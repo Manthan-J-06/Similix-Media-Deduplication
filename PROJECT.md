@@ -179,7 +179,7 @@ argus/
 |---|---|
 | Project spec | ✅ Written |
 | Repo scaffold | ✅ Done — commit `8273ae7` |
-| Stage 0 (MD5) | 🔲 Not started |
+| Stage 0 (MD5) | ✅ Done — commit `53b1b8b` |
 | Stage 1 (pHash) | 🔲 Not started |
 | Stage 2 (CLIP+FAISS) | 🔲 Not started |
 | Stage 3 (SSIM) | 🔲 Not started |

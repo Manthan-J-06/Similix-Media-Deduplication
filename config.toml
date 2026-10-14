@@ -65,3 +65,33 @@ w3 = 0.25   # Stage 3 SSIM score
 [raw]
 # Extensions treated as RAW formats (paired with JPEG, never deduped).
 extensions = ["arw", "cr2", "cr3", "nef", "orf", "rw2", "dng", "raf", "pef"]
+
+# ── Benchmark dataset generation (bench/make_dataset.py) ─────────────────────
+[benchmark]
+# Source folder of original images.
+originals_dir = "data/originals"
+# Output folder for the generated benchmark dataset.
+output_dir = "data/benchmark"
+# Ground truth CSV filename (written inside output_dir).
+ground_truth_filename = "ground_truth.csv"
+
+# Resize: edge lengths (px) to generate. Sizes larger than the original are skipped.
+resize_sizes = [128, 256, 512, 1024]
+
+# JPEG re-compression quality levels.
+jpeg_qualities = [95, 85, 75, 60]
+
+# Format conversions (Pillow save format strings).
+format_targets = ["PNG", "WEBP"]
+
+# Slight crop: fraction of image edge to remove from EACH side.
+crop_fractions = [0.02, 0.05]
+
+# Brightness adjustment factors (< 1 = darker, > 1 = brighter).
+brightness_factors = [0.85, 1.15]
+
+# Contrast adjustment factors.
+contrast_factors = [0.85, 1.15]
+
+# Rotation angles (degrees, counter-clockwise). Only 90° for now.
+rotate_angles = [90]
