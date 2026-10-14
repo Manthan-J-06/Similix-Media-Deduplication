@@ -2,91 +2,42 @@
 core/stage0.py — Stage 0: File scan, MD5 hashing, RAW-pair detection,
                            exact-duplicate clustering.
 
-Pipeline position: first and cheapest stage.
-Input:  a root directory path + an open SQLite connection + config dict.
-Output: Stage0Result (stats) + side-effects in the DB.
+Pipeline position: Stage 0 (cheapest stage).
+Input:  an ImageSource (or Path) + SQLite connection + config dict.
+Output: Stage0Result + DB side-effects.
 
-Steps
------
-1. Walk the directory tree; insert every image file as 'pending' (idempotent).
-2. For each 'pending' row (in batches): record file_size + MD5, mark 'stage0_done'.
-3. Detect RAW+JPEG sibling pairs (same stem, same directory); mark is_raw_pair=1.
-4. Group non-RAW-pair files by (file_size, md5); any group with >1 member is an
-   exact-duplicate cluster. Create a cluster row and assign all members to it.
-5. Within each cluster pick the keeper: shortest absolute path (deterministic
-   tiebreak; quality-aware selection happens at Stage 4).
+Status lifecycle:
+    'discovered' -> 'hashed' -> 'clustered' (if duplicate) or remains 'hashed' (if unique)
 
-Resumability
-------------
-Step 1 uses INSERT OR IGNORE, so re-running after a crash just skips already-
-inserted files. Step 2 only queries rows WHERE status = 'pending', so completed
-rows are never re-hashed.
+Rescanning:
+    Skips unchanged files when file_size and modified_time match the database record.
 """
 
 from __future__ import annotations
 
 import hashlib
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-# All extensions this stage will ingest (lowercased, with dot).
-# RAW extensions are also listed here so they appear in the DB;
-# they are excluded from deduplication via the is_raw_pair flag.
-_IMAGE_EXTS: frozenset[str] = frozenset({
-    ".jpg", ".jpeg", ".png", ".webp", ".gif",
-    ".bmp", ".tiff", ".tif", ".heic", ".heif",
-    # RAW formats (kept in sync with config.toml [raw] extensions)
-    ".arw", ".cr2", ".cr3", ".nef", ".orf",
-    ".rw2", ".dng", ".raf", ".pef",
-})
+from sources.base import ImageSource, ImageMetadata
+from sources.local_folder import LocalFolderSource
 
 _MD5_CHUNK = 65_536  # 64 KB read chunks for MD5 hashing
 
 
-# ---------------------------------------------------------------------------
-# Public result type
-# ---------------------------------------------------------------------------
-
 @dataclass
 class Stage0Result:
-    files_discovered: int = 0        # total files inserted (new this run)
+    files_discovered: int = 0        # new or updated files queued for hashing
     files_hashed: int = 0            # files whose MD5 was computed this run
     raw_pairs_marked: int = 0        # files flagged as RAW+JPEG siblings
     clusters_created: int = 0        # new exact-duplicate clusters
     files_clustered: int = 0         # total files assigned to clusters
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-def _image_extensions(config: dict) -> frozenset[str]:
-    """
-    Merge the hardcoded extension list with any extras from config.
-    Ensures all extensions are lowercase and start with a dot.
-    """
-    raw_exts = {
-        f".{e.lower().lstrip('.')}"
-        for e in config.get("raw", {}).get("extensions", [])
-    }
-    return _IMAGE_EXTS | raw_exts
-
-
-def _iter_image_files(root: Path, extensions: frozenset[str]) -> Iterator[Path]:
-    """Recursively yield image files under *root* matching *extensions*."""
-    for path in root.rglob("*"):
-        if path.is_file() and path.suffix.lower() in extensions:
-            yield path
-
-
-def _md5(path: Path) -> str:
-    """Return the hex MD5 digest of a file's contents."""
+def _md5_file(path: Path) -> str:
+    """Compute hex MD5 digest using chunks."""
     h = hashlib.md5()
     with open(path, "rb") as fh:
         for chunk in iter(lambda: fh.read(_MD5_CHUNK), b""):
@@ -94,66 +45,28 @@ def _md5(path: Path) -> str:
     return h.hexdigest()
 
 
-# ---------------------------------------------------------------------------
-# DB operations
-# ---------------------------------------------------------------------------
-
-def _insert_files_pending(
-    conn: sqlite3.Connection,
-    paths: list[Path],
-) -> int:
-    """
-    Bulk-insert image paths as 'pending'. Existing paths are silently ignored
-    (INSERT OR IGNORE), making this step safe to re-run after a crash.
-
-    Returns the number of newly inserted rows.
-    """
-    rows = [(str(p),) for p in paths]
-    cur = conn.executemany(
-        "INSERT OR IGNORE INTO images (file_path) VALUES (?)", rows
-    )
-    conn.commit()
-    return cur.rowcount  # -1 for executemany on some drivers; see note below
+def _md5_bytes(data: bytes) -> str:
+    """Compute hex MD5 digest from bytes."""
+    return hashlib.md5(data).hexdigest()
 
 
-def _count_pending(conn: sqlite3.Connection) -> int:
-    row = conn.execute(
-        "SELECT COUNT(*) FROM images WHERE status = 'pending'"
-    ).fetchone()
-    return row[0]
+_md5 = _md5_file
 
 
-def _fetch_pending_batch(
-    conn: sqlite3.Connection, batch_size: int
-) -> list[sqlite3.Row]:
-    return conn.execute(
-        "SELECT id, file_path FROM images WHERE status = 'pending' LIMIT ?",
-        (batch_size,),
-    ).fetchall()
+def _image_extensions(config: dict) -> frozenset[str]:
+    from sources.local_folder import DEFAULT_EXTENSIONS
+    raw_exts = {
+        f".{e.lower().lstrip('.')}"
+        for e in config.get("raw", {}).get("extensions", [])
+    }
+    return DEFAULT_EXTENSIONS | raw_exts
 
 
-def _apply_md5_batch(
-    conn: sqlite3.Connection,
-    updates: list[tuple[int, int, str]],  # (id, file_size, md5)
-) -> None:
-    """Write file_size + md5 and advance status to 'stage0_done'."""
-    conn.executemany(
-        """
-        UPDATE images
-        SET file_size = ?,
-            md5       = ?,
-            status    = 'stage0_done',
-            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
-        WHERE id = ?
-        """,
-        [(size, md5, img_id) for (img_id, size, md5) in updates],
-    )
-    conn.commit()
+def _iter_image_files(root: Path, extensions: frozenset[str]) -> Iterator[Path]:
+    for path in root.rglob("*"):
+        if path.is_file() and path.suffix.lower() in extensions:
+            yield path
 
-
-# ---------------------------------------------------------------------------
-# RAW-pair detection
-# ---------------------------------------------------------------------------
 
 def _raw_extensions(config: dict) -> frozenset[str]:
     return frozenset(
@@ -162,21 +75,108 @@ def _raw_extensions(config: dict) -> frozenset[str]:
     )
 
 
+def _scan_and_sync_files(
+    source: ImageSource,
+    conn: sqlite3.Connection,
+) -> int:
+    """
+    Sync source files with the database.
+    - If file not in DB: inserts with status = 'discovered'
+    - If file in DB and unchanged (size & mtime match): skips
+    - If file in DB but modified: updates metadata and resets status = 'discovered'
+
+    Returns number of files set to 'discovered'.
+    """
+    existing_rows = conn.execute(
+        "SELECT id, file_path, file_size, modified_time FROM images"
+    ).fetchall()
+    existing_map = {
+        row["file_path"]: (row["id"], row["file_size"], row["modified_time"])
+        for row in existing_rows
+    }
+
+    discovered_count = 0
+    inserts: list[tuple[str, int, float, int | None, int | None, str | None]] = []
+    updates: list[tuple[int, float, int | None, int | None, str | None, int]] = []
+
+    for file_id in source.list_files():
+        try:
+            meta = source.get_metadata(file_id)
+        except OSError:
+            continue
+
+        if file_id in existing_map:
+            img_id, cur_size, cur_mtime = existing_map[file_id]
+            # Check if unchanged
+            if cur_size == meta.file_size and cur_mtime is not None and abs(cur_mtime - meta.modified_time) < 1e-4:
+                continue
+
+            # Modified file — reset for re-processing
+            updates.append((
+                meta.file_size,
+                meta.modified_time,
+                meta.width,
+                meta.height,
+                meta.format,
+                img_id,
+            ))
+            discovered_count += 1
+        else:
+            inserts.append((
+                meta.file_id,
+                meta.file_size,
+                meta.modified_time,
+                meta.width,
+                meta.height,
+                meta.format,
+            ))
+            discovered_count += 1
+
+    if inserts:
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO images (
+                file_path, file_size, modified_time, width, height, format, status
+            ) VALUES (?, ?, ?, ?, ?, ?, 'discovered')
+            """,
+            inserts,
+        )
+
+    if updates:
+        conn.executemany(
+            """
+            UPDATE images
+            SET file_size = ?,
+                modified_time = ?,
+                width = ?,
+                height = ?,
+                format = ?,
+                md5 = NULL,
+                phash = NULL,
+                clip_vector = NULL,
+                cluster_id = NULL,
+                is_keeper = 0,
+                confidence = NULL,
+                status = 'discovered',
+                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+            WHERE id = ?
+            """,
+            updates,
+        )
+
+    conn.commit()
+    return discovered_count
+
+
 def _detect_raw_pairs(conn: sqlite3.Connection, raw_exts: frozenset[str]) -> int:
     """
     Mark files as RAW+JPEG siblings when the same directory contains both a
     RAW file and a non-RAW file with an identical stem (case-insensitive).
-
-    Example: /photos/IMG_001.ARW  +  /photos/IMG_001.JPG → both flagged.
-
-    Returns the total number of files newly flagged.
     """
-    # Load all stage0_done paths into memory (stems only; avoids N+1 queries).
     rows = conn.execute(
-        "SELECT id, file_path FROM images WHERE status = 'stage0_done'"
+        "SELECT id, file_path FROM images"
     ).fetchall()
 
-    # Build a map: (parent_dir, lowercase_stem) → list of (id, ext)
     from collections import defaultdict
     stem_map: dict[tuple[str, str], list[tuple[int, str]]] = defaultdict(list)
     for row in rows:
@@ -184,7 +184,6 @@ def _detect_raw_pairs(conn: sqlite3.Connection, raw_exts: frozenset[str]) -> int
         key = (str(p.parent), p.stem.lower())
         stem_map[key].append((row["id"], p.suffix.lower()))
 
-    # Find groups that contain at least one RAW and at least one non-RAW member.
     ids_to_flag: set[int] = set()
     for (_dir, _stem), members in stem_map.items():
         exts = {ext for (_id, ext) in members}
@@ -210,26 +209,18 @@ def _detect_raw_pairs(conn: sqlite3.Connection, raw_exts: frozenset[str]) -> int
     return len(ids_to_flag)
 
 
-# ---------------------------------------------------------------------------
-# Exact-duplicate clustering
-# ---------------------------------------------------------------------------
-
 def _build_exact_clusters(conn: sqlite3.Connection) -> tuple[int, int]:
     """
     Find all (file_size, md5) groups with >1 non-RAW-pair member and create a
-    cluster row for each. Assigns cluster_id + marks the keeper.
+    cluster row for each. Assigns cluster_id + marks keeper and updates status to 'clustered'.
 
-    Keeper rule (Stage 0): shortest absolute file_path (deterministic tiebreak).
-    Final quality-aware keeper selection happens at Stage 4.
-
-    Returns (clusters_created, files_clustered).
+    Keeper rule: shortest absolute file_path (deterministic tiebreak).
     """
-    # Find duplicate groups — only among files not yet assigned to a cluster.
     groups = conn.execute(
         """
         SELECT file_size, md5, COUNT(*) AS cnt
         FROM images
-        WHERE status     = 'stage0_done'
+        WHERE status IN ('hashed', 'stage0_done')
           AND is_raw_pair = 0
           AND md5 IS NOT NULL
           AND cluster_id IS NULL
@@ -246,8 +237,8 @@ def _build_exact_clusters(conn: sqlite3.Connection) -> tuple[int, int]:
             """
             SELECT id, file_path
             FROM images
-            WHERE file_size = ? AND md5 = ? AND is_raw_pair = 0
-            ORDER BY LENGTH(file_path), file_path   -- deterministic keeper
+            WHERE file_size = ? AND md5 = ? AND is_raw_pair = 0 AND cluster_id IS NULL
+            ORDER BY LENGTH(file_path), file_path
             """,
             (group["file_size"], group["md5"]),
         ).fetchall()
@@ -257,7 +248,6 @@ def _build_exact_clusters(conn: sqlite3.Connection) -> tuple[int, int]:
 
         keeper_id = members[0]["id"]
 
-        # Create the cluster; representative = the keeper.
         cur = conn.execute(
             """
             INSERT INTO clusters (representative_id, stage_detected, member_count)
@@ -267,12 +257,13 @@ def _build_exact_clusters(conn: sqlite3.Connection) -> tuple[int, int]:
         )
         cluster_id = cur.lastrowid
 
-        # Assign all members to the cluster.
         conn.executemany(
             """
             UPDATE images
             SET cluster_id = ?,
                 is_keeper  = CASE WHEN id = ? THEN 1 ELSE 0 END,
+                confidence = 100.0,
+                status     = 'clustered',
                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
             WHERE id = ?
             """,
@@ -286,63 +277,66 @@ def _build_exact_clusters(conn: sqlite3.Connection) -> tuple[int, int]:
     return clusters_created, files_clustered
 
 
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
-
 def run_stage0(
-    root: Path,
+    source_or_root: ImageSource | Path | str,
     conn: sqlite3.Connection,
     config: dict,
 ) -> Stage0Result:
     """
     Execute Stage 0 end-to-end.
-
-    Parameters
-    ----------
-    root:   Directory to scan for images.
-    conn:   Initialised SQLite connection (from db.connection.init_db).
-    config: Parsed config dict (from core.config.load_config).
-
-    Returns a Stage0Result with counts for logging/display.
     """
     result = Stage0Result()
     batch_size: int = config.get("general", {}).get("batch_size", 500)
-    extensions = _image_extensions(config)
     raw_exts = _raw_extensions(config)
 
-    # ── Step 1: discover all image files and insert as 'pending' ─────────────
-    paths = list(_iter_image_files(root, extensions))
-    if paths:
-        _insert_files_pending(conn, paths)
-        # Count how many are actually new (pending) after the insert.
-        result.files_discovered = _count_pending(conn)
+    if isinstance(source_or_root, ImageSource):
+        source = source_or_root
+    else:
+        source = LocalFolderSource(source_or_root)
 
-    # ── Step 2: hash every pending file in batches ────────────────────────────
+    # Step 1: Scan and sync files (skipping unchanged files)
+    result.files_discovered = _scan_and_sync_files(source, conn)
+
+    # Step 2: Compute MD5 for discovered files in batches
     while True:
-        batch = _fetch_pending_batch(conn, batch_size)
+        batch = conn.execute(
+            "SELECT id, file_path FROM images WHERE status = 'discovered' LIMIT ?",
+            (batch_size,),
+        ).fetchall()
         if not batch:
             break
 
-        updates: list[tuple[int, int, str]] = []
+        updates: list[tuple[str, int]] = []
         for row in batch:
-            p = Path(row["file_path"])
+            path_str = row["file_path"]
             try:
-                size = p.stat().st_size
-                digest = _md5(p)
-                updates.append((row["id"], size, digest))
-            except OSError:
-                # File disappeared or unreadable; leave as 'pending' to retry.
+                p = Path(path_str)
+                if p.is_file():
+                    digest = _md5_file(p)
+                else:
+                    digest = _md5_bytes(source.get_bytes(path_str))
+                updates.append((digest, row["id"]))
+            except Exception:
                 continue
 
         if updates:
-            _apply_md5_batch(conn, updates)
+            conn.executemany(
+                """
+                UPDATE images
+                SET md5 = ?,
+                    status = 'hashed',
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                WHERE id = ?
+                """,
+                updates,
+            )
+            conn.commit()
             result.files_hashed += len(updates)
 
-    # ── Step 3: mark RAW+JPEG sibling pairs ───────────────────────────────────
+    # Step 3: Flag RAW+JPEG sibling pairs
     result.raw_pairs_marked = _detect_raw_pairs(conn, raw_exts)
 
-    # ── Step 4: build exact-duplicate clusters ────────────────────────────────
+    # Step 4: Build exact-duplicate clusters (MD5 + file_size match)
     clusters, clustered = _build_exact_clusters(conn)
     result.clusters_created = clusters
     result.files_clustered = clustered

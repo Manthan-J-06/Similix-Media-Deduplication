@@ -124,7 +124,7 @@ class TestRunStage0Basic:
         rows = db.execute("SELECT file_path, status, md5 FROM images").fetchall()
         assert len(rows) == 2
         for row in rows:
-            assert row["status"] == "stage0_done"
+            assert row["status"] in ("hashed", "clustered")
             assert row["md5"] is not None
 
     def test_file_size_stored(self, tmp_path: Path, db: sqlite3.Connection, cfg: dict):

@@ -167,7 +167,10 @@ argus/
 
 | # | Date | Decision | Rationale |
 |---|---|---|---|
-| — | — | — | — |
+| 1 | 2026-10-14 | Generic `ImageSource` interface | Decouples core pipeline from local filesystem; enables Google Drive / S3 sources later. |
+| 2 | 2026-10-14 | JPEG draft mode for thumbnail & pHash | Avoids decoding full 20MP+ pixel data in RAM; fulfills strict 16GB memory constraint. |
+| 3 | 2026-10-14 | Rescanning skips unchanged files via `(modified_time, file_size)` | Massive speedup when re-running on 50,000+ files; only new or touched files are re-processed. |
+| 4 | 2026-10-14 | Anti-chaining representative verification | Prevents false transitive duplicate clusters (A≈B and B≈C does not cluster C if C!=A). |
 
 ---
 
@@ -180,10 +183,10 @@ argus/
 | Project spec | ✅ Written |
 | Repo scaffold | ✅ Done — commit `8273ae7` |
 | Stage 0 (MD5) | ✅ Done — commit `53b1b8b` |
-| Stage 1 (pHash) | 🔲 Not started |
+| Stage 1 (pHash) | ✅ Done |
 | Stage 2 (CLIP+FAISS) | 🔲 Not started |
 | Stage 3 (SSIM) | 🔲 Not started |
 | Stage 4 (full-res keeper) | 🔲 Not started |
 | API layer | 🔲 Not started |
 | UI | 🔲 Not started |
-| Benchmarks | 🔲 Not started |
+| Benchmarks | ✅ Done (make_dataset.py & download_originals.py) |

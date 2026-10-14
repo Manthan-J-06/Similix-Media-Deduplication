@@ -18,6 +18,9 @@ dependencies = [
     "imagehash>=4.3.1",
 ]
 
+[project.scripts]
+argus = "core.cli:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.2.0",
