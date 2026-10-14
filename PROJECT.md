@@ -178,7 +178,7 @@ argus/
 | Item | Status |
 |---|---|
 | Project spec | ✅ Written |
-| Repo scaffold | 🔲 Not started |
+| Repo scaffold | ✅ Done — commit `8273ae7` |
 | Stage 0 (MD5) | 🔲 Not started |
 | Stage 1 (pHash) | 🔲 Not started |
 | Stage 2 (CLIP+FAISS) | 🔲 Not started |
