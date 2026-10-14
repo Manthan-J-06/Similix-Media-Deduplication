@@ -171,6 +171,7 @@ argus/
 | 2 | 2026-10-14 | JPEG draft mode for thumbnail & pHash | Avoids decoding full 20MP+ pixel data in RAM; fulfills strict 16GB memory constraint. |
 | 3 | 2026-10-14 | Rescanning skips unchanged files via `(modified_time, file_size)` | Massive speedup when re-running on 50,000+ files; only new or touched files are re-processed. |
 | 4 | 2026-10-14 | Anti-chaining representative verification | Prevents false transitive duplicate clusters (A≈B and B≈C does not cluster C if C!=A). |
+| 5 | 2026-10-14 | Ground-truth evaluation framework (`bench/evaluate.py`) | Measures precision and recall overall and per transform across thresholds; baseline establishes $T \in [8, 10]$ as optimal for Stage 1 (99.1% precision, 91.7% recall). |
 
 ---
 
@@ -183,10 +184,10 @@ argus/
 | Project spec | ✅ Written |
 | Repo scaffold | ✅ Done — commit `8273ae7` |
 | Stage 0 (MD5) | ✅ Done — commit `53b1b8b` |
-| Stage 1 (pHash) | ✅ Done |
+| Stage 1 (pHash) | ✅ Done — commit `fb4ab5e` |
 | Stage 2 (CLIP+FAISS) | 🔲 Not started |
 | Stage 3 (SSIM) | 🔲 Not started |
 | Stage 4 (full-res keeper) | 🔲 Not started |
 | API layer | 🔲 Not started |
 | UI | 🔲 Not started |
-| Benchmarks | ✅ Done (make_dataset.py & download_originals.py) |
+| Benchmarks | ✅ Done — commits `eba22b3`, `8cf6fe7`, `10eda53` (make_dataset, downloader, evaluation) |
