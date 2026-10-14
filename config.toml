@@ -1,0 +1,67 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Argus — Central Configuration
+# Every tuneable threshold and weight lives here. No magic numbers in code.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[general]
+# Thumbnail edge length (px) used for Stage 1-3 processing.
+thumbnail_size = 256
+# How many images to process per batch (resumable).
+batch_size = 500
+# SQLite database path (relative to repo root).
+db_path = "argus.db"
+# Directory where thumbnail cache is stored.
+thumbnail_cache_dir = "thumbnails/"
+
+# ── Stage 0: Exact duplicate detection ───────────────────────────────────────
+[stage0]
+# MD5 is used for exact-match grouping only (not security).
+hash_algorithm = "md5"
+
+# ── Stage 1: Perceptual hashing ──────────────────────────────────────────────
+[stage1]
+# Hash algorithm: "phash" | "dhash" | "ahash" | "whash"
+hash_algorithm = "phash"
+# Hash size (bits = hash_size²). 8 → 64-bit hash.
+hash_size = 8
+# Maximum Hamming distance to consider two images near-duplicate candidates.
+# Range 0–64 for a 64-bit hash. Lower = stricter.
+hamming_threshold = 10
+
+# ── Stage 2: CLIP embedding + FAISS ──────────────────────────────────────────
+# (Not yet active — placeholders for when Stage 2 is implemented.)
+[stage2]
+# CLIP model variant. "ViT-B-32" is fast; "ViT-L-14" is more accurate.
+clip_model = "ViT-B-32"
+clip_pretrained = "openai"
+# Cosine-similarity threshold to accept a FAISS neighbour as a candidate.
+cosine_threshold = 0.92
+# Number of FAISS neighbours to retrieve per query.
+faiss_k = 20
+
+# ── Stage 3: SSIM / quality scoring ──────────────────────────────────────────
+# (Not yet active — placeholders for when Stage 3 is implemented.)
+[stage3]
+# Minimum SSIM score to consider a pair visually equivalent.
+ssim_threshold = 0.85
+# Laplacian variance threshold below which an image is considered blurry.
+blur_threshold = 100.0
+
+# ── Stage 4: Keeper selection ─────────────────────────────────────────────────
+# (Not yet active — placeholders for when Stage 4 is implemented.)
+[stage4]
+# Keeper score = quality_weight * quality_score - size_weight * size_penalty
+quality_weight = 0.7
+size_weight = 0.3
+
+# ── Confidence score weights (must sum to 1.0) ────────────────────────────────
+[confidence]
+# confidence = w1*phash_sim + w2*clip_sim + w3*ssim_score
+w1 = 0.25   # Stage 1 perceptual hash similarity
+w2 = 0.50   # Stage 2 CLIP cosine similarity
+w3 = 0.25   # Stage 3 SSIM score
+
+# ── RAW file handling ─────────────────────────────────────────────────────────
+[raw]
+# Extensions treated as RAW formats (paired with JPEG, never deduped).
+extensions = ["arw", "cr2", "cr3", "nef", "orf", "rw2", "dng", "raf", "pef"]

@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "argus"
+version = "0.1.0"
+description = "Local-first image deduplication system"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+# ── Stage 0–1 dependencies only ──────────────────────────────────────────────
+# Stage 2+ (open-clip-torch, faiss-cpu, scikit-image) are added later.
+dependencies = [
+    "Pillow>=10.3.0",
+    "pillow-heif>=0.16.0",
+    "imagehash>=4.3.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2.0",
+    "pytest-cov>=5.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*", "sources*", "db*", "agent*", "api*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
