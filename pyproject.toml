@@ -10,12 +10,14 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 
-# ── Stage 0–1 dependencies only ──────────────────────────────────────────────
-# Stage 2+ (open-clip-torch, faiss-cpu, scikit-image) are added later.
+# ── Stage 0–2 dependencies ──────────────────────────────────────────────────
 dependencies = [
     "Pillow>=10.3.0",
     "pillow-heif>=0.16.0",
     "imagehash>=4.3.1",
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "open-clip-torch>=2.24.0",
 ]
 
 [project.scripts]

@@ -94,6 +94,51 @@ def cmd_scan(args: argparse.Namespace) -> None:
     print("--------------------------------------------------")
 
 
+def cmd_embed(args: argparse.Namespace) -> None:
+    folder = Path(args.folder).resolve()
+    if not folder.exists() or not folder.is_dir():
+        print(f"Error: Target directory does not exist: {folder}", file=sys.stderr)
+        sys.exit(1)
+
+    cfg = load_config(args.config)
+    db_path = args.db or cfg.get("general", {}).get("db_path", "argus.db")
+    conn = init_db(db_path)
+
+    from core.embeddings import run_embeddings, get_device
+    device = get_device()
+    stage2_cfg = cfg.get("stage2", {})
+    rotations = stage2_cfg.get("enable_rotation_embeddings", False)
+
+    print("==================================================")
+    print("  ARGUS Stage 2 CLIP Embedding Pipeline")
+    print("==================================================")
+    print(f"Target folder : {folder}")
+    print(f"Database      : {db_path}")
+    print(f"Model         : {stage2_cfg.get('clip_model', 'ViT-B-32')}")
+    print(f"Weights       : {stage2_cfg.get('clip_pretrained', 'laion2b_s34b_b79k')}")
+    print(f"Device        : {device} ({'Apple Silicon GPU' if device.type == 'mps' else 'CPU'})")
+    print(f"Batch size    : {stage2_cfg.get('batch_size', 32)}")
+    print(f"Rotations     : {'Enabled (0°, 90°, 180°, 270°)' if rotations else 'Disabled (0° only)'}")
+    print()
+
+    source = LocalFolderSource(folder)
+    start_time = time.time()
+
+    def on_progress(current: int, total: int):
+        _render_progress_bar(current, total, prefix="Embedding thumbnails")
+
+    res = run_embeddings(source, conn, cfg, progress_callback=on_progress)
+
+    elapsed = time.time() - start_time
+    print()
+    print("--------------------------------------------------")
+    print(f"Embedding completed in {elapsed:.2f}s")
+    print(f"Newly embedded images : {res.images_embedded}")
+    print(f"Previously embedded   : {res.images_skipped}")
+    print(f"Device used           : {res.device_used}")
+    print("--------------------------------------------------")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="argus",
@@ -106,9 +151,16 @@ def main(argv: list[str] | None = None) -> None:
     scan_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
     scan_parser.add_argument("--db", default=None, help="Path to SQLite database file")
 
+    embed_parser = subparsers.add_parser("embed", help="Compute CLIP embeddings for images")
+    embed_parser.add_argument("folder", help="Path to image folder")
+    embed_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
+    embed_parser.add_argument("--db", default=None, help="Path to SQLite database file")
+
     args = parser.parse_args(argv)
     if args.subcommand == "scan":
         cmd_scan(args)
+    elif args.subcommand == "embed":
+        cmd_embed(args)
 
 
 if __name__ == "__main__":

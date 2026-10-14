@@ -20,8 +20,11 @@ CREATE TABLE IF NOT EXISTS images (
     format        TEXT,                          -- image format (JPEG, PNG, etc.)
     md5           TEXT,                          -- hex digest (Stage 0)
     phash         TEXT,                          -- perceptual hash (Stage 1)
-    clip_vector   BLOB,                          -- CLIP embedding (Stage 2)
-    status        TEXT    NOT NULL DEFAULT 'discovered', -- 'discovered' | 'hashed' | 'clustered'
+    clip_vector       BLOB,                          -- CLIP embedding (Stage 2)
+    clip_vector_90    BLOB,                          -- CLIP embedding 90 deg rotated
+    clip_vector_180   BLOB,                          -- CLIP embedding 180 deg rotated
+    clip_vector_270   BLOB,                          -- CLIP embedding 270 deg rotated
+    status        TEXT    NOT NULL DEFAULT 'discovered', -- 'discovered' | 'hashed' | 'embedded' | 'clustered'
     cluster_id    INTEGER REFERENCES clusters(id) ON DELETE SET NULL,
     is_keeper     INTEGER NOT NULL DEFAULT 0,    -- 1 = recommended keeper
     confidence    REAL,                          -- duplicate-confidence 0-100

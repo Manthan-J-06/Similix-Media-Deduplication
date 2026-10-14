@@ -29,14 +29,18 @@ hash_size = 8
 hamming_threshold = 10
 
 # ── Stage 2: CLIP embedding + FAISS ──────────────────────────────────────────
-# (Not yet active — placeholders for when Stage 2 is implemented.)
 [stage2]
-# CLIP model variant. "ViT-B-32" is fast; "ViT-L-14" is more accurate.
+# CLIP model variant. "ViT-B-32" is fast and lightweight.
 clip_model = "ViT-B-32"
-clip_pretrained = "openai"
-# Cosine-similarity threshold to accept a FAISS neighbour as a candidate.
+# Pretrained weights: "laion2b_s34b_b79k" (permissively licensed under MIT).
+clip_pretrained = "laion2b_s34b_b79k"
+# Embedding batch size (default 32). Memory is freed between batches.
+batch_size = 32
+# Also store embeddings for 90/180/270 degree rotated thumbnails (default: false).
+enable_rotation_embeddings = false
+# Cosine-similarity threshold to accept a candidate pair.
 cosine_threshold = 0.92
-# Number of FAISS neighbours to retrieve per query.
+# Number of neighbours to retrieve per query.
 faiss_k = 20
 
 # ── Stage 3: SSIM / quality scoring ──────────────────────────────────────────

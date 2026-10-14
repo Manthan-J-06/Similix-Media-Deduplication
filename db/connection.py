@@ -31,8 +31,17 @@ def init_db(db_path: str | Path) -> sqlite3.Connection:
     """
     Open a connection and ensure the schema exists.
     Safe to call multiple times (all DDL uses IF NOT EXISTS).
+    Applies non-destructive migrations for any new columns.
     """
     conn = get_connection(db_path)
     conn.executescript(ALL_DDL)
+
+    # Safe column migrations for existing databases
+    cursor = conn.execute("PRAGMA table_info(images);")
+    existing_cols = {row["name"] for row in cursor.fetchall()}
+    for col in ("clip_vector_90", "clip_vector_180", "clip_vector_270"):
+        if col not in existing_cols:
+            conn.execute(f"ALTER TABLE images ADD COLUMN {col} BLOB;")
+
     conn.commit()
     return conn

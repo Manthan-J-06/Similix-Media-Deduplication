@@ -172,6 +172,7 @@ argus/
 | 3 | 2026-10-14 | Rescanning skips unchanged files via `(modified_time, file_size)` | Massive speedup when re-running on 50,000+ files; only new or touched files are re-processed. |
 | 4 | 2026-10-14 | Anti-chaining representative verification | Prevents false transitive duplicate clusters (A≈B and B≈C does not cluster C if C!=A). |
 | 5 | 2026-10-14 | Ground-truth evaluation framework (`bench/evaluate.py`) | Measures precision and recall overall and per transform across thresholds; baseline establishes $T \in [8, 10]$ as optimal for Stage 1 (99.1% precision, 91.7% recall). |
+| 6 | 2026-10-14 | Stage 2 CLIP Embeddings: `open_clip` `ViT-B-32` (`laion2b_s34b_b79k`) | **Model weights license:** Permissively licensed under **MIT License** (LAION community open weights). Accelerated via Apple Silicon **MPS** (72 img/s). Float16 L2-normalized 512-dim vectors stored as 1,024-byte BLOB. Rotation embedding cost benchmarked: 1.39x compute latency overhead, default kept off. |
 
 ---
 
@@ -185,7 +186,8 @@ argus/
 | Repo scaffold | ✅ Done — commit `8273ae7` |
 | Stage 0 (MD5) | ✅ Done — commit `53b1b8b` |
 | Stage 1 (pHash) | ✅ Done — commit `fb4ab5e` |
-| Stage 2 (CLIP+FAISS) | 🔲 Not started |
+| Stage 2 (CLIP embeddings) | ✅ Done (embeddings module, Apple MPS, rotation handling, CLI `embed`) |
+| Stage 2 (FAISS ANN search) | 🔲 Next step |
 | Stage 3 (SSIM) | 🔲 Not started |
 | Stage 4 (full-res keeper) | 🔲 Not started |
 | API layer | 🔲 Not started |
