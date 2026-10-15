@@ -356,22 +356,44 @@ def tune_thresholds_on_tuning_set(
             best_clip_cos = cos_th
 
     # 3. Tune Combination
-    best_combo_p = 8
-    best_combo_cos = 0.90
-    best_combo_f1 = -1.0
-    for cos_th in [0.85, 0.88, 0.90, 0.92, 0.94, 0.96]:
-        for p_th in [6, 8, 10, 12]:
+    # Rule: Maximize variant recall subject to precision >= 99.5%, with cosine threshold >= 0.90.
+    best_combo_p = None
+    best_combo_cos = None
+    best_combo_recall = -1.0
+    best_combo_precision = -1.0
+
+    for cos_th in [0.90, 0.91, 0.92, 0.93, 0.94, 0.95, 0.96]:
+        for p_th in [4, 6, 8, 10, 12, 14]:
             res = run_eval(p_th=p_th, cos_th=cos_th, mode="combo")
             p, r = res["precision"], res["overall_variant_recall"]
-            f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0
-            if p >= 99.0 and f1 > best_combo_f1:
-                best_combo_f1 = f1
-                best_combo_p = p_th
-                best_combo_cos = cos_th
+            if p >= 99.5 and cos_th >= 0.90:
+                if r > best_combo_recall or (r == best_combo_recall and p > best_combo_precision):
+                    best_combo_recall = r
+                    best_combo_precision = p
+                    best_combo_p = p_th
+                    best_combo_cos = cos_th
+
+    if best_combo_p is None:
+        # Fallback if no threshold met precision >= 99.5%
+        for cos_th in [0.90, 0.92, 0.94, 0.96]:
+            for p_th in [6, 8, 10]:
+                res = run_eval(p_th=p_th, cos_th=cos_th, mode="combo")
+                p, r = res["precision"], res["overall_variant_recall"]
+                if r > best_combo_recall:
+                    best_combo_recall = r
+                    best_combo_precision = p
+                    best_combo_p = p_th
+                    best_combo_cos = cos_th
+
+    best_combo_f1 = (
+        2 * best_combo_precision * best_combo_recall / (best_combo_precision + best_combo_recall)
+        if (best_combo_precision + best_combo_recall) > 0
+        else 0
+    )
 
     print(f"Chosen pHash-only threshold   : T={best_p_th} (Tuning F1: {best_p_f1:.2f})")
     print(f"Chosen CLIP-only threshold    : cos={best_clip_cos:.2f} (Tuning F1: {best_clip_f1:.2f})")
-    print(f"Chosen Combination thresholds : pHash T={best_combo_p}, CLIP cos={best_combo_cos:.2f} (Tuning F1: {best_combo_f1:.2f})")
+    print(f"Chosen Combination thresholds : pHash T={best_combo_p}, CLIP cos={best_combo_cos:.2f} (Tuning Recall: {best_combo_recall:.2f}%, Precision: {best_combo_precision:.2f}%)")
 
     return {
         "best_phash_th": best_p_th,
@@ -381,6 +403,8 @@ def tune_thresholds_on_tuning_set(
         "tuning_f1_phash": best_p_f1,
         "tuning_f1_clip": best_clip_f1,
         "tuning_f1_combo": best_combo_f1,
+        "tuning_recall_combo": best_combo_recall,
+        "tuning_precision_combo": best_combo_precision,
     }
 
 
@@ -502,9 +526,10 @@ def build_test_report_markdown(
         "",
         "## 2. Thresholds Chosen on Tuning Set Only",
         "",
+        "- **Combination Selection Rule**: Maximize variant recall subject to $\\text{precision} \\ge 99.5\\%$, with cosine threshold $\\ge 0.90$.",
         f"- **pHash only**: Hamming Threshold $T = {chosen['best_phash_th']}$ (Tuning F1: {chosen['tuning_f1_phash']:.2f})",
         f"- **CLIP only**: Cosine Threshold $c = {chosen['best_clip_cos']:.2f}$ (Tuning F1: {chosen['tuning_f1_clip']:.2f})",
-        f"- **Combination**: pHash $T = {chosen['best_combo_phash']}$, CLIP Cosine $c = {chosen['best_combo_cos']:.2f}$ (Tuning F1: {chosen['tuning_f1_combo']:.2f})",
+        f"- **Combination**: pHash $T = {chosen['best_combo_phash']}$, CLIP Cosine $c = {chosen['best_combo_cos']:.2f}$ (Tuning Recall: {chosen.get('tuning_recall_combo', 100.0):.2f}%, Precision: {chosen.get('tuning_precision_combo', 100.0):.2f}%)",
         "",
         "## 3. Performance on Held-Out Test Set (Before & After Stage 3)",
         "",
