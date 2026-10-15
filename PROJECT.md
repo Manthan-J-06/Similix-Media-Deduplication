@@ -175,6 +175,7 @@ argus/
 | 6 | 2026-10-14 | Stage 2 CLIP Embeddings: `open_clip` `ViT-B-32` (`laion2b_s34b_b79k`) | **Model weights license:** Permissively licensed under **MIT License** (LAION community open weights). Accelerated via Apple Silicon **MPS** (72 img/s). Float16 L2-normalized 512-dim vectors stored as 1,024-byte BLOB. Rotation embedding cost benchmarked: 1.39x compute latency overhead, default kept off. |
 | 7 | 2026-10-15 | Vector Index Architecture (`core/index.py`) | `VectorIndex` ABC with swappable implementations: `FlatIPIndex` (exact inner product for <200k images) and `HNSWIndex` (approximate graph index for >200k images) using `faiss.IndexIDMap2`. Incremental persistence ensures only newly embedded images are indexed. |
 | 8 | 2026-10-15 | Anti-Chaining Clustering & Unified Cluster Table (`core/cluster.py`) | Anti-chaining representative verification: members must be directly similar to keeper (`cosine_threshold` / pHash), with mutual compatibility; failing members are split out and re-evaluated. Unified `clusters` table covers Stage 0 (MD5), Stage 1 (pHash), and Stage 2 (CLIP) with per-member `link_signal` and `confidence` score. OpenMP runtime collision guarded for macOS (`KMP_DUPLICATE_LIB_OK=TRUE`). |
+| 9 | 2026-10-15 | Reproducible Benchmark Split & Held-Out Test Evaluation | Partitioned benchmark (200 originals, 4,000 images) into a 60% tuning set (120 originals, 2,400 images) and 40% held-out test set (80 originals, 1,600 images) split strictly by original image to prevent data leakage (`bench/split.json`, random seed `42`). Threshold tuning on the 60% set chose: pHash $T=8$, CLIP $\text{cos}=0.88$, and Combination $T=8, \text{cos}=0.90$. Held-out test set evaluation verified **99.60% precision**, **99.67% variant recall** (1,515/1,520 variants), and **99.41% pairwise recall** across all transformations. |
 
 ---
 
@@ -189,8 +190,8 @@ argus/
 | Stage 0 (MD5) | ✅ Done — commit `53b1b8b` |
 | Stage 1 (pHash) | ✅ Done — commit `fb4ab5e` |
 | Stage 2 (CLIP embeddings & FAISS clustering) | ✅ Done (`core/embeddings.py`, `core/index.py`, `core/cluster.py`, CLI `embed` & `cluster`) |
+| Benchmark & Held-Out Test Evaluation | ✅ Done — 60/40 reproducible split (seed `42`), tuning on 60%, test on 40% (99.60% precision, 99.67% recall) |
 | Stage 3 (SSIM) | 🔲 Next step |
 | Stage 4 (full-res keeper) | 🔲 Not started |
 | API layer | 🔲 Not started |
 | UI | 🔲 Not started |
-| Benchmarks | ✅ Done — commits `eba22b3`, `8cf6fe7`, `10eda53` (make_dataset, downloader, evaluation) |
