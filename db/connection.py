@@ -42,6 +42,27 @@ def init_db(db_path: str | Path) -> sqlite3.Connection:
     for col in ("clip_vector_90", "clip_vector_180", "clip_vector_270"):
         if col not in existing_cols:
             conn.execute(f"ALTER TABLE images ADD COLUMN {col} BLOB;")
+    if "link_signal" not in existing_cols:
+        conn.execute("ALTER TABLE images ADD COLUMN link_signal TEXT;")
+
+    # Backfill link_signal for previously clustered rows if unset
+    conn.execute(
+        """
+        UPDATE images
+        SET link_signal = 'md5'
+        WHERE cluster_id IN (SELECT id FROM clusters WHERE stage_detected = 0)
+          AND link_signal IS NULL
+        """
+    )
+    conn.execute(
+        """
+        UPDATE images
+        SET link_signal = 'phash'
+        WHERE cluster_id IN (SELECT id FROM clusters WHERE stage_detected = 1)
+          AND link_signal IS NULL
+        """
+    )
 
     conn.commit()
     return conn
+

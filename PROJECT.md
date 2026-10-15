@@ -173,6 +173,8 @@ argus/
 | 4 | 2026-10-14 | Anti-chaining representative verification | Prevents false transitive duplicate clusters (A≈B and B≈C does not cluster C if C!=A). |
 | 5 | 2026-10-14 | Ground-truth evaluation framework (`bench/evaluate.py`) | Measures precision and recall overall and per transform across thresholds; baseline establishes $T \in [8, 10]$ as optimal for Stage 1 (99.1% precision, 91.7% recall). |
 | 6 | 2026-10-14 | Stage 2 CLIP Embeddings: `open_clip` `ViT-B-32` (`laion2b_s34b_b79k`) | **Model weights license:** Permissively licensed under **MIT License** (LAION community open weights). Accelerated via Apple Silicon **MPS** (72 img/s). Float16 L2-normalized 512-dim vectors stored as 1,024-byte BLOB. Rotation embedding cost benchmarked: 1.39x compute latency overhead, default kept off. |
+| 7 | 2026-10-15 | Vector Index Architecture (`core/index.py`) | `VectorIndex` ABC with swappable implementations: `FlatIPIndex` (exact inner product for <200k images) and `HNSWIndex` (approximate graph index for >200k images) using `faiss.IndexIDMap2`. Incremental persistence ensures only newly embedded images are indexed. |
+| 8 | 2026-10-15 | Anti-Chaining Clustering & Unified Cluster Table (`core/cluster.py`) | Anti-chaining representative verification: members must be directly similar to keeper (`cosine_threshold` / pHash), with mutual compatibility; failing members are split out and re-evaluated. Unified `clusters` table covers Stage 0 (MD5), Stage 1 (pHash), and Stage 2 (CLIP) with per-member `link_signal` and `confidence` score. OpenMP runtime collision guarded for macOS (`KMP_DUPLICATE_LIB_OK=TRUE`). |
 
 ---
 
@@ -186,9 +188,8 @@ argus/
 | Repo scaffold | ✅ Done — commit `8273ae7` |
 | Stage 0 (MD5) | ✅ Done — commit `53b1b8b` |
 | Stage 1 (pHash) | ✅ Done — commit `fb4ab5e` |
-| Stage 2 (CLIP embeddings) | ✅ Done (embeddings module, Apple MPS, rotation handling, CLI `embed`) |
-| Stage 2 (FAISS ANN search) | 🔲 Next step |
-| Stage 3 (SSIM) | 🔲 Not started |
+| Stage 2 (CLIP embeddings & FAISS clustering) | ✅ Done (`core/embeddings.py`, `core/index.py`, `core/cluster.py`, CLI `embed` & `cluster`) |
+| Stage 3 (SSIM) | 🔲 Next step |
 | Stage 4 (full-res keeper) | 🔲 Not started |
 | API layer | 🔲 Not started |
 | UI | 🔲 Not started |

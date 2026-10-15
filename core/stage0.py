@@ -260,11 +260,12 @@ def _build_exact_clusters(conn: sqlite3.Connection) -> tuple[int, int]:
         conn.executemany(
             """
             UPDATE images
-            SET cluster_id = ?,
-                is_keeper  = CASE WHEN id = ? THEN 1 ELSE 0 END,
-                confidence = 100.0,
-                status     = 'clustered',
-                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+            SET cluster_id  = ?,
+                is_keeper   = CASE WHEN id = ? THEN 1 ELSE 0 END,
+                confidence  = 100.0,
+                link_signal = 'md5',
+                status      = 'clustered',
+                updated_at  = strftime('%Y-%m-%dT%H:%M:%SZ','now')
             WHERE id = ?
             """,
             [(cluster_id, keeper_id, row["id"]) for row in members],

@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS images (
     cluster_id    INTEGER REFERENCES clusters(id) ON DELETE SET NULL,
     is_keeper     INTEGER NOT NULL DEFAULT 0,    -- 1 = recommended keeper
     confidence    REAL,                          -- duplicate-confidence 0-100
+    link_signal   TEXT,                          -- 'md5' | 'phash' | 'clip'
     is_raw_pair   INTEGER NOT NULL DEFAULT 0,    -- 1 = RAW/JPEG sibling, skip dedup
     created_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
     updated_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))

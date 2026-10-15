@@ -139,6 +139,53 @@ def cmd_embed(args: argparse.Namespace) -> None:
     print("--------------------------------------------------")
 
 
+def cmd_cluster(args: argparse.Namespace) -> None:
+    cfg = load_config(args.config)
+    db_path = args.db or cfg.get("general", {}).get("db_path", "argus.db")
+    conn = init_db(db_path)
+
+    stage2_cfg = cfg.get("stage2", {})
+    index_path = args.index or stage2_cfg.get("faiss_index_path", str(Path(db_path).with_suffix(".faiss")))
+
+    print("==================================================")
+    print("  ARGUS Stage 2 Duplicate Clustering")
+    print("==================================================")
+    print(f"Database         : {db_path}")
+    print(f"FAISS Index      : {index_path}")
+    print(f"Cosine threshold : {stage2_cfg.get('cosine_threshold', 0.92)}")
+    print(f"Neighbors (K)    : {stage2_cfg.get('faiss_k', 20)}")
+    print()
+
+    start_time = time.time()
+    from core.cluster import run_stage2_clustering
+    res = run_stage2_clustering(conn, cfg, index_path=index_path)
+    elapsed = time.time() - start_time
+
+    # Summary
+    total_images = conn.execute("SELECT COUNT(*) FROM images").fetchone()[0]
+    total_clusters = conn.execute("SELECT COUNT(*) FROM clusters").fetchone()[0]
+    clustered_images = conn.execute("SELECT COUNT(*) FROM images WHERE cluster_id IS NOT NULL").fetchone()[0]
+    keepers = conn.execute("SELECT COUNT(*) FROM images WHERE is_keeper = 1").fetchone()[0]
+    signal_counts = dict(
+        conn.execute("SELECT link_signal, COUNT(*) FROM images WHERE cluster_id IS NOT NULL GROUP BY link_signal").fetchall()
+    )
+
+    print("--------------------------------------------------")
+    print(f"Clustering complete in {elapsed:.2f}s")
+    print(f"Candidate pairs found       : {res.candidates_found}")
+    print(f"New Stage 2 clusters        : {res.clusters_created}")
+    print(f"Added to existing clusters  : {res.members_added_to_existing}")
+    print(f"Clusters merged             : {res.clusters_merged}")
+    print()
+    print(f"Total images in library     : {total_images}")
+    print(f"Total duplicate groups      : {total_clusters}")
+    print(f"Files clustered             : {clustered_images}")
+    print(f"Recommended keepers         : {keepers}")
+    print(f"Redundant copies            : {clustered_images - keepers}")
+    print(f"Signal breakdown            : {signal_counts}")
+    print("--------------------------------------------------")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="argus",
@@ -156,12 +203,21 @@ def main(argv: list[str] | None = None) -> None:
     embed_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
     embed_parser.add_argument("--db", default=None, help="Path to SQLite database file")
 
+    cluster_parser = subparsers.add_parser("cluster", help="Cluster duplicate images using FAISS index")
+    cluster_parser.add_argument("folder", nargs="?", default=None, help="Path to image folder (optional)")
+    cluster_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
+    cluster_parser.add_argument("--db", default=None, help="Path to SQLite database file")
+    cluster_parser.add_argument("--index", default=None, help="Path to FAISS index file")
+
     args = parser.parse_args(argv)
     if args.subcommand == "scan":
         cmd_scan(args)
     elif args.subcommand == "embed":
         cmd_embed(args)
+    elif args.subcommand == "cluster":
+        cmd_cluster(args)
 
 
 if __name__ == "__main__":
     main()
+

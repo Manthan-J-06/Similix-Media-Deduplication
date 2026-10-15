@@ -20,6 +20,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator
 
+import os
+
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+try:
+    import faiss  # noqa: F401
+except ImportError:
+    pass
+
 import numpy as np
 import open_clip
 import torch

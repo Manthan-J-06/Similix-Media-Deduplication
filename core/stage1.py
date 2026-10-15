@@ -174,10 +174,11 @@ def cluster_stage1_candidates(
                 conn.execute(
                     """
                     UPDATE images
-                    SET cluster_id = ?,
-                        confidence = ?,
-                        status = 'clustered',
-                        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                    SET cluster_id  = ?,
+                        confidence  = ?,
+                        link_signal = 'phash',
+                        status      = 'clustered',
+                        updated_at  = strftime('%Y-%m-%dT%H:%M:%SZ','now')
                     WHERE id = ?
                     """,
                     (cluster_id, similarity, img["id"]),
@@ -254,11 +255,12 @@ def cluster_stage1_candidates(
                 conn.execute(
                     """
                     UPDATE images
-                    SET cluster_id = ?,
-                        is_keeper = 1,
-                        confidence = 100.0,
-                        status = 'clustered',
-                        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                    SET cluster_id  = ?,
+                        is_keeper   = 1,
+                        confidence  = 100.0,
+                        link_signal = 'phash',
+                        status      = 'clustered',
+                        updated_at  = strftime('%Y-%m-%dT%H:%M:%SZ','now')
                     WHERE id = ?
                     """,
                     (cluster_id, representative["id"]),
@@ -270,11 +272,12 @@ def cluster_stage1_candidates(
                     conn.execute(
                         """
                         UPDATE images
-                        SET cluster_id = ?,
-                            is_keeper = 0,
-                            confidence = ?,
-                            status = 'clustered',
-                            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                        SET cluster_id  = ?,
+                            is_keeper   = 0,
+                            confidence  = ?,
+                            link_signal = 'phash',
+                            status      = 'clustered',
+                            updated_at  = strftime('%Y-%m-%dT%H:%M:%SZ','now')
                         WHERE id = ?
                         """,
                         (cluster_id, similarity, member["id"]),
