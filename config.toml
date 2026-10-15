@@ -97,5 +97,5 @@ brightness_factors = [0.85, 1.15]
 # Contrast adjustment factors.
 contrast_factors = [0.85, 1.15]
 
-# Rotation angles (degrees, counter-clockwise). Only 90° for now.
-rotate_angles = [90]
+# Rotation angles (degrees, counter-clockwise).
+rotate_angles = [90, 180, 270]

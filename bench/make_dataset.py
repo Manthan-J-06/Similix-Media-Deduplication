@@ -345,7 +345,7 @@ def _make_rotations(
         records.append(VariantRecord(
             filename=dest.name,
             original_filename=src.name,
-            transformation="rotate90",
+            transformation=f"rotate{angle}",
             parameters=f"angle={angle}",
         ))
         rotated.close()

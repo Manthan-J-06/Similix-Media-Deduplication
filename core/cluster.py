@@ -134,30 +134,46 @@ def run_stage2_clustering(
     # Load all embedded images metadata into memory for fast lookup
     rows = conn.execute(
         """
-        SELECT id, file_path, width, height, phash, clip_vector, cluster_id, is_keeper, link_signal
+        SELECT id, file_path, width, height, phash, clip_vector,
+               clip_vector_90, clip_vector_180, clip_vector_270,
+               cluster_id, is_keeper, link_signal
         FROM images
         WHERE is_raw_pair = 0
         """
     ).fetchall()
 
     img_map: dict[int, dict[str, Any]] = {}
-    vec_map: dict[int, np.ndarray] = {}
+    vec_map: dict[int, list[np.ndarray]] = {}
 
     for r in rows:
         img_id = r["id"]
         img_dict = dict(r)
         img_map[img_id] = img_dict
-        if r["clip_vector"] is not None:
-            vec_map[img_id] = deserialize_embedding(r["clip_vector"]).astype(np.float32)
+        v_list = []
+        for col in ("clip_vector", "clip_vector_90", "clip_vector_180", "clip_vector_270"):
+            blob = r[col]
+            if blob is not None:
+                v_list.append(deserialize_embedding(blob).astype(np.float32))
+        if v_list:
+            vec_map[img_id] = v_list
 
     def get_sim(id1: int, id2: int) -> float:
         if id1 == id2:
             return 1.0
-        v1 = vec_map.get(id1)
-        v2 = vec_map.get(id2)
-        if v1 is not None and v2 is not None:
-            return cosine_similarity(v1, v2)
-        return 0.0
+        v_list1 = vec_map.get(id1)
+        v_list2 = vec_map.get(id2)
+        if not v_list1 or not v_list2:
+            return 0.0
+        if len(v_list1) > 1 or len(v_list2) > 1:
+            best_sim = -1.0
+            for v1 in v_list1:
+                for v2 in v_list2:
+                    s = cosine_similarity(v1, v2)
+                    if s > best_sim:
+                        best_sim = s
+            return best_sim
+        else:
+            return cosine_similarity(v_list1[0], v_list2[0])
 
     # 4. Match unclustered images against existing cluster representatives
     existing_clusters_cursor = conn.execute(
