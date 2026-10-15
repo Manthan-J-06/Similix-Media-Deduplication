@@ -184,64 +184,74 @@ def run_stage2_clustering(
         """
     ).fetchall()
 
-    for c_row in existing_clusters_cursor:
-        c_id = c_row["id"]
-        rep_id = c_row["representative_id"]
-        if rep_id not in img_map:
+    rep_to_cluster = {
+        c_row["representative_id"]: c_row["id"]
+        for c_row in existing_clusters_cursor
+        if c_row["representative_id"] in img_map
+    }
+
+    # Collect and rank candidate matches to existing representatives by direct similarity
+    # descending to ensure each unclustered image joins its best-matching cluster.
+    matches: list[tuple[float, int, int, int]] = []
+    for id1, id2, _sim in candidate_pairs:
+        rep_id = None
+        unclustered_id = None
+        if id1 in rep_to_cluster and img_map.get(id2, {}).get("cluster_id") is None:
+            rep_id = id1
+            unclustered_id = id2
+        elif id2 in rep_to_cluster and img_map.get(id1, {}).get("cluster_id") is None:
+            rep_id = id2
+            unclustered_id = id1
+
+        if rep_id is not None and unclustered_id is not None:
+            direct_sim = get_sim(unclustered_id, rep_id)
+            if direct_sim >= cosine_threshold:
+                matches.append((direct_sim, unclustered_id, rep_id, rep_to_cluster[rep_id]))
+
+    matches.sort(key=lambda x: -x[0])
+
+    for direct_sim, unclustered_id, rep_id, c_id in matches:
+        u_meta = img_map[unclustered_id]
+        if u_meta.get("cluster_id") is not None:
             continue
+
         rep_meta = img_map[rep_id]
         rep_phash = rep_meta.get("phash")
+        u_phash = u_meta.get("phash")
+        if rep_phash and u_phash:
+            pdist = _hamming_distance(rep_phash, u_phash)
+            signal = "clip" if pdist > hamming_threshold else "phash"
+        else:
+            signal = "clip"
 
-        # Find any unclustered images that are candidate neighbors of rep_id
-        for id1, id2, sim in candidate_pairs:
-            unclustered_id = None
-            if id1 == rep_id and img_map.get(id2, {}).get("cluster_id") is None:
-                unclustered_id = id2
-            elif id2 == rep_id and img_map.get(id1, {}).get("cluster_id") is None:
-                unclustered_id = id1
-
-            if unclustered_id is not None:
-                # Anti-chaining: verify direct similarity to cluster representative
-                direct_sim = get_sim(unclustered_id, rep_id)
-                if direct_sim >= cosine_threshold:
-                    u_meta = img_map[unclustered_id]
-                    # Check pHash if available and not a rotation candidate
-                    u_phash = u_meta.get("phash")
-                    if rep_phash and u_phash:
-                        pdist = _hamming_distance(rep_phash, u_phash)
-                        # If pHash matches very closely, pHash is an additional signal
-                        signal = "clip" if pdist > hamming_threshold else "phash"
-                    else:
-                        signal = "clip"
-
-                    conf = round(direct_sim * 100.0, 1)
-                    conn.execute(
-                        """
-                        UPDATE images
-                        SET cluster_id  = ?,
-                            is_keeper   = 0,
-                            confidence  = ?,
-                            link_signal = ?,
-                            status      = 'clustered',
-                            updated_at  = strftime('%Y-%m-%dT%H:%M:%SZ','now')
-                        WHERE id = ?
-                        """,
-                        (c_id, conf, signal, unclustered_id),
-                    )
-                    conn.execute(
-                        """
-                        UPDATE clusters
-                        SET member_count = member_count + 1
-                        WHERE id = ?
-                        """,
-                        (c_id,),
-                    )
-                    u_meta["cluster_id"] = c_id
-                    u_meta["is_keeper"] = 0
-                    u_meta["confidence"] = conf
-                    u_meta["link_signal"] = signal
-                    res.members_added_to_existing += 1
-                    res.total_files_clustered += 1
+        conf = round(direct_sim * 100.0, 1)
+        conn.execute(
+            """
+            UPDATE images
+            SET cluster_id  = ?,
+                is_keeper   = 0,
+                confidence  = ?,
+                link_signal = ?,
+                status      = 'clustered',
+                updated_at  = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+            WHERE id = ?
+            """,
+            (c_id, conf, signal, unclustered_id),
+        )
+        conn.execute(
+            """
+            UPDATE clusters
+            SET member_count = member_count + 1
+            WHERE id = ?
+            """,
+            (c_id,),
+        )
+        u_meta["cluster_id"] = c_id
+        u_meta["is_keeper"] = 0
+        u_meta["confidence"] = conf
+        u_meta["link_signal"] = signal
+        res.members_added_to_existing += 1
+        res.total_files_clustered += 1
 
     conn.commit()
 

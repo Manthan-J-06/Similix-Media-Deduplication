@@ -367,3 +367,68 @@ class TestUnifiedClustersAndLinkSignal:
         res2 = run_stage2_clustering(conn, cfg)
         clusters_after = conn.execute("SELECT COUNT(*) FROM clusters").fetchone()[0]
         assert clusters_after == 3
+
+
+class TestBestMatchingRepresentativeAssignment:
+    """
+    Ensure an unclustered image matches the cluster representative with the highest similarity,
+    rather than being greedily captured by an earlier-visited cluster in arbitrary database order.
+    """
+
+    def test_unclustered_matches_highest_similarity_representative(self, tmp_path):
+        db_path = tmp_path / "test_best_rep.db"
+        conn = init_db(db_path)
+        dim = 512
+
+        def make_vec(angle: float) -> np.ndarray:
+            v = np.zeros(dim, dtype=np.float32)
+            v[0] = np.cos(angle)
+            v[1] = np.sin(angle)
+            return v
+
+        # C1 representative at angle +0.40 (cos(0.40) ~= 0.921)
+        # C2 representative at angle -0.10 (cos(-0.10) ~= 0.995)
+        # C1 vs C2 distance is 0.50 rad (cos(0.50) ~= 0.877 < 0.90, so clusters do not merge)
+        # Unclustered image U at angle 0.0 (sim with C1 is 0.921, with C2 is 0.995)
+        v_u = make_vec(0.0)
+        v_c1 = make_vec(0.40)
+        v_c2 = make_vec(-0.10)
+
+        # Cluster 1 (id=1, rep_id=1)
+        c1 = conn.execute("INSERT INTO clusters (stage_detected, member_count) VALUES (1, 1)").lastrowid
+        conn.execute(
+            "INSERT INTO images (id, file_path, clip_vector, cluster_id, is_keeper, status) VALUES (1, 'c1_rep.jpg', ?, ?, 1, 'clustered')",
+            (serialize_embedding(v_c1), c1),
+        )
+        conn.execute("UPDATE clusters SET representative_id = 1 WHERE id = ?", (c1,))
+
+        # Cluster 2 (id=2, rep_id=2)
+        c2 = conn.execute("INSERT INTO clusters (stage_detected, member_count) VALUES (1, 1)").lastrowid
+        conn.execute(
+            "INSERT INTO images (id, file_path, clip_vector, cluster_id, is_keeper, status) VALUES (2, 'c2_rep.jpg', ?, ?, 1, 'clustered')",
+            (serialize_embedding(v_c2), c2),
+        )
+        conn.execute("UPDATE clusters SET representative_id = 2 WHERE id = ?", (c2,))
+
+        # Unclustered image U (id=3)
+        conn.execute(
+            "INSERT INTO images (id, file_path, clip_vector, cluster_id, status) VALUES (3, 'u.jpg', ?, NULL, 'embedded')",
+            (serialize_embedding(v_u),),
+        )
+        conn.commit()
+
+        cfg = {
+            "stage2": {
+                "cosine_threshold": 0.90,
+                "faiss_k": 10,
+                "embedding_dim": dim,
+            }
+        }
+
+        run_stage2_clustering(conn, cfg)
+
+        u_row = conn.execute("SELECT cluster_id, confidence FROM images WHERE id = 3").fetchone()
+        # Must be assigned to c2 (sim 0.995), NOT c1 (sim 0.913)
+        assert u_row["cluster_id"] == c2
+        assert u_row["confidence"] >= 99.0
+

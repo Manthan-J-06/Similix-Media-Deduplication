@@ -36,8 +36,8 @@ clip_model = "ViT-B-32"
 clip_pretrained = "laion2b_s34b_b79k"
 # Embedding batch size (default 32). Memory is freed between batches.
 batch_size = 32
-# Also store embeddings for 90/180/270 degree rotated thumbnails (default: false).
-enable_rotation_embeddings = false
+# Also store embeddings for 90/180/270 degree rotated thumbnails (default: true).
+enable_rotation_embeddings = true
 # Cosine-similarity threshold to accept a candidate pair.
 cosine_threshold = 0.92
 # Number of neighbours to retrieve per query.
