@@ -43,13 +43,24 @@ cosine_threshold = 0.92
 # Number of neighbours to retrieve per query.
 faiss_k = 20
 
-# ── Stage 3: SSIM / quality scoring ──────────────────────────────────────────
-# (Not yet active — placeholders for when Stage 3 is implemented.)
+# ── Stage 3: Geometric verification (keypoint matching + RANSAC) ─────────────
 [stage3]
-# Minimum SSIM score to consider a pair visually equivalent.
-ssim_threshold = 0.85
-# Laplacian variance threshold below which an image is considered blurry.
-blur_threshold = 100.0
+# Feature detector algorithm: "sift" (patent expired, Apache 2.0) or "orb".
+algorithm = "sift"
+# Maximum number of keypoint features to extract per image proxy.
+max_features = 2000
+# Target proxy edge length (px) for geometric verification (default 512).
+proxy_size = 512
+# Lowe's distance ratio threshold for matching (lower = stricter).
+ratio_threshold = 0.75
+# RANSAC reprojection error threshold in pixels.
+ransac_reproj_threshold = 4.0
+# Minimum number of geometrically consistent inliers to accept a pair.
+min_inliers = 20
+# Minimum ratio of inliers to good feature matches.
+min_inlier_ratio = 0.65
+# Geometric transformation model: "affine" (similarity: scale+rot+trans) or "homography"
+transformation_model = "affine"
 
 # ── Stage 4: Keeper selection ─────────────────────────────────────────────────
 # (Not yet active — placeholders for when Stage 4 is implemented.)

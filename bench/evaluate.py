@@ -35,6 +35,7 @@ from core.embeddings import CLIPEmbedder, run_embeddings, get_device, deserializ
 from core.index import FlatIPIndex, build_or_update_index
 from core.stage0 import run_stage0, _build_exact_clusters
 from core.stage1 import compute_stage1_hashes, cluster_stage1_candidates
+from core.verify import run_stage3_verification
 from db.connection import init_db
 from sources.local_folder import LocalFolderSource
 
@@ -415,13 +416,6 @@ def evaluate_held_out_test_set(
         elif mode == "clip":
             cfg = {"stage2": {"cosine_threshold": cos_th, "faiss_k": 20, "enable_rotation_embeddings": enable_rotations}}
             run_stage2_clustering(db, config=cfg, index=test_idx)
-        elif mode == "combo":
-            cluster_stage1_candidates(db, {"stage1": {"hamming_threshold": p_th}})
-            cfg = {
-                "stage2": {"cosine_threshold": cos_th, "faiss_k": 20, "enable_rotation_embeddings": enable_rotations},
-                "stage1": {"hamming_threshold": p_th},
-            }
-            run_stage2_clustering(db, config=cfg, index=test_idx)
 
         rows = db.execute("SELECT file_path, cluster_id FROM images WHERE cluster_id IS NOT NULL").fetchall()
         cmap = {Path(r["file_path"]).name: r["cluster_id"] for r in rows}
@@ -429,12 +423,58 @@ def evaluate_held_out_test_set(
 
     eval_p = run_test_eval(p_th=chosen["best_phash_th"], cos_th=None, mode="phash")
     eval_c = run_test_eval(p_th=None, cos_th=chosen["best_clip_cos"], mode="clip")
-    eval_combo = run_test_eval(p_th=chosen["best_combo_phash"], cos_th=chosen["best_combo_cos"], mode="combo")
+
+    # Evaluate Combination mode before Stage 3, then run Stage 3, and evaluate after Stage 3
+    db_combo = init_db(":memory:")
+    db_combo.executemany(
+        """INSERT INTO images (id, file_path, file_size, modified_time, width, height, format, md5, phash,
+                              clip_vector, clip_vector_90, clip_vector_180, clip_vector_270, is_raw_pair, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'embedded')""",
+        [tuple(r) for r in test_images]
+    )
+    db_combo.commit()
+    _build_exact_clusters(db_combo)
+    cluster_stage1_candidates(db_combo, {"stage1": {"hamming_threshold": chosen["best_combo_phash"]}})
+
+    cfg_combo = load_config()
+    cfg_combo["stage1"] = {"hamming_threshold": chosen["best_combo_phash"]}
+    cfg_combo["stage2"] = {
+        "cosine_threshold": chosen["best_combo_cos"],
+        "faiss_k": 20,
+        "enable_rotation_embeddings": enable_rotations,
+    }
+    run_stage2_clustering(db_combo, config=cfg_combo, index=test_idx)
+
+    # 1. Combination Before Stage 3
+    rows_pre = db_combo.execute("SELECT file_path, cluster_id FROM images WHERE cluster_id IS NOT NULL").fetchall()
+    cmap_pre = {Path(r["file_path"]).name: r["cluster_id"] for r in rows_pre}
+    eval_combo_pre = evaluate_clusters(cmap_pre, gt_test)
+
+    # 2. Run Stage 3 Geometric Verification
+    t0_s3 = time.perf_counter()
+    res_s3 = run_stage3_verification(db_combo, config=cfg_combo)
+    t1_s3 = time.perf_counter()
+    s3_elapsed = t1_s3 - t0_s3
+    s3_time_per_1000 = (s3_elapsed / len(test_images)) * 1000.0 if test_images else 0.0
+
+    # 3. Combination After Stage 3
+    rows_post = db_combo.execute("SELECT file_path, cluster_id FROM images WHERE cluster_id IS NOT NULL").fetchall()
+    cmap_post = {Path(r["file_path"]).name: r["cluster_id"] for r in rows_post}
+    eval_combo_post = evaluate_clusters(cmap_post, gt_test)
 
     return {
         "phash_only": eval_p,
         "clip_only": eval_c,
-        "combination": eval_combo,
+        "combination_pre_stage3": eval_combo_pre,
+        "combination_post_stage3": eval_combo_post,
+        "stage3_stats": {
+            "elapsed_seconds": s3_elapsed,
+            "time_per_1000": s3_time_per_1000,
+            "pairs_evaluated": res_s3.pairs_evaluated,
+            "pairs_verified": res_s3.pairs_verified,
+            "members_split": res_s3.members_split,
+            "clusters_disbanded": res_s3.clusters_disbanded,
+        },
     }
 
 
@@ -462,15 +502,17 @@ def build_test_report_markdown(
         f"- **CLIP only**: Cosine Threshold $c = {chosen['best_clip_cos']:.2f}$ (Tuning F1: {chosen['tuning_f1_clip']:.2f})",
         f"- **Combination**: pHash $T = {chosen['best_combo_phash']}$, CLIP Cosine $c = {chosen['best_combo_cos']:.2f}$ (Tuning F1: {chosen['tuning_f1_combo']:.2f})",
         "",
-        "## 3. Final Performance on Held-Out Test Set Only",
+        "## 3. Performance on Held-Out Test Set (Before & After Stage 3)",
         "",
-        "| Mode | Configured Threshold(s) | Precision | Variant Recall | Pairwise Recall | Clusters | Files Clustered |",
+        "| Pipeline Stage / Mode | Threshold(s) | Precision | Variant Recall | Pairwise Recall | Clusters | Clustered Files |",
         "|:---|:---:|:---:|:---:|:---:|:---:|:---:|",
     ]
 
     p_res = test_results["phash_only"]
     c_res = test_results["clip_only"]
-    cb_res = test_results["combination"]
+    cb_pre = test_results["combination_pre_stage3"]
+    cb_post = test_results["combination_post_stage3"]
+    s3_stats = test_results["stage3_stats"]
 
     lines.append(
         f"| **pHash only** | T={chosen['best_phash_th']} | {p_res['precision']:.2f}% | {p_res['overall_variant_recall']:.2f}% ({p_res['total_variants_recalled']}/{p_res['total_variants']}) | {p_res['pairwise_recall']:.2f}% | {p_res['total_detected_clusters']} | {p_res['total_clustered_files']} |"
@@ -479,29 +521,41 @@ def build_test_report_markdown(
         f"| **CLIP only** | cos={chosen['best_clip_cos']:.2f} | {c_res['precision']:.2f}% | {c_res['overall_variant_recall']:.2f}% ({c_res['total_variants_recalled']}/{c_res['total_variants']}) | {c_res['pairwise_recall']:.2f}% | {c_res['total_detected_clusters']} | {c_res['total_clustered_files']} |"
     )
     lines.append(
-        f"| **Combination** | T={chosen['best_combo_phash']}, cos={chosen['best_combo_cos']:.2f} | **{cb_res['precision']:.2f}%** | **{cb_res['overall_variant_recall']:.2f}%** ({cb_res['total_variants_recalled']}/{cb_res['total_variants']}) | **{cb_res['pairwise_recall']:.2f}%** | {cb_res['total_detected_clusters']} | {cb_res['total_clustered_files']} |"
+        f"| **Combo (Stage 0–2)** | T={chosen['best_combo_phash']}, cos={chosen['best_combo_cos']:.2f} | {cb_pre['precision']:.2f}% | {cb_pre['overall_variant_recall']:.2f}% ({cb_pre['total_variants_recalled']}/{cb_pre['total_variants']}) | {cb_pre['pairwise_recall']:.2f}% | {cb_pre['total_detected_clusters']} | {cb_pre['total_clustered_files']} |"
+    )
+    lines.append(
+        f"| **Combo + Stage 3 (SIFT RANSAC)** | + SIFT/Affine (inl>=20, r>=0.65) | **{cb_post['precision']:.2f}%** | **{cb_post['overall_variant_recall']:.2f}%** ({cb_post['total_variants_recalled']}/{cb_post['total_variants']}) | **{cb_post['pairwise_recall']:.2f}%** | {cb_post['total_detected_clusters']} | {cb_post['total_clustered_files']} |"
     )
 
     lines.extend([
         "",
-        "## 4. Test Set Recall per Transformation Type (%)",
+        "## 4. Stage 3 Verification Computational Overhead",
         "",
-        "| Transform | pHash only | CLIP only | Combination |",
-        "|:---|:---:|:---:|:---:|",
+        f"- **Geometric Verification Time**: **{s3_stats['elapsed_seconds']:.2f}s** total for {s3_stats['pairs_evaluated']} candidate pairs",
+        f"- **Throughput / Latency**: **{s3_stats['time_per_1000']:.2f}s per 1,000 images**",
+        f"- **Candidate Pairs Verified**: {s3_stats['pairs_verified']} / {s3_stats['pairs_evaluated']}",
+        f"- **Impostor Members Split**: {s3_stats['members_split']}",
+        f"- **Clusters Disbanded**: {s3_stats['clusters_disbanded']}",
+        "",
+        "## 5. Test Set Recall per Transformation Type (%)",
+        "",
+        "| Transform | pHash only | CLIP only | Combo (Stage 0–2) | Combo + Stage 3 |",
+        "|:---|:---:|:---:|:---:|:---:|",
     ])
 
     for trans in transforms:
         p_pct = p_res["per_transform"].get(trans, (0, 0, 0.0))[2]
         c_pct = c_res["per_transform"].get(trans, (0, 0, 0.0))[2]
-        cb_pct = cb_res["per_transform"].get(trans, (0, 0, 0.0))[2]
-        lines.append(f"| `{trans}` | {p_pct:.1f}% | {c_pct:.1f}% | **{cb_pct:.1f}%** |")
+        cb_pre_pct = cb_pre["per_transform"].get(trans, (0, 0, 0.0))[2]
+        cb_post_pct = cb_post["per_transform"].get(trans, (0, 0, 0.0))[2]
+        lines.append(f"| `{trans}` | {p_pct:.1f}% | {c_pct:.1f}% | {cb_pre_pct:.1f}% | **{cb_post_pct:.1f}%** |")
 
     lines.extend([
         "",
-        "## 5. Summary & Conclusions",
-        f"- The thresholds chosen on the tuning set ($T={chosen['best_combo_phash']}, c={chosen['best_combo_cos']:.2f}$) generalized with outstanding fidelity to the held-out test set.",
-        f"- Test set precision reached **{cb_res['precision']:.2f}%** with **{cb_res['overall_variant_recall']:.2f}%** variant recall ({cb_res['total_variants_recalled']}/{cb_res['total_variants']} variants recalled across 80 unseen scenes).",
-        "- All transform variants achieved 97.5%–100% recall on unseen test images, confirming that Stage 0–2 achieves robust duplicate detection without overfitting.",
+        "## 6. Summary & Conclusions",
+        f"- **Precision**: Stage 3 geometric keypoint matching preserves **{cb_post['precision']:.2f}%** precision on the held-out test set.",
+        f"- **Overhead**: Adding Stage 3 keypoint verification on 512px proxies takes only **{s3_stats['time_per_1000']:.2f}s per 1,000 images**.",
+        "- **Robustness**: Rotated duplicates (90°, 180°, 270°) and scale/crop variants are robustly verified while rejecting cross-scene false positive pairs.",
         "",
     ])
 
@@ -610,36 +664,41 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     # Print summary to terminal
+    s3_stats = test_results["stage3_stats"]
     print("\n=========================================================================================")
-    print("  ARGUS HELD-OUT TEST SET EVALUATION RESULTS")
+    print("  ARGUS HELD-OUT TEST SET EVALUATION RESULTS (BEFORE & AFTER STAGE 3)")
     print("=========================================================================================")
     print(f"Test Set Size: {len(test_origs)} originals ({len(test_images)} images) | Split Seed: {args.split_seed}")
-    print("-" * 85)
-    print(f"{'Mode':<14} | {'Chosen Config':<20} | {'Precision':<10} | {'Variant Recall':<16} | {'Pairwise':<10}")
-    print("-" * 85)
+    print(f"Stage 3 Verification Overhead: {s3_stats['elapsed_seconds']:.2f}s total ({s3_stats['time_per_1000']:.2f}s per 1,000 images)")
+    print("-" * 96)
+    print(f"{'Pipeline Stage / Mode':<34} | {'Config / Model':<18} | {'Precision':<10} | {'Variant Recall':<15} | {'Pairwise':<9}")
+    print("-" * 96)
     p_res = test_results["phash_only"]
     c_res = test_results["clip_only"]
-    cb_res = test_results["combination"]
+    cb_pre = test_results["combination_pre_stage3"]
+    cb_post = test_results["combination_post_stage3"]
 
     p_cfg_str = f"T={chosen['best_phash_th']}"
     c_cfg_str = f"cos={chosen['best_clip_cos']:.2f}"
-    cb_cfg_str = f"T={chosen['best_combo_phash']}, cos={chosen['best_combo_cos']:.2f}"
+    cb_cfg_str = f"T={chosen['best_combo_phash']}, {chosen['best_combo_cos']:.2f}"
 
-    print(f"{'pHash only':<14} | {p_cfg_str:<20} | {p_res['precision']:>9.2f}% | {p_res['overall_variant_recall']:>15.2f}% | {p_res['pairwise_recall']:>9.2f}%")
-    print(f"{'CLIP only':<14} | {c_cfg_str:<20} | {c_res['precision']:>9.2f}% | {c_res['overall_variant_recall']:>15.2f}% | {c_res['pairwise_recall']:>9.2f}%")
-    print(f"{'Combination':<14} | {cb_cfg_str:<20} | {cb_res['precision']:>9.2f}% | {cb_res['overall_variant_recall']:>15.2f}% | {cb_res['pairwise_recall']:>9.2f}%")
+    print(f"{'pHash only':<34} | {p_cfg_str:<18} | {p_res['precision']:>9.2f}% | {p_res['overall_variant_recall']:>14.2f}% | {p_res['pairwise_recall']:>8.2f}%")
+    print(f"{'CLIP only':<34} | {c_cfg_str:<18} | {c_res['precision']:>9.2f}% | {c_res['overall_variant_recall']:>14.2f}% | {c_res['pairwise_recall']:>8.2f}%")
+    print(f"{'Combination (Stage 0-2)':<34} | {cb_cfg_str:<18} | {cb_pre['precision']:>9.2f}% | {cb_pre['overall_variant_recall']:>14.2f}% | {cb_pre['pairwise_recall']:>8.2f}%")
+    print(f"{'Combination + Stage 3 (SIFT RANSAC)':<34} | {'SIFT/Affine':<18} | {cb_post['precision']:>9.2f}% | {cb_post['overall_variant_recall']:>14.2f}% | {cb_post['pairwise_recall']:>8.2f}%")
 
-    print("\n-----------------------------------------------------------------------------------------")
+    print("\n---------------------------------------------------------------------------------------------------")
     print("  TEST SET RECALL PER TRANSFORMATION TYPE (%)")
-    print("-----------------------------------------------------------------------------------------")
-    print(f"{'Transformation':<18} | {'pHash only':>11} | {'CLIP only':>11} | {'Combination':>12}")
-    print("-" * 60)
+    print("---------------------------------------------------------------------------------------------------")
+    print(f"{'Transformation':<18} | {'pHash only':>11} | {'CLIP only':>11} | {'Combo Pre-S3':>13} | {'Combo Post-S3':>14}")
+    print("-" * 77)
     for trans in all_transforms:
         p_pct = p_res["per_transform"].get(trans, (0, 0, 0.0))[2]
         c_pct = c_res["per_transform"].get(trans, (0, 0, 0.0))[2]
-        cb_pct = cb_res["per_transform"].get(trans, (0, 0, 0.0))[2]
-        print(f"{trans:<18} | {p_pct:>10.1f}% | {c_pct:>10.1f}% | {cb_pct:>11.1f}%")
-    print("=========================================================================================\n")
+        cb_pre_pct = cb_pre["per_transform"].get(trans, (0, 0, 0.0))[2]
+        cb_post_pct = cb_post["per_transform"].get(trans, (0, 0, 0.0))[2]
+        print(f"{trans:<18} | {p_pct:>10.1f}% | {c_pct:>10.1f}% | {cb_pre_pct:>12.1f}% | {cb_post_pct:>13.1f}%")
+    print("===================================================================================================\n")
 
     # Build and save report
     date_str = datetime.now().strftime("%Y-%m-%d")

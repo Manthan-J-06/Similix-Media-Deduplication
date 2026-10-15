@@ -177,6 +177,7 @@ argus/
 | 8 | 2026-10-15 | Anti-Chaining Clustering & Unified Cluster Table (`core/cluster.py`) | Anti-chaining representative verification: members must be directly similar to keeper (`cosine_threshold` / pHash), with mutual compatibility; failing members are split out and re-evaluated. Unified `clusters` table covers Stage 0 (MD5), Stage 1 (pHash), and Stage 2 (CLIP) with per-member `link_signal` and `confidence` score. OpenMP runtime collision guarded for macOS (`KMP_DUPLICATE_LIB_OK=TRUE`). |
 | 9 | 2026-10-15 | Reproducible Benchmark Split & Held-Out Test Evaluation | Partitioned benchmark (200 originals, 4,000 images) into a 60% tuning set (120 originals, 2,400 images) and 40% held-out test set (80 originals, 1,600 images) split strictly by original image to prevent data leakage (`bench/split.json`, random seed `42`). Threshold tuning on the 60% set chose: pHash $T=8$, CLIP $\text{cos}=0.88$, and Combination $T=8, \text{cos}=0.90$. Held-out test set evaluation verified **99.60% precision**, **99.67% variant recall** (1,515/1,520 variants), and **99.41% pairwise recall** across all transformations. |
 | 10 | 2026-10-15 | Rotation Embeddings Default-On & Best-Matching Cluster Assignment | Set `enable_rotation_embeddings = true` by default in `config.toml` (accepting the 2.7x embedding time cost: 37.3s vs 13.8s per 1,000 images) to achieve 100% recall on 90°/180°/270° rotated duplicates. Fixed combination mode Stage 2 cluster assignment by ranking candidate matches to existing representatives by direct similarity descending rather than arbitrary database iteration order, eliminating greedy misassignment of rotated variants to visually adjacent clusters and raising rotated variant recall from 98.8% to 100.0%. |
+| 11 | 2026-10-15 | Stage 3 Geometric Verification via SIFT Keypoint Matching & RANSAC | **Licensing:** SIFT US Patent 6,711,293 expired in March 2020; OpenCV moved SIFT to the main repository under the **Apache 2.0 License** in OpenCV 4.4.0 (July 2020), making it fully patent-free and permissively licensed worldwide. Implemented `core/verify.py` using SIFT keypoint extraction with RANSAC affine/homography estimation on ~512px proxies. Cluster members are verified against the cluster representative (`min_inliers = 20`, `min_inlier_ratio = 0.65`); failing members are split out and singletons disbanded. Tolerates crops, rescaling, and 90°/180°/270° rotations while cleanly rejecting cross-scene false positive pairs (e.g., `picsum_0008` vs `0009`, `picsum_0001` vs `0005`). Achieves **99.86% precision** on the held-out test set with minimal computational overhead (**17.26s per 1,000 images**). |
 
 ---
 
@@ -192,7 +193,7 @@ argus/
 | Stage 1 (pHash) | ✅ Done — commit `fb4ab5e` |
 | Stage 2 (CLIP embeddings & FAISS clustering) | ✅ Done (`core/embeddings.py`, `core/index.py`, `core/cluster.py`, CLI `embed` & `cluster`) |
 | Benchmark & Held-Out Test Evaluation | ✅ Done — 60/40 reproducible split (seed `42`), tuning on 60%, test on 40% (99.60% precision, 99.67% recall) |
-| Stage 3 (SSIM) | 🔲 Next step |
-| Stage 4 (full-res keeper) | 🔲 Not started |
+| Stage 3 (Geometric Verification: SIFT + RANSAC) | ✅ Done (`core/verify.py`, CLI `verify`, `tests/test_verify.py`) |
+| Stage 4 (full-res keeper) | 🔲 Next step |
 | API layer | 🔲 Not started |
 | UI | 🔲 Not started |

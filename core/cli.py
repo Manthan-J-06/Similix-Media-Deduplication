@@ -186,6 +186,48 @@ def cmd_cluster(args: argparse.Namespace) -> None:
     print("--------------------------------------------------")
 
 
+def cmd_verify(args: argparse.Namespace) -> None:
+    cfg = load_config(args.config)
+    db_path = args.db or cfg.get("general", {}).get("db_path", "argus.db")
+    conn = init_db(db_path)
+
+    stage3_cfg = cfg.get("stage3", {})
+    algo = stage3_cfg.get("algorithm", "sift")
+    min_inl = stage3_cfg.get("min_inliers", 20)
+    min_rat = stage3_cfg.get("min_inlier_ratio", 0.65)
+
+    print("==================================================")
+    print("  ARGUS Stage 3 Geometric Verification")
+    print("==================================================")
+    print(f"Database         : {db_path}")
+    print(f"Algorithm        : {algo.upper()}")
+    print(f"Min Inliers      : {min_inl}")
+    print(f"Min Inlier Ratio : {min_rat}")
+    print()
+
+    source = None
+    if args.folder:
+        folder = Path(args.folder).resolve()
+        if folder.exists() and folder.is_dir():
+            source = LocalFolderSource(folder)
+
+    from core.verify import run_stage3_verification
+    res = run_stage3_verification(conn, cfg, source=source)
+
+    total_clusters = conn.execute("SELECT COUNT(*) FROM clusters").fetchone()[0]
+    clustered_images = conn.execute("SELECT COUNT(*) FROM images WHERE cluster_id IS NOT NULL").fetchone()[0]
+
+    print("--------------------------------------------------")
+    print(f"Verification complete in {res.elapsed_seconds:.2f}s ({res.time_per_1000:.2f}s per 1,000 images)")
+    print(f"Pairs evaluated          : {res.pairs_evaluated}")
+    print(f"Pairs verified           : {res.pairs_verified}")
+    print(f"Impostor members split   : {res.members_split}")
+    print(f"Clusters disbanded       : {res.clusters_disbanded}")
+    print(f"Remaining duplicate groups: {total_clusters}")
+    print(f"Remaining clustered files: {clustered_images}")
+    print("--------------------------------------------------")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="argus",
@@ -209,6 +251,11 @@ def main(argv: list[str] | None = None) -> None:
     cluster_parser.add_argument("--db", default=None, help="Path to SQLite database file")
     cluster_parser.add_argument("--index", default=None, help="Path to FAISS index file")
 
+    verify_parser = subparsers.add_parser("verify", help="Verify clusters with geometric keypoint matching (Stage 3)")
+    verify_parser.add_argument("folder", nargs="?", default=None, help="Path to image folder (optional)")
+    verify_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
+    verify_parser.add_argument("--db", default=None, help="Path to SQLite database file")
+
     args = parser.parse_args(argv)
     if args.subcommand == "scan":
         cmd_scan(args)
@@ -216,6 +263,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_embed(args)
     elif args.subcommand == "cluster":
         cmd_cluster(args)
+    elif args.subcommand == "verify":
+        cmd_verify(args)
 
 
 if __name__ == "__main__":
