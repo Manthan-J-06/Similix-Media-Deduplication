@@ -7,9 +7,15 @@ estimation (RANSAC) on ~512px proxy thumbnails.
 
 Features:
 - Tolerates crops, rescaling, and arbitrary rotations (90°, 180°, 270°).
-- Outputs inlier count and inlier ratio for each member-representative pair.
+- Outputs inlier count, inlier ratio, and status ("verified", "failed", "inconclusive").
+- Inconclusive verdict when either image has fewer than min_keypoints (default 100).
+  Inconclusive members keep their existing cluster, are flagged with is_low_confidence = 1,
+  and are excluded from auto-delete recommendations.
 - Non-matching members (below min_inliers or min_inlier_ratio) are split out of the cluster.
-- Clusters reduced to fewer than 2 members are disbanded.
+- Re-evaluation: members split out of a cluster are re-evaluated against other surviving
+  cluster representatives and against each other to form separate clusters (never simply dropped).
+- Caches keypoints and descriptors per image in SQLite (table keypoint_cache) and in-memory
+  so representatives and members are never re-detected repeatedly.
 - Uses SIFT (patent expired March 2020, Apache 2.0 license in OpenCV 4.4+) as the default
   matcher, with ORB as a configurable alternative.
 """
@@ -18,6 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import pickle
 import sqlite3
 import time
 from typing import Any
@@ -32,6 +39,7 @@ from sources.base import ImageSource
 @dataclass
 class MatchResult:
     """Detailed result of keypoint matching and RANSAC verification between two images."""
+    status: str  # "verified" | "failed" | "inconclusive"
     verified: bool
     inlier_count: int
     inlier_ratio: float
@@ -51,17 +59,66 @@ class PairVerificationRecord:
     inlier_ratio: float
     good_matches: int
     verified: bool
+    status: str = "verified"
 
 
 @dataclass
 class Stage3Result:
     pairs_evaluated: int = 0
     pairs_verified: int = 0
+    pairs_inconclusive: int = 0
+    pairs_failed: int = 0
     members_split: int = 0
     clusters_disbanded: int = 0
+    new_clusters_formed: int = 0
+    low_confidence_members: int = 0
     elapsed_seconds: float = 0.0
     time_per_1000: float = 0.0
     pair_details: list[PairVerificationRecord] = field(default_factory=list)
+
+
+def serialize_keypoints(keypoints: list[cv2.KeyPoint]) -> bytes:
+    """Serialize OpenCV KeyPoints into compact float32 binary format."""
+    if not keypoints:
+        return b""
+    arr = np.array(
+        [(kp.pt[0], kp.pt[1], kp.size, kp.angle, kp.response, kp.octave, kp.class_id) for kp in keypoints],
+        dtype=np.float32,
+    )
+    return arr.tobytes()
+
+
+def deserialize_keypoints(data: bytes) -> list[cv2.KeyPoint]:
+    """Deserialize binary format back into a list of OpenCV KeyPoints."""
+    if not data:
+        return []
+    arr = np.frombuffer(data, dtype=np.float32).reshape(-1, 7)
+    return [
+        cv2.KeyPoint(
+            x=float(r[0]),
+            y=float(r[1]),
+            size=float(r[2]),
+            angle=float(r[3]),
+            response=float(r[4]),
+            octave=int(r[5]),
+            class_id=int(r[6]),
+        )
+        for r in arr
+    ]
+
+
+def serialize_descriptors(descriptors: np.ndarray | None) -> bytes:
+    """Serialize numpy feature descriptors into bytes."""
+    if descriptors is None or len(descriptors) == 0:
+        return b""
+    return pickle.dumps(descriptors)
+
+
+def deserialize_descriptors(data: bytes) -> np.ndarray | None:
+    """Deserialize bytes back into numpy feature descriptors."""
+    if not data:
+        return None
+    return pickle.loads(data)
 
 
 def load_proxy_grayscale(
@@ -123,6 +180,7 @@ class KeypointVerifier:
 
         self.algorithm = str(stage3_cfg.get("algorithm", "sift")).lower()
         self.max_features = int(stage3_cfg.get("max_features", 2000))
+        self.min_keypoints = int(stage3_cfg.get("min_keypoints", 100))
         self.proxy_size = int(stage3_cfg.get("proxy_size", 512))
         self.ratio_threshold = float(stage3_cfg.get("ratio_threshold", 0.75))
         self.ransac_reproj = float(stage3_cfg.get("ransac_reproj_threshold", 4.0))
@@ -152,12 +210,28 @@ class KeypointVerifier:
     ) -> MatchResult:
         """
         Match extracted descriptors and compute inliers via RANSAC.
+        Returns MatchResult with status in {"verified", "failed", "inconclusive"}.
         """
         nkp1 = len(kp1)
         nkp2 = len(kp2)
 
+        # Check for insufficient keypoints -> inconclusive verdict
+        if nkp1 < self.min_keypoints or nkp2 < self.min_keypoints:
+            if des1 is None or des2 is None or len(des1) < 4 or len(des2) < 4:
+                return MatchResult(
+                    status="inconclusive",
+                    verified=True,
+                    inlier_count=0,
+                    inlier_ratio=0.0,
+                    good_matches=0,
+                    total_keypoints_1=nkp1,
+                    total_keypoints_2=nkp2,
+                    message=f"Inconclusive: insufficient keypoints ({min(nkp1, nkp2)} < {self.min_keypoints})",
+                )
+
         if des1 is None or des2 is None or len(des1) < 4 or len(des2) < 4:
             return MatchResult(
+                status="failed",
                 verified=False,
                 inlier_count=0,
                 inlier_ratio=0.0,
@@ -180,7 +254,19 @@ class KeypointVerifier:
                 good_matches.append(match[0])
 
         if len(good_matches) < 4:
+            if nkp1 < self.min_keypoints or nkp2 < self.min_keypoints:
+                return MatchResult(
+                    status="inconclusive",
+                    verified=True,
+                    inlier_count=len(good_matches),
+                    inlier_ratio=0.0,
+                    good_matches=len(good_matches),
+                    total_keypoints_1=nkp1,
+                    total_keypoints_2=nkp2,
+                    message=f"Inconclusive: insufficient keypoints ({min(nkp1, nkp2)} < {self.min_keypoints})",
+                )
             return MatchResult(
+                status="failed",
                 verified=False,
                 inlier_count=len(good_matches),
                 inlier_ratio=0.0,
@@ -196,13 +282,24 @@ class KeypointVerifier:
         if self.model == "homography":
             _M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, self.ransac_reproj)
         else:
-            # Affine partial (2D Euclidean similarity: scale, rotation, translation)
             _M, mask = cv2.estimateAffinePartial2D(
                 src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=self.ransac_reproj
             )
 
         if mask is None:
+            if nkp1 < self.min_keypoints or nkp2 < self.min_keypoints:
+                return MatchResult(
+                    status="inconclusive",
+                    verified=True,
+                    inlier_count=0,
+                    inlier_ratio=0.0,
+                    good_matches=len(good_matches),
+                    total_keypoints_1=nkp1,
+                    total_keypoints_2=nkp2,
+                    message=f"Inconclusive: insufficient keypoints ({min(nkp1, nkp2)} < {self.min_keypoints})",
+                )
             return MatchResult(
+                status="failed",
                 verified=False,
                 inlier_count=0,
                 inlier_ratio=0.0,
@@ -215,9 +312,23 @@ class KeypointVerifier:
         inlier_count = int(np.sum(mask))
         inlier_ratio = inlier_count / len(good_matches) if good_matches else 0.0
 
+        if nkp1 < self.min_keypoints or nkp2 < self.min_keypoints:
+            return MatchResult(
+                status="inconclusive",
+                verified=True,
+                inlier_count=inlier_count,
+                inlier_ratio=round(inlier_ratio, 4),
+                good_matches=len(good_matches),
+                total_keypoints_1=nkp1,
+                total_keypoints_2=nkp2,
+                message=f"Inconclusive: insufficient keypoints ({min(nkp1, nkp2)} < {self.min_keypoints})",
+            )
+
         verified = (inlier_count >= self.min_inliers) and (inlier_ratio >= self.min_inlier_ratio)
+        status = "verified" if verified else "failed"
 
         return MatchResult(
+            status=status,
             verified=verified,
             inlier_count=inlier_count,
             inlier_ratio=round(inlier_ratio, 4),
@@ -249,6 +360,22 @@ def verify_pair(
     return v.match_features(kp1, des1, kp2, des2)
 
 
+def get_auto_delete_candidates(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """
+    Return cluster members that are safe for auto-delete recommendation.
+    Inconclusive / low-confidence members are strictly excluded.
+    """
+    return conn.execute(
+        """
+        SELECT * FROM images
+        WHERE cluster_id IS NOT NULL
+          AND is_keeper = 0
+          AND is_low_confidence = 0
+        ORDER BY cluster_id, id
+        """
+    ).fetchall()
+
+
 def run_stage3_verification(
     conn: sqlite3.Connection,
     config: dict | None = None,
@@ -260,13 +387,32 @@ def run_stage3_verification(
     For each cluster:
     1. Loads the cluster representative proxy thumbnail.
     2. Compares each non-representative cluster member against the representative.
-    3. Members that fail geometric verification (below inlier / inlier_ratio thresholds)
-       are split out of the cluster.
-    4. If splitting leaves fewer than 2 members, the cluster is disbanded.
-    5. Updates clusters member_count and commits changes.
+    3. If either image has < min_keypoints, verdict is 'inconclusive'; the member keeps
+       its cluster, gets is_low_confidence = 1 in the database, and is excluded from auto-delete.
+    4. Members that fail geometric verification are split out of the cluster.
+    5. Disbands clusters reduced to fewer than 2 members.
+    6. Re-evaluates split members: matches them against other cluster representatives and
+       against each other to form separate clusters (never simply dropped).
+    7. Caches keypoints and descriptors in SQLite table keypoint_cache and in-memory.
     """
     t0 = time.perf_counter()
     verifier = KeypointVerifier(config)
+
+    # Ensure keypoint cache table and is_low_confidence column exist
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS keypoint_cache (
+            image_id    INTEGER PRIMARY KEY,
+            keypoints   BLOB,
+            descriptors BLOB,
+            created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+        );
+        """
+    )
+    cursor = conn.execute("PRAGMA table_info(images);")
+    existing_cols = {row["name"] for row in cursor.fetchall()}
+    if "is_low_confidence" not in existing_cols:
+        conn.execute("ALTER TABLE images ADD COLUMN is_low_confidence INTEGER NOT NULL DEFAULT 0;")
 
     clusters_rows = conn.execute(
         """
@@ -278,20 +424,40 @@ def run_stage3_verification(
     ).fetchall()
 
     res = Stage3Result()
-    proxy_cache: dict[str, tuple[list[cv2.KeyPoint], np.ndarray | None]] = {}
+    mem_cache: dict[int, tuple[list[cv2.KeyPoint], np.ndarray | None]] = {}
 
-    def get_features(path_str: str) -> tuple[list[cv2.KeyPoint], np.ndarray | None]:
-        if path_str not in proxy_cache:
-            proxy = load_proxy_grayscale(path_str, proxy_size=verifier.proxy_size, source=source)
-            proxy_cache[path_str] = verifier.extract_features(proxy)
-        return proxy_cache[path_str]
+    def get_features(image_id: int, file_path: str) -> tuple[list[cv2.KeyPoint], np.ndarray | None]:
+        if image_id in mem_cache:
+            return mem_cache[image_id]
+
+        row = conn.execute(
+            "SELECT keypoints, descriptors FROM keypoint_cache WHERE image_id = ?",
+            (image_id,),
+        ).fetchone()
+
+        if row is not None and row["keypoints"] is not None:
+            kps = deserialize_keypoints(row["keypoints"])
+            des = deserialize_descriptors(row["descriptors"])
+            mem_cache[image_id] = (kps, des)
+            return mem_cache[image_id]
+
+        proxy = load_proxy_grayscale(file_path, proxy_size=verifier.proxy_size, source=source)
+        kps, des = verifier.extract_features(proxy)
+        conn.execute(
+            "INSERT OR REPLACE INTO keypoint_cache (image_id, keypoints, descriptors) VALUES (?, ?, ?)",
+            (image_id, serialize_keypoints(kps), serialize_descriptors(des)),
+        )
+        mem_cache[image_id] = (kps, des)
+        return mem_cache[image_id]
+
+    split_pool: list[tuple[int, str]] = []
 
     for c_row in clusters_rows:
         cluster_id = c_row["id"]
         rep_id = c_row["representative_id"]
         rep_path = c_row["rep_path"]
 
-        rep_kp, rep_des = get_features(rep_path)
+        rep_kp, rep_des = get_features(rep_id, rep_path)
 
         members = conn.execute(
             """
@@ -303,20 +469,28 @@ def run_stage3_verification(
             (cluster_id, rep_id),
         ).fetchall()
 
-        members_to_split: list[int] = []
+        members_to_split: list[tuple[int, str]] = []
+        cluster_has_inconclusive = (len(rep_kp) < verifier.min_keypoints)
 
         for m_row in members:
             m_id = m_row["id"]
             m_path = m_row["file_path"]
 
-            m_kp, m_des = get_features(m_path)
+            m_kp, m_des = get_features(m_id, m_path)
             match_res = verifier.match_features(rep_kp, rep_des, m_kp, m_des)
 
             res.pairs_evaluated += 1
-            if match_res.verified:
+
+            if match_res.status == "inconclusive":
+                res.pairs_inconclusive += 1
+                cluster_has_inconclusive = True
+                conn.execute("UPDATE images SET is_low_confidence = 1 WHERE id = ?", (m_id,))
+            elif match_res.status == "verified":
                 res.pairs_verified += 1
+                conn.execute("UPDATE images SET is_low_confidence = 0 WHERE id = ?", (m_id,))
             else:
-                members_to_split.append(m_id)
+                res.pairs_failed += 1
+                members_to_split.append((m_id, m_path))
                 res.members_split += 1
 
             res.pair_details.append(
@@ -329,23 +503,32 @@ def run_stage3_verification(
                     inlier_ratio=match_res.inlier_ratio,
                     good_matches=match_res.good_matches,
                     verified=match_res.verified,
+                    status=match_res.status,
                 )
             )
 
+        if cluster_has_inconclusive:
+            conn.execute("UPDATE images SET is_low_confidence = 1 WHERE id = ?", (rep_id,))
+        else:
+            conn.execute("UPDATE images SET is_low_confidence = 0 WHERE id = ?", (rep_id,))
+
         # Split failing members out of the cluster
         if members_to_split:
+            for mid, mpath in members_to_split:
+                split_pool.append((mid, mpath))
             conn.executemany(
                 """
                 UPDATE images
-                SET cluster_id  = NULL,
-                    is_keeper   = 0,
-                    confidence  = NULL,
-                    link_signal = NULL,
-                    status      = 'embedded',
-                    updated_at  = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                SET cluster_id        = NULL,
+                    is_keeper         = 0,
+                    confidence        = NULL,
+                    link_signal       = NULL,
+                    status            = 'embedded',
+                    is_low_confidence = 0,
+                    updated_at        = strftime('%Y-%m-%dT%H:%M:%SZ','now')
                 WHERE id = ?
                 """,
-                [(mid,) for mid in members_to_split],
+                [(mid,) for mid, _ in members_to_split],
             )
 
         # Check remaining member count in this cluster
@@ -355,16 +538,20 @@ def run_stage3_verification(
         ).fetchone()[0]
 
         if remaining_count < 2:
-            # Only keeper left or empty: disband cluster
+            # Cluster reduced below 2 members: disband and add remaining rep to split_pool
+            rep_row = conn.execute("SELECT id, file_path FROM images WHERE id = ?", (rep_id,)).fetchone()
+            if rep_row is not None:
+                split_pool.append((rep_row["id"], rep_row["file_path"]))
             conn.execute(
                 """
                 UPDATE images
-                SET cluster_id  = NULL,
-                    is_keeper   = 0,
-                    confidence  = NULL,
-                    link_signal = NULL,
-                    status      = 'embedded',
-                    updated_at  = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                SET cluster_id        = NULL,
+                    is_keeper         = 0,
+                    confidence        = NULL,
+                    link_signal       = NULL,
+                    status            = 'embedded',
+                    is_low_confidence = 0,
+                    updated_at        = strftime('%Y-%m-%dT%H:%M:%SZ','now')
                 WHERE cluster_id = ?
                 """,
                 (cluster_id,),
@@ -376,6 +563,135 @@ def run_stage3_verification(
                 "UPDATE clusters SET member_count = ? WHERE id = ?",
                 (remaining_count, cluster_id),
             )
+
+    # ── Re-evaluation of Split Members ─────────────────────────────────────
+    # Members split out by Stage 3 must be re-evaluated:
+    # 1. Matched against other surviving clusters' representatives
+    # 2. Matched against each other using the same verification to form new clusters
+    if split_pool:
+        surviving_clusters = conn.execute(
+            """
+            SELECT c.id, c.representative_id, i.file_path as rep_path
+            FROM clusters c
+            JOIN images i ON i.id = c.representative_id
+            ORDER BY c.id
+            """
+        ).fetchall()
+
+        still_split: list[tuple[int, str]] = []
+
+        # 1. Try matching against other surviving clusters
+        for mid, mpath in split_pool:
+            mkp, mdes = get_features(mid, mpath)
+            matched_cid: int | None = None
+
+            for sc in surviving_clusters:
+                rep_kp, rep_des = get_features(sc["representative_id"], sc["rep_path"])
+                mres = verifier.match_features(rep_kp, rep_des, mkp, mdes)
+                if mres.status == "verified":
+                    matched_cid = sc["id"]
+                    conn.execute(
+                        """
+                        UPDATE images
+                        SET cluster_id        = ?,
+                            is_keeper         = 0,
+                            confidence        = 100.0,
+                            link_signal       = 'sift',
+                            status            = 'clustered',
+                            is_low_confidence = 0,
+                            updated_at        = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                        WHERE id = ?
+                        """,
+                        (matched_cid, mid),
+                    )
+                    conn.execute(
+                        "UPDATE clusters SET member_count = member_count + 1 WHERE id = ?",
+                        (matched_cid,),
+                    )
+                    break
+
+            if matched_cid is None:
+                still_split.append((mid, mpath))
+
+        # 2. Group remaining split members amongst each other
+        while still_split:
+            seed_id, seed_path = still_split.pop(0)
+            seed_kp, seed_des = get_features(seed_id, seed_path)
+            cand_members: list[tuple[int, str]] = [(seed_id, seed_path)]
+
+            unmatched: list[tuple[int, str]] = []
+            for mid, mpath in still_split:
+                mkp, mdes = get_features(mid, mpath)
+                mres = verifier.match_features(seed_kp, seed_des, mkp, mdes)
+                if mres.status == "verified":
+                    cand_members.append((mid, mpath))
+                else:
+                    unmatched.append((mid, mpath))
+
+            still_split = unmatched
+
+            if len(cand_members) >= 2:
+                # Form new cluster
+                conn.execute(
+                    """
+                    INSERT INTO clusters (representative_id, stage_detected, member_count)
+                    VALUES (?, 3, ?)
+                    """,
+                    (seed_id, len(cand_members)),
+                )
+                new_cid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+                has_low = 1 if len(seed_kp) < verifier.min_keypoints else 0
+
+                conn.execute(
+                    """
+                    UPDATE images
+                    SET cluster_id        = ?,
+                        is_keeper         = 1,
+                        confidence        = 100.0,
+                        link_signal       = 'sift',
+                        status            = 'clustered',
+                        is_low_confidence = ?,
+                        updated_at        = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                    WHERE id = ?
+                    """,
+                    (new_cid, has_low, seed_id),
+                )
+                for mid, _mpath in cand_members[1:]:
+                    conn.execute(
+                        """
+                        UPDATE images
+                        SET cluster_id        = ?,
+                            is_keeper         = 0,
+                            confidence        = 100.0,
+                            link_signal       = 'sift',
+                            status            = 'clustered',
+                            is_low_confidence = ?,
+                            updated_at        = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                        WHERE id = ?
+                        """,
+                        (new_cid, has_low, mid),
+                    )
+                res.new_clusters_formed += 1
+            else:
+                conn.execute(
+                    """
+                    UPDATE images
+                    SET cluster_id        = NULL,
+                        is_keeper         = 0,
+                        confidence        = NULL,
+                        link_signal       = NULL,
+                        status            = 'embedded',
+                        is_low_confidence = 0,
+                        updated_at        = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                    WHERE id = ?
+                    """,
+                    (seed_id,),
+                )
+
+    res.low_confidence_members = conn.execute(
+        "SELECT COUNT(*) FROM images WHERE cluster_id IS NOT NULL AND is_low_confidence = 1"
+    ).fetchone()[0]
 
     conn.commit()
 

@@ -472,8 +472,12 @@ def evaluate_held_out_test_set(
             "time_per_1000": s3_time_per_1000,
             "pairs_evaluated": res_s3.pairs_evaluated,
             "pairs_verified": res_s3.pairs_verified,
+            "pairs_inconclusive": res_s3.pairs_inconclusive,
+            "pairs_failed": res_s3.pairs_failed,
             "members_split": res_s3.members_split,
             "clusters_disbanded": res_s3.clusters_disbanded,
+            "new_clusters_formed": res_s3.new_clusters_formed,
+            "low_confidence_members": res_s3.low_confidence_members,
         },
     }
 
@@ -534,7 +538,10 @@ def build_test_report_markdown(
         f"- **Geometric Verification Time**: **{s3_stats['elapsed_seconds']:.2f}s** total for {s3_stats['pairs_evaluated']} candidate pairs",
         f"- **Throughput / Latency**: **{s3_stats['time_per_1000']:.2f}s per 1,000 images**",
         f"- **Candidate Pairs Verified**: {s3_stats['pairs_verified']} / {s3_stats['pairs_evaluated']}",
+        f"- **Inconclusive Candidate Pairs**: {s3_stats.get('pairs_inconclusive', 0)} (keypoints < min_keypoints, kept in cluster)",
+        f"- **Low Confidence Members**: **{s3_stats.get('low_confidence_members', 0)}** (excluded from auto-delete recommendations)",
         f"- **Impostor Members Split**: {s3_stats['members_split']}",
+        f"- **New Clusters Formed**: {s3_stats.get('new_clusters_formed', 0)} (split members successfully re-grouped)",
         f"- **Clusters Disbanded**: {s3_stats['clusters_disbanded']}",
         "",
         "## 5. Test Set Recall per Transformation Type (%)",
@@ -670,6 +677,7 @@ def main(argv: list[str] | None = None) -> None:
     print("=========================================================================================")
     print(f"Test Set Size: {len(test_origs)} originals ({len(test_images)} images) | Split Seed: {args.split_seed}")
     print(f"Stage 3 Verification Overhead: {s3_stats['elapsed_seconds']:.2f}s total ({s3_stats['time_per_1000']:.2f}s per 1,000 images)")
+    print(f"Stage 3 Summary: Verified={s3_stats['pairs_verified']}, Inconclusive={s3_stats.get('pairs_inconclusive', 0)}, Split={s3_stats['members_split']}, Re-grouped Clusters={s3_stats.get('new_clusters_formed', 0)}, Low-Confidence Members={s3_stats.get('low_confidence_members', 0)}")
     print("-" * 96)
     print(f"{'Pipeline Stage / Mode':<34} | {'Config / Model':<18} | {'Precision':<10} | {'Variant Recall':<15} | {'Pairwise':<9}")
     print("-" * 96)

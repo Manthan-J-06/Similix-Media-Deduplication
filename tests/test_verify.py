@@ -12,6 +12,7 @@ from PIL import Image
 from core.verify import (
     KeypointVerifier,
     MatchResult,
+    get_auto_delete_candidates,
     load_proxy_grayscale,
     run_stage3_verification,
     verify_pair,
@@ -248,3 +249,139 @@ class TestStage3ClusterPipelineSplitting:
         assert conn.execute("SELECT COUNT(*) FROM clusters").fetchone()[0] == 0
         # Both images unclustered
         assert conn.execute("SELECT COUNT(*) FROM images WHERE cluster_id IS NOT NULL").fetchone()[0] == 0
+
+    def test_split_members_re_evaluated_into_two_clusters(self, tmp_path, benchmark_available):
+        """
+        A mixed cluster containing scene A (rep) and scene B members must end
+        as two clusters, with no member left ungrouped.
+        """
+        if not benchmark_available:
+            pytest.skip("Benchmark files not present in data/benchmark")
+
+        db_path = tmp_path / "stage3_reeval.db"
+        conn = init_db(db_path)
+
+        # Scene A: picsum_0008, picsum_0008__exact
+        # Scene B: picsum_0009, picsum_0009__exact
+        p8 = str(BENCH_DIR / "picsum_0008.jpg")
+        p8_exact = str(BENCH_DIR / "picsum_0008__exact.jpg")
+        p9 = str(BENCH_DIR / "picsum_0009.jpg")
+        p9_exact = str(BENCH_DIR / "picsum_0009__exact.jpg")
+
+        c1 = conn.execute("INSERT INTO clusters (stage_detected, member_count) VALUES (2, 4)").lastrowid
+        conn.execute("INSERT INTO images (id, file_path, cluster_id, is_keeper, status) VALUES (1, ?, ?, 1, 'clustered')", (p8, c1))
+        conn.execute("UPDATE clusters SET representative_id = 1 WHERE id = ?", (c1,))
+        conn.execute("INSERT INTO images (id, file_path, cluster_id, is_keeper, status) VALUES (2, ?, ?, 0, 'clustered')", (p8_exact, c1))
+        conn.execute("INSERT INTO images (id, file_path, cluster_id, is_keeper, status) VALUES (3, ?, ?, 0, 'clustered')", (p9, c1))
+        conn.execute("INSERT INTO images (id, file_path, cluster_id, is_keeper, status) VALUES (4, ?, ?, 0, 'clustered')", (p9_exact, c1))
+        conn.commit()
+
+        cfg = {
+            "stage3": {
+                "algorithm": "sift",
+                "min_inliers": 20,
+                "min_inlier_ratio": 0.65,
+                "transformation_model": "affine",
+            }
+        }
+
+        res = run_stage3_verification(conn, cfg)
+
+        # Must end as two clusters!
+        all_clusters = conn.execute("SELECT id, representative_id, member_count FROM clusters ORDER BY id").fetchall()
+        assert len(all_clusters) == 2, f"Expected 2 clusters, got {len(all_clusters)}"
+
+        # No member left ungrouped!
+        ungrouped = conn.execute("SELECT COUNT(*) FROM images WHERE cluster_id IS NULL").fetchone()[0]
+        assert ungrouped == 0, f"Expected 0 ungrouped images, got {ungrouped}"
+
+        # Cluster 1 has scene A members (ids 1, 2)
+        c1_members = {row["id"] for row in conn.execute("SELECT id FROM images WHERE cluster_id = ?", (c1,)).fetchall()}
+        assert c1_members == {1, 2}
+
+        # Cluster 2 has scene B members (ids 3, 4)
+        c2_id = [c["id"] for c in all_clusters if c["id"] != c1][0]
+        c2_members = {row["id"] for row in conn.execute("SELECT id FROM images WHERE cluster_id = ?", (c2_id,)).fetchall()}
+        assert c2_members == {3, 4}
+
+    def test_inconclusive_verdict_low_keypoints_and_auto_delete_exclusion(self, tmp_path):
+        """
+        Pairs with fewer than N keypoints receive 'inconclusive' verdict, keep their cluster,
+        receive is_low_confidence = 1, and are excluded from auto-delete recommendations.
+        """
+        import numpy as np
+        # High texture base image
+        rng = np.random.RandomState(42)
+        tex_arr = (rng.rand(300, 300) * 255).astype(np.uint8)
+        base_img = Image.fromarray(tex_arr, mode="L")
+        base_path = tmp_path / "textured.jpg"
+        base_img.save(base_path, quality=95)
+
+        # Blank / smooth image (very low keypoints < 10)
+        smooth_arr = np.full((300, 300), 128, dtype=np.uint8)
+        smooth_img = Image.fromarray(smooth_arr, mode="L")
+        smooth_path = tmp_path / "smooth.jpg"
+        smooth_img.save(smooth_path, quality=95)
+
+        cfg = {
+            "stage3": {
+                "algorithm": "sift",
+                "min_keypoints": 50,
+                "min_inliers": 20,
+                "min_inlier_ratio": 0.65,
+            }
+        }
+        verifier = KeypointVerifier(cfg)
+
+        # 1. Direct match check
+        res = verify_pair(base_path, smooth_path, config=cfg, verifier=verifier)
+        assert res.status == "inconclusive"
+        assert res.verified is True
+
+        # 2. Database cluster run
+        db_path = tmp_path / "stage3_inconclusive.db"
+        conn = init_db(db_path)
+
+        c1 = conn.execute("INSERT INTO clusters (stage_detected, member_count) VALUES (2, 2)").lastrowid
+        conn.execute("INSERT INTO images (id, file_path, cluster_id, is_keeper, status) VALUES (1, ?, ?, 1, 'clustered')", (str(base_path), c1))
+        conn.execute("UPDATE clusters SET representative_id = 1 WHERE id = ?", (c1,))
+        conn.execute("INSERT INTO images (id, file_path, cluster_id, is_keeper, status) VALUES (2, ?, ?, 0, 'clustered')", (str(smooth_path), c1))
+        conn.commit()
+
+        s3_res = run_stage3_verification(conn, cfg)
+        assert s3_res.pairs_inconclusive == 1
+
+        # Inconclusive member must KEEP its existing cluster
+        row_smooth = conn.execute("SELECT cluster_id, is_low_confidence, is_keeper FROM images WHERE id = 2").fetchone()
+        assert row_smooth["cluster_id"] == c1
+        assert row_smooth["is_low_confidence"] == 1
+
+        # Must be EXCLUDED from auto-delete recommendations
+        candidates = get_auto_delete_candidates(conn)
+        candidate_ids = [c["id"] for c in candidates]
+        assert 2 not in candidate_ids, "Low confidence image must be excluded from auto-delete candidates!"
+
+    def test_keypoint_cache_persists_in_sqlite(self, tmp_path, benchmark_available):
+        """Keypoints and descriptors are cached in SQLite so images are not re-detected."""
+        if not benchmark_available:
+            pytest.skip("Benchmark files not present in data/benchmark")
+
+        db_path = tmp_path / "stage3_cache.db"
+        conn = init_db(db_path)
+
+        p8 = str(BENCH_DIR / "picsum_0008.jpg")
+        p8_exact = str(BENCH_DIR / "picsum_0008__exact.jpg")
+
+        c1 = conn.execute("INSERT INTO clusters (stage_detected, member_count) VALUES (2, 2)").lastrowid
+        conn.execute("INSERT INTO images (id, file_path, cluster_id, is_keeper, status) VALUES (1, ?, ?, 1, 'clustered')", (p8, c1))
+        conn.execute("UPDATE clusters SET representative_id = 1 WHERE id = ?", (c1,))
+        conn.execute("INSERT INTO images (id, file_path, cluster_id, is_keeper, status) VALUES (2, ?, ?, 0, 'clustered')", (p8_exact, c1))
+        conn.commit()
+
+        cfg = {"stage3": {"algorithm": "sift", "min_inliers": 20, "min_inlier_ratio": 0.65}}
+        run_stage3_verification(conn, cfg)
+
+        # Check keypoint_cache table
+        cache_count = conn.execute("SELECT COUNT(*) FROM keypoint_cache").fetchone()[0]
+        assert cache_count == 2
+

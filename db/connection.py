@@ -44,6 +44,8 @@ def init_db(db_path: str | Path) -> sqlite3.Connection:
             conn.execute(f"ALTER TABLE images ADD COLUMN {col} BLOB;")
     if "link_signal" not in existing_cols:
         conn.execute("ALTER TABLE images ADD COLUMN link_signal TEXT;")
+    if "is_low_confidence" not in existing_cols:
+        conn.execute("ALTER TABLE images ADD COLUMN is_low_confidence INTEGER NOT NULL DEFAULT 0;")
 
     # Backfill link_signal for previously clustered rows if unset
     conn.execute(

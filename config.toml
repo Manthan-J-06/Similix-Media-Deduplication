@@ -49,6 +49,8 @@ faiss_k = 20
 algorithm = "sift"
 # Maximum number of keypoint features to extract per image proxy.
 max_features = 2000
+# Minimum keypoints required on each image. Below this, verdict is 'inconclusive'.
+min_keypoints = 100
 # Target proxy edge length (px) for geometric verification (default 512).
 proxy_size = 512
 # Lowe's distance ratio threshold for matching (lower = stricter).

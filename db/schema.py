@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS images (
     status        TEXT    NOT NULL DEFAULT 'discovered', -- 'discovered' | 'hashed' | 'embedded' | 'clustered'
     cluster_id    INTEGER REFERENCES clusters(id) ON DELETE SET NULL,
     is_keeper     INTEGER NOT NULL DEFAULT 0,    -- 1 = recommended keeper
+    is_low_confidence INTEGER NOT NULL DEFAULT 0, -- 1 = inconclusive keypoints, exclude from auto-delete
     confidence    REAL,                          -- duplicate-confidence 0-100
     link_signal   TEXT,                          -- 'md5' | 'phash' | 'clip'
     is_raw_pair   INTEGER NOT NULL DEFAULT 0,    -- 1 = RAW/JPEG sibling, skip dedup
