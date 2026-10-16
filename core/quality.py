@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 import os
 from pathlib import Path
 import pickle
+import re
 import sqlite3
 import time
 from typing import Any
@@ -83,25 +84,62 @@ class QualityResult:
     member_records: list[MemberQualityRecord] = field(default_factory=list)
 
 
+LOSSLESS_FORMATS = frozenset({"PNG", "TIFF", "TIF", "BMP"})
+
+
+def _is_lossless_member(m: sqlite3.Row | dict[str, Any]) -> bool:
+    fmt = m["format"] if ("format" in m.keys() and m["format"]) else ""
+    if not fmt:
+        p = str(m["file_path"])
+        fmt = Path(p).suffix.lstrip(".").upper()
+    return fmt.upper() in LOSSLESS_FORMATS
+
+
 def select_reference_member(members: list[sqlite3.Row | dict[str, Any]]) -> sqlite3.Row | dict[str, Any]:
     """
     Select the reference member for a duplicate cluster:
     1. Highest pixel count (width * height, descending)
-    2. Least compressed (file_size / (width * height), descending)
+    2. Among equal pixels: prefer a lossless format (PNG/TIFF/BMP) ONLY if it has
+       no lossy twin already in the cluster of the same resolution; otherwise prefer
+       the SMALLEST file size (never select a copy because it has more bytes per pixel).
     3. Shortest file path length (len(file_path), ascending)
     4. Deterministic tie-breaker (file_path, ascending)
+    5. ID ascending
     """
     if not members:
         raise ValueError("Cannot select reference from empty member list")
 
-    def key_fn(m: sqlite3.Row | dict[str, Any]) -> tuple[int, float, int, str]:
+    # Map each pixel count to whether there is any lossy member with that pixel count
+    pixel_has_lossy: dict[int, bool] = {}
+    for m in members:
+        px = (m["width"] or 0) * (m["height"] or 0)
+        if not _is_lossless_member(m):
+            pixel_has_lossy[px] = True
+
+    def key_fn(m: sqlite3.Row | dict[str, Any]) -> tuple:
         w = m["width"] or 0
         h = m["height"] or 0
         px = w * h
         sz = m["file_size"] or 0
-        bpp = (sz / px) if px > 0 else 0.0
         p = str(m["file_path"])
-        return (-px, -bpp, len(p), p)
+        m_id = m["id"] if "id" in m.keys() else 0
+
+        lossless = _is_lossless_member(m)
+        has_lossy_twin = pixel_has_lossy.get(px, False)
+        prefer_lossless = (lossless and not has_lossy_twin)
+
+        lossless_rank = 0 if prefer_lossless else 1
+        stem = Path(p).stem
+        is_derived = 1 if re.search(r"(__|_copy|\bcopy\b|\s\(\d+\)|_resave)", stem, re.IGNORECASE) else 0
+
+        # Sort:
+        # 1. Highest pixel count (-px)
+        # 2. Prefer lossless only if no lossy twin (lossless_rank)
+        # 3. Prefer canonical non-derived original over derived copies (is_derived)
+        # 4. Smallest file size (sz)
+        # 5. Shortest path length (len(p))
+        # 6. Tie-breakers (p, m_id)
+        return (-px, lossless_rank, is_derived, sz, len(p), p, m_id)
 
     return min(members, key=key_fn)
 

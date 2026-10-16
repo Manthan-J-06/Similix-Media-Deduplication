@@ -78,17 +78,17 @@ def setup_demo_folder(demo_dir: Path) -> list[str]:
 
             # 3. q85 JPEG
             q85_dest = demo_dir / f"{stem}__jpeg_q85.jpg"
-            im_rgb.save(q85_dest, "JPEG", quality=85)
+            im_rgb.save(q85_dest, "JPEG", quality=85, optimize=True)
             created_files.append(q85_dest.name)
 
             # 4. q60 JPEG
             q60_dest = demo_dir / f"{stem}__jpeg_q60.jpg"
-            im_rgb.save(q60_dest, "JPEG", quality=60)
+            im_rgb.save(q60_dest, "JPEG", quality=60, optimize=True)
             created_files.append(q60_dest.name)
 
             # 5. q30 JPEG
             q30_dest = demo_dir / f"{stem}__jpeg_q30.jpg"
-            im_rgb.save(q30_dest, "JPEG", quality=30)
+            im_rgb.save(q30_dest, "JPEG", quality=30, optimize=True)
             created_files.append(q30_dest.name)
 
             # 6. 50% scale JPEG

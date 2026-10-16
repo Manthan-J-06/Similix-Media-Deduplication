@@ -32,6 +32,8 @@ from typing import Any
 
 import numpy as np
 
+from core.quality import select_reference_member
+
 # Default keeper mode limits per specification
 DEFAULT_KEEPER_MODES: dict[str, dict[str, Any]] = {
     "conservative": {
@@ -42,15 +44,15 @@ DEFAULT_KEEPER_MODES: dict[str, dict[str, Any]] = {
         "allow_blur_flag": False,
     },
     "balanced": {
-        "ssim_gray": 0.95,
-        "ssim_color": 0.94,
+        "ssim_gray": 0.98,
+        "ssim_color": 0.97,
         "pixel_ratio_floor": 0.60,
         "min_saving_ratio": 0.10,
         "allow_blur_flag": False,
     },
     "aggressive": {
-        "ssim_gray": 0.92,
-        "ssim_color": 0.90,
+        "ssim_gray": 0.95,
+        "ssim_color": 0.94,
         "pixel_ratio_floor": 0.25,
         "min_saving_ratio": 0.30,
         "allow_blur_flag": True,
@@ -172,43 +174,35 @@ def choose_keeper(
             break
 
     if ref_member is None:
-        # Fallback to member with highest pixel count, then least compressed, then shortest path
-        def ref_key(m: dict[str, Any]):
-            w = m.get("width") or 0
-            h = m.get("height") or 0
-            px = w * h
-            sz = m.get("file_size") or 0
-            bpp = (sz / px) if px > 0 else 0.0
-            p = str(m.get("file_path") or "")
-            return (-px, -bpp, len(p), p, m.get("id") or 0)
-        ref_member = min(members, key=ref_key)
+        ref_member = select_reference_member(members)
 
     ref_id = ref_member.get("id")
     ref_sz = ref_member.get("file_size") or 0
     min_saving = float(limits.get("min_saving_ratio", 0.0))
     max_non_ref_sz = ref_sz * (1.0 - min_saving)
 
-    # 1. Select Candidates meeting mode limits and min_saving_ratio
-    # A non-reference candidate becomes keeper only if its file size <= reference_size * (1 - min_saving_ratio).
-    # Otherwise the reference stays the keeper.
-    candidates = []
-    for m in members:
-        is_ref = (m.get("id") == ref_id)
-        if _is_member_candidate(m, limits, is_reference=is_ref):
-            if is_ref:
-                candidates.append(m)
-            else:
-                m_sz = m.get("file_size") or 0
-                if m_sz <= max_non_ref_sz:
-                    candidates.append(m)
-
-    # 2. Pick Keeper
-    # Keeper = smallest file among candidates; ties go to higher pixel count, then shorter path.
+    # 1. Select Candidates & Pick Keeper
+    # Conservative mode: keeper = the reference.
+    # Balanced / aggressive: keeper = smallest file among candidates; ties to higher pixel count, then shorter path.
     # If no other candidate qualifies, the reference is the keeper.
-    if candidates:
-        keeper = min(candidates, key=_keeper_candidate_sort_key)
-    else:
+    if mode == "conservative":
         keeper = ref_member
+    else:
+        candidates = []
+        for m in members:
+            is_ref = (m.get("id") == ref_id)
+            if _is_member_candidate(m, limits, is_reference=is_ref):
+                if is_ref:
+                    candidates.append(m)
+                else:
+                    m_sz = m.get("file_size") or 0
+                    if m_sz <= max_non_ref_sz:
+                        candidates.append(m)
+
+        if candidates:
+            keeper = min(candidates, key=_keeper_candidate_sort_key)
+        else:
+            keeper = ref_member
 
     keeper_id = keeper.get("id")
     keeper_md5 = keeper.get("md5")
@@ -230,13 +224,47 @@ def choose_keeper(
 
     # Reason for keeper
     if keeper_id == ref_id:
-        reasons[keeper_id] = f"Recommended keeper (reference copy, highest fidelity)"
+        reasons[keeper_id] = "Recommended keeper (reference copy, highest fidelity)"
         quality_retained[keeper_id] = 100.0
     else:
         k_ssim = keeper.get("ssim")
         k_pct = round(float(k_ssim) * 100.0, 1) if k_ssim is not None else 100.0
         reasons[keeper_id] = f"Recommended keeper (smallest candidate in {mode} mode, {k_pct}% quality retained)"
         quality_retained[keeper_id] = k_pct
+
+    # Map byte-identical groups by (md5, file_size)
+    exact_groups: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for m in members:
+        md5_val = m.get("md5")
+        sz_val = m.get("file_size") or 0
+        if md5_val:
+            exact_groups.setdefault((md5_val, sz_val), []).append(m)
+
+    # Secondary byte-identical duplicates (for keeper or non-keeper groups)
+    # Byte-identical copies of the keeper are always delete_safe.
+    # A byte-identical copy of a non-keeper goes through that member's own rule,
+    # so exact duplicate copies are never stranded in review when the keeper is a different file.
+    secondary_duplicate_map: dict[int, dict[str, Any]] = {}
+    for group_key, grp_members in exact_groups.items():
+        if len(grp_members) <= 1:
+            continue
+        has_keeper = any(m.get("id") == keeper_id for m in grp_members)
+        if has_keeper:
+            for m in grp_members:
+                mid = m.get("id")
+                if mid != keeper_id:
+                    secondary_duplicate_map[mid] = keeper
+        else:
+            # Pick canonical anchor representative (shortest path length, then path, then id)
+            def anchor_sort_key(m: dict[str, Any]):
+                p = str(m.get("file_path") or "")
+                return (len(p), p, m.get("id") or 0)
+            anchor = min(grp_members, key=anchor_sort_key)
+            anchor_id = anchor.get("id")
+            for m in grp_members:
+                mid = m.get("id")
+                if mid != anchor_id:
+                    secondary_duplicate_map[mid] = anchor
 
     # 3. Partition remaining members into delete_safe vs review
     for m in members:
@@ -249,6 +277,9 @@ def choose_keeper(
         m_ssim = m.get("ssim")
         m_md5 = m.get("md5")
         m_sz = m.get("file_size") or 0
+        m_w = m.get("width") or 0
+        m_h = m.get("height") or 0
+        m_px = m_w * m_h
 
         # Calculate quality retained vs reference
         if q_status == "reference" or (keeper_md5 and m_md5 == keeper_md5):
@@ -259,14 +290,7 @@ def choose_keeper(
             retained_pct = 0.0
         quality_retained[mid] = retained_pct
 
-        # Check conditions
-        is_byte_identical = bool(
-            keeper_md5 and m_md5 and m_md5 == keeper_md5 and m_sz == keeper_sz
-        )
-
-        m_w = m.get("width") or 0
-        m_h = m.get("height") or 0
-        m_px = m_w * m_h
+        # Quality value for comparison
         if mid == ref_id or q_status == "reference" or (keeper_md5 and m_md5 == keeper_md5):
             m_quality = 1.0
         elif m_ssim is not None:
@@ -274,9 +298,26 @@ def choose_keeper(
         else:
             m_quality = 0.0
 
-        is_keeper_at_least_as_good = (k_px >= m_px) and (k_quality >= m_quality - 0.005)
+        # Handle secondary byte-identical duplicates first
+        if mid in secondary_duplicate_map:
+            anchor = secondary_duplicate_map[mid]
+            if anchor.get("id") == keeper_id:
+                delete_safe_ids.append(mid)
+                reasons[mid] = "Byte-identical copy of keeper (100.0% quality retained)"
+            else:
+                # Duplicate copy of a non-keeper:
+                # Invariant: keeper's file size must never exceed any delete_safe member's size
+                # unless that member is a lower-resolution copy.
+                if (m_px >= k_px) and (keeper_sz > m_sz):
+                    review_ids.append(mid)
+                    reasons[mid] = f"Keeper ({keeper_sz:,} B) is larger than same-resolution copy ({m_sz:,} B)"
+                else:
+                    delete_safe_ids.append(mid)
+                    anchor_name = Path(str(anchor.get("file_path") or "")).name or f"member {anchor.get('id')}"
+                    reasons[mid] = f"Byte-identical duplicate of {anchor_name}"
+            continue
 
-        # Unalignable, low-confidence or inconclusive goes to review_ids, never delete_safe
+        # Check unalignable, low-confidence, or unverified
         if q_status == "unalignable":
             review_ids.append(mid)
             reasons[mid] = "Unalignable member (geometric verification/alignment failed)"
@@ -286,27 +327,48 @@ def choose_keeper(
         elif q_status not in ("reference", "aligned"):
             review_ids.append(mid)
             reasons[mid] = f"Unverified quality status '{q_status}' (manual review required)"
-        elif not is_keeper_at_least_as_good:
-            # Member is better than keeper in resolution or quality -> review
-            review_ids.append(mid)
-            reasons[mid] = "better than recommended keeper"
-        elif is_byte_identical:
-            delete_safe_ids.append(mid)
-            reasons[mid] = "Byte-identical copy of keeper (100.0% quality retained)"
-        elif mode == "conservative" and keeper_id != ref_id:
-            # In conservative mode, byte-identical members are the only automatic delete_safe members when keeper is not reference
-            review_ids.append(mid)
-            reasons[mid] = "Conservative mode: non-identical duplicate requires manual review when keeper is not reference"
-        elif q_status in ("reference", "aligned") and not is_low_conf:
-            delete_safe_ids.append(mid)
-            reasons[mid] = f"Verified aligned duplicate ({retained_pct}% quality retained)"
+        elif mode == "conservative":
+            # Conservative mode: keeper = reference.
+            # delete_safe = byte-identical copies of keeper plus members strictly worse
+            # (lower resolution or SSIM below keeper by > 0.005) and verified.
+            is_strictly_worse = (m_px < k_px) or (m_quality < k_quality - 0.005)
+            if not is_strictly_worse:
+                review_ids.append(mid)
+                reasons[mid] = "Conservative mode: same-fidelity duplicate requires manual review"
+            elif (m_px >= k_px) and (keeper_sz > m_sz):
+                review_ids.append(mid)
+                reasons[mid] = f"Keeper ({keeper_sz:,} B) is larger than same-resolution copy ({m_sz:,} B)"
+            else:
+                delete_safe_ids.append(mid)
+                reasons[mid] = f"Verified strictly worse duplicate ({retained_pct}% quality retained)"
         else:
-            review_ids.append(mid)
-            reasons[mid] = "Requires manual inspection"
+            # Balanced / aggressive modes:
+            # Keeper must be at least as good in pixel count and quality
+            is_keeper_at_least_as_good = (k_px >= m_px) and (k_quality >= m_quality - 0.005)
+            if not is_keeper_at_least_as_good:
+                review_ids.append(mid)
+                reasons[mid] = "better than recommended keeper"
+            elif (m_px >= k_px) and (keeper_sz > m_sz):
+                review_ids.append(mid)
+                reasons[mid] = f"Keeper ({keeper_sz:,} B) is larger than same-resolution copy ({m_sz:,} B)"
+            else:
+                delete_safe_ids.append(mid)
+                reasons[mid] = f"Verified aligned duplicate ({retained_pct}% quality retained)"
 
-    # Invariant: Never mark every member of a cluster as delete_safe
+    # Invariants:
     assert keeper_id not in delete_safe_ids, "Keeper cannot be marked delete_safe"
     assert len(delete_safe_ids) < len(members), "Cannot mark all cluster members as delete_safe"
+
+    # Invariant: Keeper file size must never exceed any same-resolution delete_safe member's size
+    id_to_m = {m.get("id"): m for m in members}
+    for ds_id in delete_safe_ids:
+        ds_m = id_to_m[ds_id]
+        ds_px = (ds_m.get("width") or 0) * (ds_m.get("height") or 0)
+        ds_sz = ds_m.get("file_size") or 0
+        if ds_px >= k_px:
+            assert keeper_sz <= ds_sz, (
+                f"Keeper file size ({keeper_sz} B) exceeds same-resolution delete_safe member ({ds_sz} B)"
+            )
 
     # Total savings in bytes if delete_safe members are deleted
     total_savings = sum(

@@ -70,16 +70,43 @@ class TestReferenceMemberSelection:
         ref = select_reference_member(members)
         assert ref["id"] == 2
 
-    def test_least_compressed_selected_on_pixel_tie(self):
-        # Both 1024x768 (786,432 px). Member 2 has higher bytes per pixel.
+    def test_smallest_file_size_preferred_among_equal_pixels(self):
+        # Two JPEGs of identical resolution: smaller file size is chosen as reference
         members = [
-            {"id": 1, "width": 1024, "height": 768, "file_size": 100000, "file_path": "/photos/compressed.jpg"},
-            {"id": 2, "width": 1024, "height": 768, "file_size": 500000, "file_path": "/photos/uncompressed.png"},
+            {"id": 1, "width": 1024, "height": 768, "file_size": 58000, "file_path": "/photos/original.jpg"},
+            {"id": 2, "width": 1024, "height": 768, "file_size": 85000, "file_path": "/photos/q85_resave.jpg"},
         ]
         ref = select_reference_member(members)
-        assert ref["id"] == 2
+        assert ref["id"] == 1
 
-    def test_shortest_path_selected_on_compression_tie(self):
+    def test_q85_resave_larger_file_must_not_become_reference(self):
+        # A q85 re-save of an original (larger file, same pixels) must NOT become the reference
+        members = [
+            {"id": 10, "width": 1024, "height": 768, "file_size": 58850, "file_path": "/photos/picsum_0001.jpg", "format": "JPEG"},
+            {"id": 11, "width": 1024, "height": 768, "file_size": 75719, "file_path": "/photos/picsum_0001__jpeg_q85.jpg", "format": "JPEG"},
+        ]
+        ref = select_reference_member(members)
+        assert ref["id"] == 10
+        assert ref["file_path"] == "/photos/picsum_0001.jpg"
+
+    def test_lossless_preferred_only_if_no_lossy_twin(self):
+        # When a lossy twin exists of same pixels, prefer smallest file size (original JPEG over inflated PNG)
+        members_with_twin = [
+            {"id": 1, "width": 1024, "height": 768, "file_size": 60000, "file_path": "/photos/orig.jpg", "format": "JPEG"},
+            {"id": 2, "width": 1024, "height": 768, "file_size": 500000, "file_path": "/photos/conv.png", "format": "PNG"},
+        ]
+        ref1 = select_reference_member(members_with_twin)
+        assert ref1["id"] == 1  # 60KB JPEG wins over 500KB PNG transcode
+
+        # When NO lossy twin exists of same pixels (e.g. only PNGs, or JPEG is lower-res), prefer lossless
+        members_no_twin = [
+            {"id": 1, "width": 1024, "height": 768, "file_size": 500000, "file_path": "/photos/orig.png", "format": "PNG"},
+            {"id": 2, "width": 512, "height": 384, "file_size": 30000, "file_path": "/photos/thumb.jpg", "format": "JPEG"},
+        ]
+        ref2 = select_reference_member(members_no_twin)
+        assert ref2["id"] == 1
+
+    def test_shortest_path_selected_on_tie(self):
         # Both identical dimensions and size. Member 1 has shorter path.
         members = [
             {"id": 1, "width": 1024, "height": 768, "file_size": 100000, "file_path": "/a.jpg"},
@@ -218,11 +245,13 @@ class TestQualityPipelineIntegration:
 
         # Check DB columns
         rows = {r["id"]: r for r in conn.execute("SELECT * FROM images").fetchall()}
-        assert rows[1]["quality_status"] == "reference"
-        assert rows[1]["ssim"] == 1.0
+        ref_id = 1 if rows[1]["quality_status"] == "reference" else 2
+        other_id = 2 if ref_id == 1 else 1
+        assert rows[ref_id]["quality_status"] == "reference"
+        assert rows[ref_id]["ssim"] == 1.0
 
-        assert rows[2]["quality_status"] == "aligned"
-        assert rows[2]["ssim"] >= 0.90
+        assert rows[other_id]["quality_status"] == "aligned"
+        assert rows[other_id]["ssim"] >= 0.90
 
         assert rows[3]["quality_status"] == "unalignable"
         assert rows[3]["ssim"] is None

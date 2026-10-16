@@ -264,13 +264,13 @@ class TestAggressiveModeMinSavingRatio:
                 "id": 2,
                 "file_path": "/photos/small_saving.jpg",
                 "file_size": 80_000,  # 20% saving (under 30%)
-                "width": 1024,
-                "height": 768,
+                "width": 512,
+                "height": 384,        # Lower resolution copy (passes size invariant)
                 "md5": "md5_cand",
                 "quality_status": "aligned",
-                "ssim": 0.98,
-                "ssim_color": 0.97,
-                "pixel_ratio": 1.0,
+                "ssim": 0.96,
+                "ssim_color": 0.95,
+                "pixel_ratio": 0.25,
                 "is_low_confidence": 0,
             },
         ]
@@ -306,8 +306,8 @@ class TestMemberBetterThanKeeperGoesToReview:
                 "height": 450,       # Lower resolution!
                 "md5": "md5_low",
                 "quality_status": "aligned",
-                "ssim": 0.93,
-                "ssim_color": 0.91,
+                "ssim": 0.96,        # Meets aggressive ssim >= 0.95
+                "ssim_color": 0.95,
                 "pixel_ratio": 0.3433,
                 "is_low_confidence": 0,
             },
@@ -315,7 +315,7 @@ class TestMemberBetterThanKeeperGoesToReview:
         # In aggressive mode, candidate 2 qualifies and becomes keeper
         res = choose_keeper(members, mode="aggressive")
         assert res["keeper_id"] == 2
-        # Member 1 is better than keeper in resolution (1024x768 > 600x450) and quality (1.0 > 0.93)
+        # Member 1 is better than keeper in resolution (1024x768 > 600x450) and quality (1.0 > 0.96)
         assert 1 in res["review_ids"]
         assert 1 not in res["delete_safe_ids"]
         assert res["reasons"][1] == "better than recommended keeper"
@@ -325,7 +325,10 @@ class TestCraftedFourMemberClusterThreeModes:
     def test_crafted_4_member_cluster_gives_three_different_keepers(self):
         """
         (c) a crafted 4-member cluster (original, q60, q30, 50% scale)
-        gives three different keepers across the three modes.
+        gives three different keepers across the three modes under Prompt 10 limits:
+        - Conservative: keeper = reference (original)
+        - Balanced: ssim >= 0.98, ssim_color >= 0.97, pixel_ratio >= 0.60, min_saving >= 0.10
+        - Aggressive: ssim >= 0.95, ssim_color >= 0.94, pixel_ratio >= 0.25, min_saving >= 0.30
         """
         members = [
             # 1. Original (Reference)
@@ -343,7 +346,7 @@ class TestCraftedFourMemberClusterThreeModes:
                 "blur_flag": False,
                 "is_low_confidence": 0,
             },
-            # 2. q60: 420KB (16% saving >= 10% balanced threshold, but fails aggressive 30% saving)
+            # 2. q60: 420KB (16% saving >= 10% balanced, ssim 0.985 >= 0.98; fails aggressive 30% saving)
             {
                 "id": 2,
                 "file_path": "/photos/q60.jpg",
@@ -352,14 +355,14 @@ class TestCraftedFourMemberClusterThreeModes:
                 "height": 1000,
                 "md5": "md5_q60",
                 "quality_status": "aligned",
-                "ssim": 0.965,
-                "ssim_color": 0.955,
+                "ssim": 0.985,
+                "ssim_color": 0.975,
                 "pixel_ratio": 1.0,
                 "blur_flag": False,
                 "is_low_confidence": 0,
             },
-            # 3. 50% scale: 200KB (60% saving >= 30% aggressive threshold, ssim 0.935 >= 0.92, px 0.25 >= 0.25)
-            # Fails conservative (ssim 0.935 < 0.98, px 0.25 < 0.90)
+            # 3. 50% scale: 200KB (60% saving >= 30% aggressive, ssim 0.955 >= 0.95, px 0.25 >= 0.25)
+            # Fails conservative (ssim 0.955 < 0.98, px 0.25 < 0.90)
             # Fails balanced (px 0.25 < 0.60)
             {
                 "id": 3,
@@ -369,13 +372,13 @@ class TestCraftedFourMemberClusterThreeModes:
                 "height": 500,
                 "md5": "md5_scale50",
                 "quality_status": "aligned",
-                "ssim": 0.935,
-                "ssim_color": 0.920,
+                "ssim": 0.955,
+                "ssim_color": 0.945,
                 "pixel_ratio": 0.25,
                 "blur_flag": False,
                 "is_low_confidence": 0,
             },
-            # 4. q30: 300KB, ssim 0.89 (fails all modes ssim thresholds 0.98, 0.95, 0.92)
+            # 4. q30: 300KB, ssim 0.89 (fails all modes ssim thresholds 0.98, 0.98, 0.95)
             {
                 "id": 4,
                 "file_path": "/photos/q30.jpg",
@@ -411,9 +414,14 @@ class TestCraftedFourMemberClusterThreeModes:
         assert res_cons["keeper_id"] != res_agg["keeper_id"]
 
 
-class TestConservativeModeNonRefReview:
-    def test_conservative_mode_non_ref_review(self):
-        """Conservative mode: byte-identical members are the only automatic delete_safe members when keeper is not reference."""
+class TestConservativeModeRules:
+    def test_conservative_mode_keeper_is_reference_and_deletes_exact_plus_worse(self):
+        """
+        Conservative mode: keeper = the reference.
+        delete_safe = byte-identical copies of keeper plus members strictly worse
+        (lower resolution or SSIM below keeper by > 0.005) and verified.
+        Nothing else is deleted automatically.
+        """
         members = [
             {
                 "id": 1,
@@ -428,39 +436,207 @@ class TestConservativeModeNonRefReview:
                 "pixel_ratio": 1.0,
                 "is_low_confidence": 0,
             },
+            # Byte-identical copy of keeper
             {
                 "id": 2,
-                "file_path": "/photos/cand_keeper.jpg",
-                "file_size": 120_000,
+                "file_path": "/photos/ref_copy.jpg",
+                "file_size": 150_000,
+                "width": 1000,
+                "height": 1000,
+                "md5": "md5_ref",
+                "quality_status": "aligned",
+                "ssim": 1.0,
+                "ssim_color": 1.0,
+                "pixel_ratio": 1.0,
+                "is_low_confidence": 0,
+            },
+            # Strictly worse member: lower resolution (500x500 < 1000x1000)
+            {
+                "id": 3,
+                "file_path": "/photos/thumb.jpg",
+                "file_size": 40_000,
+                "width": 500,
+                "height": 500,
+                "md5": "md5_thumb",
+                "quality_status": "aligned",
+                "ssim": 0.95,
+                "ssim_color": 0.94,
+                "pixel_ratio": 0.25,
+                "is_low_confidence": 0,
+            },
+            # Strictly worse member: same resolution, larger file size, but lower SSIM (0.985 < 1.0 - 0.005)
+            {
+                "id": 4,
+                "file_path": "/photos/q85_larger_file.jpg",
+                "file_size": 180_000,
+                "width": 1000,
+                "height": 1000,
+                "md5": "md5_q85",
+                "quality_status": "aligned",
+                "ssim": 0.985,
+                "ssim_color": 0.980,
+                "pixel_ratio": 1.0,
+                "is_low_confidence": 0,
+            },
+            # Same fidelity member: same resolution and SSIM within 0.005 (0.998 >= 1.0 - 0.005) -> review!
+            {
+                "id": 5,
+                "file_path": "/photos/near_identical.jpg",
+                "file_size": 150_000,
+                "width": 1000,
+                "height": 1000,
+                "md5": "md5_near",
+                "quality_status": "aligned",
+                "ssim": 0.998,
+                "ssim_color": 0.997,
+                "pixel_ratio": 1.0,
+                "is_low_confidence": 0,
+            },
+        ]
+        res = choose_keeper(members, mode="conservative")
+        # Keeper is the reference
+        assert res["keeper_id"] == 1
+        # Byte-identical copy (id 2) is delete_safe
+        assert 2 in res["delete_safe_ids"]
+        # Strictly worse lower-resolution thumbnail (id 3) is delete_safe
+        assert 3 in res["delete_safe_ids"]
+        # Strictly worse same-resolution member (id 4) is delete_safe (keeper 150K <= member 180K)
+        assert 4 in res["delete_safe_ids"]
+        # Same-fidelity member (id 5) is NOT strictly worse -> requires review
+        assert 5 in res["review_ids"]
+        assert 5 not in res["delete_safe_ids"]
+
+
+class TestKeeperNeverLargerThanSameResolutionMemberItReplaces:
+    def test_keeper_never_larger_than_same_resolution_member(self):
+        """
+        Invariant: the keeper's file size must never exceed any delete_safe member's
+        size by design unless that member is a lower-resolution copy.
+        Test: recommended keeper is never larger than the smallest same-resolution member it replaces.
+        """
+        members = [
+            # Candidate 1: High quality candidate, 1000x1000, 200KB
+            {
+                "id": 1,
+                "file_path": "/photos/original.jpg",
+                "file_size": 250_000,
+                "width": 1000,
+                "height": 1000,
+                "md5": "md5_orig",
+                "quality_status": "reference",
+                "ssim": 1.0,
+                "ssim_color": 1.0,
+                "pixel_ratio": 1.0,
+                "is_low_confidence": 0,
+            },
+            # Candidate 2: Chosen keeper in balanced mode, 1000x1000, 200KB
+            {
+                "id": 2,
+                "file_path": "/photos/keeper_cand.jpg",
+                "file_size": 200_000,
                 "width": 1000,
                 "height": 1000,
                 "md5": "md5_keeper",
                 "quality_status": "aligned",
-                "ssim": 0.995,
-                "ssim_color": 0.990,
+                "ssim": 0.985,
+                "ssim_color": 0.980,
                 "pixel_ratio": 1.0,
                 "is_low_confidence": 0,
             },
+            # Member 3: Same resolution (1000x1000), but smaller file size (120KB) and lower SSIM (0.90)
+            # Fails balanced mode candidate threshold, but keeper (200KB) is LARGER than member 3 (120KB)!
             {
                 "id": 3,
-                "file_path": "/photos/byte_identical_to_keeper.jpg",
+                "file_path": "/photos/smaller_same_res.jpg",
                 "file_size": 120_000,
                 "width": 1000,
                 "height": 1000,
-                "md5": "md5_keeper",  # Exact MD5 match with keeper
+                "md5": "md5_smaller",
                 "quality_status": "aligned",
-                "ssim": 0.995,
-                "ssim_color": 0.990,
+                "ssim": 0.90,
+                "ssim_color": 0.89,
                 "pixel_ratio": 1.0,
                 "is_low_confidence": 0,
             },
+            # Member 4: Lower resolution (500x500), smaller file size (50KB)
             {
                 "id": 4,
-                "file_path": "/photos/aligned_other.jpg",
-                "file_size": 130_000,
+                "file_path": "/photos/thumb_smaller.jpg",
+                "file_size": 50_000,
+                "width": 500,
+                "height": 500,
+                "md5": "md5_thumb",
+                "quality_status": "aligned",
+                "ssim": 0.96,
+                "ssim_color": 0.95,
+                "pixel_ratio": 0.25,
+                "is_low_confidence": 0,
+            },
+        ]
+        res = choose_keeper(members, mode="balanced")
+        assert res["keeper_id"] == 2
+        keeper_sz = 200_000
+
+        # Member 3 is same resolution and smaller than keeper -> MUST NOT be in delete_safe!
+        assert 3 not in res["delete_safe_ids"]
+        assert 3 in res["review_ids"]
+
+        # Member 4 is lower resolution -> allowed in delete_safe even though keeper is larger
+        assert 4 in res["delete_safe_ids"]
+
+        # Invariant verification across all delete_safe members:
+        id_to_m = {m["id"]: m for m in members}
+        for ds_id in res["delete_safe_ids"]:
+            m = id_to_m[ds_id]
+            px = m["width"] * m["height"]
+            if px >= 1000 * 1000:
+                assert keeper_sz <= m["file_size"]
+
+
+class TestByteIdenticalCopiesNeverStrandedInReview:
+    def test_byte_identical_copies_of_non_keeper_not_stranded_in_review(self):
+        """
+        Byte-identical copies of the keeper are always delete_safe.
+        A byte-identical copy of a non-keeper goes through that member's own rule,
+        so exact duplicate copies are never stranded in review when the keeper is a different file.
+        """
+        members = [
+            # High-res reference original (500KB)
+            {
+                "id": 1,
+                "file_path": "/photos/original.jpg",
+                "file_size": 500_000,
                 "width": 1000,
                 "height": 1000,
-                "md5": "md5_other",
+                "md5": "md5_original",
+                "quality_status": "reference",
+                "ssim": 1.0,
+                "ssim_color": 1.0,
+                "pixel_ratio": 1.0,
+                "is_low_confidence": 0,
+            },
+            # Exact duplicate of the original (also 500KB)
+            {
+                "id": 2,
+                "file_path": "/photos/original_copy.jpg",
+                "file_size": 500_000,
+                "width": 1000,
+                "height": 1000,
+                "md5": "md5_original",
+                "quality_status": "aligned",
+                "ssim": 1.0,
+                "ssim_color": 1.0,
+                "pixel_ratio": 1.0,
+                "is_low_confidence": 0,
+            },
+            # Smaller candidate keeper (q60, 400KB)
+            {
+                "id": 3,
+                "file_path": "/photos/q60.jpg",
+                "file_size": 400_000,
+                "width": 1000,
+                "height": 1000,
+                "md5": "md5_q60",
                 "quality_status": "aligned",
                 "ssim": 0.985,
                 "ssim_color": 0.980,
@@ -468,14 +644,18 @@ class TestConservativeModeNonRefReview:
                 "is_low_confidence": 0,
             },
         ]
-        res = choose_keeper(members, mode="conservative")
-        assert res["keeper_id"] == 2  # cand_keeper is smaller (120K < 150K)
-        # Byte-identical member (id 3) is automatic delete_safe
-        assert 3 in res["delete_safe_ids"]
-        # Non-identical member (id 4) goes to review_ids because keeper is not reference
-        assert 4 in res["review_ids"]
-        # Ref member (id 1) has higher quality (1.0 > 0.995) -> review
+        res = choose_keeper(members, mode="balanced")
+        # Keeper is the smaller q60 candidate
+        assert res["keeper_id"] == 3
+
+        # Non-keeper original (id 1) is better than keeper (quality 1.0 vs 0.985) -> goes to review
         assert 1 in res["review_ids"]
+        assert res["reasons"][1] == "better than recommended keeper"
+
+        # Exact byte-identical copy of non-keeper original (id 2) is NOT stranded in review!
+        # It is marked delete_safe
+        assert 2 in res["delete_safe_ids"]
+        assert "Byte-identical duplicate of original.jpg" in res["reasons"][2]
 
 
 class TestSafetyInvariants:
