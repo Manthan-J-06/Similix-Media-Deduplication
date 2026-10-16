@@ -53,6 +53,7 @@ class QualityMetrics:
     bytes_ratio: float = 0.0
     inlier_count: int = 0
     inlier_ratio: float = 0.0
+    blur_flag: bool = False
 
 
 @dataclass
@@ -110,6 +111,36 @@ def compute_laplacian_sharpness(gray_img: np.ndarray) -> float:
     if gray_img.size == 0:
         return 0.0
     return float(cv2.Laplacian(gray_img, cv2.CV_64F).var())
+
+
+def compute_common_scale_sharpness(
+    gray_member: np.ndarray,
+    gray_ref: np.ndarray,
+    blur_threshold: float = 0.70,
+) -> tuple[float, bool]:
+    """
+    Compute sharpness ratio between member and reference at a common resolution.
+    Resizes both to the smaller dimension (min width, min height) using INTER_AREA,
+    computes Laplacian variance for both, and caps the ratio at 1.0.
+    Returns:
+        (sharpness_ratio, is_blurred)
+        where sharpness_ratio <= 1.0 and is_blurred is True if ratio < blur_threshold.
+    """
+    h_m, w_m = gray_member.shape[:2]
+    h_r, w_r = gray_ref.shape[:2]
+    cw = max(1, min(w_m, w_r))
+    ch = max(1, min(h_m, h_r))
+
+    m_scaled = cv2.resize(gray_member, (cw, ch), interpolation=cv2.INTER_AREA) if (w_m, h_m) != (cw, ch) else gray_member
+    ref_scaled = cv2.resize(gray_ref, (cw, ch), interpolation=cv2.INTER_AREA) if (w_r, h_r) != (cw, ch) else gray_ref
+
+    lap_m = compute_laplacian_sharpness(m_scaled)
+    lap_ref = compute_laplacian_sharpness(ref_scaled)
+
+    raw_ratio = (lap_m / lap_ref) if lap_ref > 0 else 0.0
+    capped_ratio = min(1.0, raw_ratio)
+    is_blurred = capped_ratio < blur_threshold
+    return round(capped_ratio, 4), is_blurred
 
 
 def load_proxy_rgb(
@@ -256,13 +287,14 @@ def align_and_compute_metrics(
     pixel_ratio = round(m_px / ref_px, 4)
     bytes_ratio = round((m_sz / ref_sz) if ref_sz > 0 else 0.0, 4)
 
-    # Sharpness ratio (Laplacian variance)
+    # Sharpness ratio computed at common scale (capped at 1.0)
     ref_gray = cv2.cvtColor(ref_rgb, cv2.COLOR_RGB2GRAY)
     m_gray = cv2.cvtColor(m_rgb, cv2.COLOR_RGB2GRAY)
 
-    ref_sharpness = compute_laplacian_sharpness(ref_gray)
-    m_sharpness = compute_laplacian_sharpness(m_gray)
-    sharpness_ratio = round((m_sharpness / ref_sharpness) if ref_sharpness > 0 else 0.0, 4)
+    blur_threshold = float(cfg.get("blur_threshold", 0.70))
+    sharpness_ratio, blur_flag = compute_common_scale_sharpness(
+        m_gray, ref_gray, blur_threshold=blur_threshold
+    )
 
     # ── Alignment ──────────────────────────────────────────────────────────
     # Check if cached in pair_transforms (member -> reference)
@@ -361,6 +393,7 @@ def align_and_compute_metrics(
             bytes_ratio=bytes_ratio,
             inlier_count=inlier_count,
             inlier_ratio=round(inlier_ratio, 4),
+            blur_flag=blur_flag,
         )
 
     ref_w, ref_h = ref_rgb.shape[1], ref_rgb.shape[0]
@@ -419,6 +452,7 @@ def align_and_compute_metrics(
         bytes_ratio=bytes_ratio,
         inlier_count=inlier_count,
         inlier_ratio=round(inlier_ratio, 4),
+        blur_flag=blur_flag,
     )
 
 
