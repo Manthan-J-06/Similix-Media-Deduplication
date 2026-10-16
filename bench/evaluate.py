@@ -747,6 +747,63 @@ def main(argv: list[str] | None = None) -> None:
     out_file.write_text(report_md, encoding="utf-8")
     print(f"Held-out test set report saved to: {out_file}\n")
 
+    # 4. Save tuned thresholds to single source of truth (bench/tuned.json)
+    tuned_data = {
+        "stage1": {
+            "hamming_threshold": int(chosen["best_combo_phash"]),
+        },
+        "stage2": {
+            "cosine_threshold": round(float(chosen["best_combo_cos"]), 4),
+        },
+        "tuned_at": datetime.now().isoformat(),
+        "tuning_rule": "maximize variant recall subject to precision >= 99.5%, with cosine threshold >= 0.90",
+        "split_seed": args.split_seed,
+        "tuning_metrics": {
+            "pHash_threshold": int(chosen["best_phash_th"]),
+            "pHash_tuning_f1": round(float(chosen["tuning_f1_phash"]), 2),
+            "clip_cosine_threshold": round(float(chosen["best_clip_cos"]), 4),
+            "clip_tuning_f1": round(float(chosen["tuning_f1_clip"]), 2),
+            "combo_hamming_threshold": int(chosen["best_combo_phash"]),
+            "combo_cosine_threshold": round(float(chosen["best_combo_cos"]), 4),
+            "combo_tuning_recall": round(float(chosen.get("tuning_recall_combo", 100.0)), 2),
+            "combo_tuning_precision": round(float(chosen.get("tuning_precision_combo", 100.0)), 2),
+        },
+    }
+    tuned_json_path = Path("bench/tuned.json")
+    tuned_json_path.parent.mkdir(parents=True, exist_ok=True)
+    tuned_json_path.write_text(json.dumps(tuned_data, indent=2), encoding="utf-8")
+    print(f"Tuned thresholds saved to single source of truth: {tuned_json_path}\n")
+
+    # 5. Check and loud warning if tuned thresholds differ from config.toml
+    # Reload config to get the current on-disk state
+    current_cfg = load_config()
+    cfg_stage1_th = current_cfg.get("stage1", {}).get("hamming_threshold")
+    cfg_stage2_cos = current_cfg.get("stage2", {}).get("cosine_threshold")
+    tuned_stage1_th = chosen["best_combo_phash"]
+    tuned_stage2_cos = chosen["best_combo_cos"]
+
+    print("=" * 80)
+    print("  THRESHOLD CONSISTENCY VERIFICATION")
+    print("=" * 80)
+    print(f"Tuned thresholds used in benchmark : pHash hamming_threshold={tuned_stage1_th}, CLIP cosine_threshold={tuned_stage2_cos:.4f}")
+    print(f"Active thresholds in config.toml    : pHash hamming_threshold={cfg_stage1_th}, CLIP cosine_threshold={cfg_stage2_cos:.4f}")
+
+    if cfg_stage1_th != tuned_stage1_th or abs(float(cfg_stage2_cos) - float(tuned_stage2_cos)) > 1e-4:
+        print("\n" + "#" * 80)
+        print("  ⚠️  CRITICAL WARNING: TUNED THRESHOLDS DIFFER FROM config.toml!  ⚠️")
+        print("#" * 80)
+        print(f"  Tuned Benchmark Values : stage1.hamming_threshold = {tuned_stage1_th}")
+        print(f"                           stage2.cosine_threshold  = {tuned_stage2_cos:.4f}")
+        print(f"  Active config.toml     : stage1.hamming_threshold = {cfg_stage1_th}")
+        print(f"                           stage2.cosine_threshold  = {cfg_stage2_cos:.4f}")
+        print()
+        print("  THE CLI WILL RUN WITH DIFFERENT THRESHOLDS FROM THE BENCHMARK!")
+        print("  Please update config.toml to match the tuned parameters.")
+        print("#" * 80 + "\n")
+    else:
+        print("  ✅ config.toml is in sync with tuned benchmark thresholds.\n")
+    print("=" * 80 + "\n")
+
 
 if __name__ == "__main__":
     main()

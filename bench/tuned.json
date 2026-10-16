@@ -1,0 +1,21 @@
+{
+  "stage1": {
+    "hamming_threshold": 8
+  },
+  "stage2": {
+    "cosine_threshold": 0.9
+  },
+  "tuned_at": "2026-10-16T11:21:51.111656",
+  "tuning_rule": "maximize variant recall subject to precision >= 99.5%, with cosine threshold >= 0.90",
+  "split_seed": 42,
+  "tuning_metrics": {
+    "pHash_threshold": 8,
+    "pHash_tuning_f1": 89.7,
+    "clip_cosine_threshold": 0.88,
+    "clip_tuning_f1": 96.14,
+    "combo_hamming_threshold": 8,
+    "combo_cosine_threshold": 0.9,
+    "combo_tuning_recall": 100.0,
+    "combo_tuning_precision": 100.0
+  }
+}

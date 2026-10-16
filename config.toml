@@ -26,7 +26,7 @@ hash_algorithm = "phash"
 hash_size = 8
 # Maximum Hamming distance to consider two images near-duplicate candidates.
 # Range 0–64 for a 64-bit hash. Lower = stricter.
-hamming_threshold = 10
+hamming_threshold = 8
 
 # ── Stage 2: CLIP embedding + FAISS ──────────────────────────────────────────
 [stage2]
@@ -39,7 +39,7 @@ batch_size = 32
 # Also store embeddings for 90/180/270 degree rotated thumbnails (default: true).
 enable_rotation_embeddings = true
 # Cosine-similarity threshold to accept a candidate pair.
-cosine_threshold = 0.92
+cosine_threshold = 0.90
 # Number of neighbours to retrieve per query.
 faiss_k = 20
 
