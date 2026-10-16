@@ -31,6 +31,12 @@ CREATE TABLE IF NOT EXISTS images (
     confidence    REAL,                          -- duplicate-confidence 0-100
     link_signal   TEXT,                          -- 'md5' | 'phash' | 'clip'
     is_raw_pair   INTEGER NOT NULL DEFAULT 0,    -- 1 = RAW/JPEG sibling, skip dedup
+    ssim          REAL,                          -- SSIM score vs cluster reference (grayscale)
+    ssim_color    REAL,                          -- SSIM score vs cluster reference (color)
+    sharpness_ratio REAL,                        -- Laplacian variance ratio (member / reference)
+    pixel_ratio   REAL,                          -- pixel count ratio (member / reference)
+    bytes_ratio   REAL,                          -- file size ratio (member / reference)
+    quality_status TEXT,                         -- 'reference' | 'aligned' | 'unalignable'
     created_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
     updated_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
@@ -47,6 +53,22 @@ CREATE TABLE IF NOT EXISTS clusters (
     stage_detected    INTEGER NOT NULL,           -- pipeline stage that found this cluster (0, 1, 2...)
     member_count      INTEGER NOT NULL DEFAULT 0,
     created_at        TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+"""
+
+# ---------------------------------------------------------------------------
+# Table: pair_transforms (cached geometric alignment matrices)
+# ---------------------------------------------------------------------------
+CREATE_PAIR_TRANSFORMS = """
+CREATE TABLE IF NOT EXISTS pair_transforms (
+    source_id        INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+    target_id        INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+    transform_matrix BLOB NOT NULL,
+    model            TEXT NOT NULL DEFAULT 'affine',
+    inlier_count     INTEGER NOT NULL DEFAULT 0,
+    inlier_ratio     REAL NOT NULL DEFAULT 0.0,
+    created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    PRIMARY KEY (source_id, target_id)
 );
 """
 
@@ -76,11 +98,13 @@ CREATE INDEX IF NOT EXISTS idx_images_phash     ON images(phash);
 CREATE INDEX IF NOT EXISTS idx_images_status    ON images(status);
 CREATE INDEX IF NOT EXISTS idx_images_cluster   ON images(cluster_id);
 CREATE INDEX IF NOT EXISTS idx_actions_image    ON actions(image_id);
+CREATE INDEX IF NOT EXISTS idx_pair_transforms_target ON pair_transforms(target_id);
 """
 
 ALL_DDL = "\n".join([
     CREATE_IMAGES,
     CREATE_CLUSTERS,
+    CREATE_PAIR_TRANSFORMS,
     CREATE_ACTIONS,
     CREATE_INDEXES,
 ])

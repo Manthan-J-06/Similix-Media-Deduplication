@@ -228,6 +228,43 @@ def cmd_verify(args: argparse.Namespace) -> None:
     print("--------------------------------------------------")
 
 
+def cmd_quality(args: argparse.Namespace) -> None:
+    cfg = load_config(args.config)
+    db_path = args.db or cfg.get("general", {}).get("db_path", "argus.db")
+    conn = init_db(db_path)
+
+    q_cfg = cfg.get("quality", {})
+    proxy_sz = q_cfg.get("proxy_size", 1024)
+    min_inl = q_cfg.get("min_align_inliers", 15)
+    min_rat = q_cfg.get("min_align_inlier_ratio", 0.50)
+
+    print("==================================================")
+    print("  ARGUS Quality Scoring & Geometric Alignment")
+    print("==================================================")
+    print(f"Database         : {db_path}")
+    print(f"Proxy Size       : {proxy_sz}px")
+    print(f"Min Inliers      : {min_inl}")
+    print(f"Min Inlier Ratio : {min_rat}")
+    print()
+
+    source = None
+    if args.folder:
+        folder = Path(args.folder).resolve()
+        if folder.exists() and folder.is_dir():
+            source = LocalFolderSource(folder)
+
+    from core.quality import run_quality_pipeline
+    res = run_quality_pipeline(conn, cfg, source=source)
+
+    print("--------------------------------------------------")
+    print(f"Quality evaluation complete in {res.elapsed_seconds:.2f}s")
+    print(f"Clusters evaluated       : {res.clusters_evaluated}")
+    print(f"Members evaluated        : {res.members_evaluated}")
+    print(f"Members aligned          : {res.members_aligned}")
+    print(f"Members unalignable      : {res.members_unalignable}")
+    print("--------------------------------------------------")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="argus",
@@ -256,6 +293,11 @@ def main(argv: list[str] | None = None) -> None:
     verify_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
     verify_parser.add_argument("--db", default=None, help="Path to SQLite database file")
 
+    quality_parser = subparsers.add_parser("quality", help="Score quality and align cluster proxies (Stage 4 prep)")
+    quality_parser.add_argument("folder", nargs="?", default=None, help="Path to image folder (optional)")
+    quality_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
+    quality_parser.add_argument("--db", default=None, help="Path to SQLite database file")
+
     args = parser.parse_args(argv)
     if args.subcommand == "scan":
         cmd_scan(args)
@@ -265,6 +307,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_cluster(args)
     elif args.subcommand == "verify":
         cmd_verify(args)
+    elif args.subcommand == "quality":
+        cmd_quality(args)
 
 
 if __name__ == "__main__":

@@ -47,6 +47,95 @@ class MatchResult:
     total_keypoints_1: int
     total_keypoints_2: int
     message: str = ""
+    transform_matrix: np.ndarray | None = None
+
+
+def proxy_matrix_to_full(
+    M: np.ndarray,
+    p1_shape: tuple[int, int],
+    o1_shape: tuple[int, int],
+    p2_shape: tuple[int, int],
+    o2_shape: tuple[int, int],
+) -> np.ndarray:
+    """
+    Convert an affine transformation matrix M estimated between proxy images
+    into full-resolution image coordinates.
+    p1_shape, p2_shape: (height, width) of proxy images
+    o1_shape, o2_shape: (width, height) of original images
+    """
+    s1x = p1_shape[1] / max(1, o1_shape[0])
+    s1y = p1_shape[0] / max(1, o1_shape[1])
+    s2x = p2_shape[1] / max(1, o2_shape[0])
+    s2y = p2_shape[0] / max(1, o2_shape[1])
+
+    M_full = np.zeros((2, 3), dtype=np.float64)
+    M_full[0, 0] = M[0, 0] * (s1x / s2x)
+    M_full[0, 1] = M[0, 1] * (s1y / s2x)
+    M_full[0, 2] = M[0, 2] / s2x
+    M_full[1, 0] = M[1, 0] * (s1x / s2y)
+    M_full[1, 1] = M[1, 1] * (s1y / s2y)
+    M_full[1, 2] = M[1, 2] / s2y
+    return M_full
+
+
+def full_matrix_to_proxy(
+    M_full: np.ndarray,
+    p1_shape: tuple[int, int],
+    o1_shape: tuple[int, int],
+    p2_shape: tuple[int, int],
+    o2_shape: tuple[int, int],
+) -> np.ndarray:
+    """
+    Convert a full-resolution affine matrix M_full into target proxy image coordinates.
+    """
+    s1x = p1_shape[1] / max(1, o1_shape[0])
+    s1y = p1_shape[0] / max(1, o1_shape[1])
+    s2x = p2_shape[1] / max(1, o2_shape[0])
+    s2y = p2_shape[0] / max(1, o2_shape[1])
+
+    M = np.zeros((2, 3), dtype=np.float64)
+    M[0, 0] = M_full[0, 0] * (s2x / s1x)
+    M[0, 1] = M_full[0, 1] * (s2x / s1y)
+    M[0, 2] = M_full[0, 2] * s2x
+    M[1, 0] = M_full[1, 0] * (s2y / s1x)
+    M[1, 1] = M_full[1, 1] * (s2y / s1y)
+    M[1, 2] = M_full[1, 2] * s2y
+    return M
+
+
+def cache_pair_transform(
+    conn: sqlite3.Connection,
+    source_id: int,
+    target_id: int,
+    M_full: np.ndarray,
+    model: str = "affine",
+    inlier_count: int = 0,
+    inlier_ratio: float = 0.0,
+) -> None:
+    """
+    Store bidirectional transformation matrices in SQLite pair_transforms table.
+    """
+    try:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO pair_transforms (source_id, target_id, transform_matrix, model, inlier_count, inlier_ratio)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (source_id, target_id, pickle.dumps(M_full), model, inlier_count, inlier_ratio),
+        )
+        if model == "affine":
+            M_inv = cv2.invertAffineTransform(M_full)
+        else:
+            M_inv = np.linalg.inv(M_full)
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO pair_transforms (source_id, target_id, transform_matrix, model, inlier_count, inlier_ratio)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (target_id, source_id, pickle.dumps(M_inv), model, inlier_count, inlier_ratio),
+        )
+    except Exception:
+        pass
 
 
 @dataclass
@@ -280,9 +369,9 @@ class KeypointVerifier:
         dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
 
         if self.model == "homography":
-            _M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, self.ransac_reproj)
+            M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, self.ransac_reproj)
         else:
-            _M, mask = cv2.estimateAffinePartial2D(
+            M, mask = cv2.estimateAffinePartial2D(
                 src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=self.ransac_reproj
             )
 
@@ -322,6 +411,7 @@ class KeypointVerifier:
                 total_keypoints_1=nkp1,
                 total_keypoints_2=nkp2,
                 message=f"Inconclusive: insufficient keypoints ({min(nkp1, nkp2)} < {self.min_keypoints})",
+                transform_matrix=M,
             )
 
         verified = (inlier_count >= self.min_inliers) and (inlier_ratio >= self.min_inlier_ratio)
@@ -336,6 +426,7 @@ class KeypointVerifier:
             total_keypoints_1=nkp1,
             total_keypoints_2=nkp2,
             message="Verified" if verified else f"Failed thresholds (inliers={inlier_count}/{self.min_inliers}, ratio={inlier_ratio:.3f}/{self.min_inlier_ratio})",
+            transform_matrix=M,
         )
 
 
@@ -363,7 +454,7 @@ def verify_pair(
 def get_auto_delete_candidates(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     """
     Return cluster members that are safe for auto-delete recommendation.
-    Inconclusive / low-confidence members are strictly excluded.
+    Inconclusive / low-confidence members and unalignable members are strictly excluded.
     """
     return conn.execute(
         """
@@ -371,6 +462,7 @@ def get_auto_delete_candidates(conn: sqlite3.Connection) -> list[sqlite3.Row]:
         WHERE cluster_id IS NOT NULL
           AND is_keeper = 0
           AND is_low_confidence = 0
+          AND (quality_status IS NULL OR quality_status != 'unalignable')
         ORDER BY cluster_id, id
         """
     ).fetchall()
@@ -398,7 +490,7 @@ def run_stage3_verification(
     t0 = time.perf_counter()
     verifier = KeypointVerifier(config)
 
-    # Ensure keypoint cache table and is_low_confidence column exist
+    # Ensure keypoint cache table, pair_transforms table, and is_low_confidence column exist
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS keypoint_cache (
@@ -409,10 +501,45 @@ def run_stage3_verification(
         );
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pair_transforms (
+            source_id        INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+            target_id        INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+            transform_matrix BLOB NOT NULL,
+            model            TEXT NOT NULL DEFAULT 'affine',
+            inlier_count     INTEGER NOT NULL DEFAULT 0,
+            inlier_ratio     REAL NOT NULL DEFAULT 0.0,
+            created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            PRIMARY KEY (source_id, target_id)
+        );
+        """
+    )
     cursor = conn.execute("PRAGMA table_info(images);")
     existing_cols = {row["name"] for row in cursor.fetchall()}
     if "is_low_confidence" not in existing_cols:
         conn.execute("ALTER TABLE images ADD COLUMN is_low_confidence INTEGER NOT NULL DEFAULT 0;")
+
+    # Cache original dimensions for coordinate transformation
+    orig_dims: dict[int, tuple[int, int]] = {}
+    for r in conn.execute("SELECT id, width, height, file_path FROM images").fetchall():
+        w, h = r["width"], r["height"]
+        if not w or not h:
+            try:
+                with Image.open(r["file_path"]) as im:
+                    w, h = im.size
+                conn.execute("UPDATE images SET width = ?, height = ? WHERE id = ?", (w, h, r["id"]))
+            except Exception:
+                w, h = 1024, 768
+        orig_dims[r["id"]] = (w, h)
+
+    def get_proxy_shape(img_id: int) -> tuple[int, int]:
+        w, h = orig_dims.get(img_id, (1024, 1024))
+        max_dim = max(w, h)
+        scale = verifier.proxy_size / max_dim if max_dim > verifier.proxy_size else 1.0
+        pw = max(1, int(round(w * scale)))
+        ph = max(1, int(round(h * scale)))
+        return (ph, pw)
 
     clusters_rows = conn.execute(
         """
@@ -485,9 +612,23 @@ def run_stage3_verification(
                 res.pairs_inconclusive += 1
                 cluster_has_inconclusive = True
                 conn.execute("UPDATE images SET is_low_confidence = 1 WHERE id = ?", (m_id,))
+                if match_res.transform_matrix is not None:
+                    p1_s = get_proxy_shape(rep_id)
+                    o1_s = orig_dims.get(rep_id, (1024, 1024))
+                    p2_s = get_proxy_shape(m_id)
+                    o2_s = orig_dims.get(m_id, (1024, 1024))
+                    M_full = proxy_matrix_to_full(match_res.transform_matrix, p1_s, o1_s, p2_s, o2_s)
+                    cache_pair_transform(conn, rep_id, m_id, M_full, verifier.model, match_res.inlier_count, match_res.inlier_ratio)
             elif match_res.status == "verified":
                 res.pairs_verified += 1
                 conn.execute("UPDATE images SET is_low_confidence = 0 WHERE id = ?", (m_id,))
+                if match_res.transform_matrix is not None:
+                    p1_s = get_proxy_shape(rep_id)
+                    o1_s = orig_dims.get(rep_id, (1024, 1024))
+                    p2_s = get_proxy_shape(m_id)
+                    o2_s = orig_dims.get(m_id, (1024, 1024))
+                    M_full = proxy_matrix_to_full(match_res.transform_matrix, p1_s, o1_s, p2_s, o2_s)
+                    cache_pair_transform(conn, rep_id, m_id, M_full, verifier.model, match_res.inlier_count, match_res.inlier_ratio)
             else:
                 res.pairs_failed += 1
                 members_to_split.append((m_id, m_path))
@@ -590,6 +731,13 @@ def run_stage3_verification(
                 mres = verifier.match_features(rep_kp, rep_des, mkp, mdes)
                 if mres.status == "verified":
                     matched_cid = sc["id"]
+                    if mres.transform_matrix is not None:
+                        p1_s = get_proxy_shape(sc["representative_id"])
+                        o1_s = orig_dims.get(sc["representative_id"], (1024, 1024))
+                        p2_s = get_proxy_shape(mid)
+                        o2_s = orig_dims.get(mid, (1024, 1024))
+                        M_full = proxy_matrix_to_full(mres.transform_matrix, p1_s, o1_s, p2_s, o2_s)
+                        cache_pair_transform(conn, sc["representative_id"], mid, M_full, verifier.model, mres.inlier_count, mres.inlier_ratio)
                     conn.execute(
                         """
                         UPDATE images
@@ -625,6 +773,13 @@ def run_stage3_verification(
                 mres = verifier.match_features(seed_kp, seed_des, mkp, mdes)
                 if mres.status == "verified":
                     cand_members.append((mid, mpath))
+                    if mres.transform_matrix is not None:
+                        p1_s = get_proxy_shape(seed_id)
+                        o1_s = orig_dims.get(seed_id, (1024, 1024))
+                        p2_s = get_proxy_shape(mid)
+                        o2_s = orig_dims.get(mid, (1024, 1024))
+                        M_full = proxy_matrix_to_full(mres.transform_matrix, p1_s, o1_s, p2_s, o2_s)
+                        cache_pair_transform(conn, seed_id, mid, M_full, verifier.model, mres.inlier_count, mres.inlier_ratio)
                 else:
                     unmatched.append((mid, mpath))
 

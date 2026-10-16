@@ -64,6 +64,23 @@ min_inlier_ratio = 0.65
 # Geometric transformation model: "affine" (similarity: scale+rot+trans) or "homography"
 transformation_model = "affine"
 
+# ── Stage 4: Quality scoring & proxy alignment ──────────────────────────────
+[quality]
+# Target proxy edge length (px) for quality and SSIM evaluation (default 1024).
+proxy_size = 1024
+# Feature detector algorithm: "sift" or "orb".
+algorithm = "sift"
+# Maximum number of keypoint features to extract per image proxy.
+max_features = 2000
+# Lowe's distance ratio threshold for matching.
+ratio_threshold = 0.75
+# RANSAC reprojection error threshold in pixels.
+ransac_reproj_threshold = 4.0
+# Minimum number of geometrically consistent inliers to accept alignment.
+min_align_inliers = 15
+# Minimum ratio of inliers to good feature matches.
+min_align_inlier_ratio = 0.50
+
 # ── Stage 4: Keeper selection ─────────────────────────────────────────────────
 # (Not yet active — placeholders for when Stage 4 is implemented.)
 [stage4]
