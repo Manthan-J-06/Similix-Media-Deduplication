@@ -38,18 +38,21 @@ DEFAULT_KEEPER_MODES: dict[str, dict[str, Any]] = {
         "ssim_gray": 0.98,
         "ssim_color": 0.97,
         "pixel_ratio_floor": 0.90,
+        "min_saving_ratio": 0.0,
         "allow_blur_flag": False,
     },
     "balanced": {
         "ssim_gray": 0.95,
         "ssim_color": 0.94,
         "pixel_ratio_floor": 0.60,
+        "min_saving_ratio": 0.10,
         "allow_blur_flag": False,
     },
     "aggressive": {
         "ssim_gray": 0.92,
         "ssim_color": 0.90,
         "pixel_ratio_floor": 0.25,
+        "min_saving_ratio": 0.30,
         "allow_blur_flag": True,
     },
 }
@@ -181,13 +184,23 @@ def choose_keeper(
         ref_member = min(members, key=ref_key)
 
     ref_id = ref_member.get("id")
+    ref_sz = ref_member.get("file_size") or 0
+    min_saving = float(limits.get("min_saving_ratio", 0.0))
+    max_non_ref_sz = ref_sz * (1.0 - min_saving)
 
-    # 1. Select Candidates meeting mode limits
+    # 1. Select Candidates meeting mode limits and min_saving_ratio
+    # A non-reference candidate becomes keeper only if its file size <= reference_size * (1 - min_saving_ratio).
+    # Otherwise the reference stays the keeper.
     candidates = []
     for m in members:
         is_ref = (m.get("id") == ref_id)
         if _is_member_candidate(m, limits, is_reference=is_ref):
-            candidates.append(m)
+            if is_ref:
+                candidates.append(m)
+            else:
+                m_sz = m.get("file_size") or 0
+                if m_sz <= max_non_ref_sz:
+                    candidates.append(m)
 
     # 2. Pick Keeper
     # Keeper = smallest file among candidates; ties go to higher pixel count, then shorter path.
@@ -200,6 +213,15 @@ def choose_keeper(
     keeper_id = keeper.get("id")
     keeper_md5 = keeper.get("md5")
     keeper_sz = keeper.get("file_size") or 0
+    k_w = keeper.get("width") or 0
+    k_h = keeper.get("height") or 0
+    k_px = k_w * k_h
+    if keeper_id == ref_id or keeper.get("quality_status") == "reference":
+        k_quality = 1.0
+    elif keeper.get("ssim") is not None:
+        k_quality = float(keeper["ssim"])
+    else:
+        k_quality = 1.0
 
     delete_safe_ids: list[int] = []
     review_ids: list[int] = []
@@ -242,6 +264,18 @@ def choose_keeper(
             keeper_md5 and m_md5 and m_md5 == keeper_md5 and m_sz == keeper_sz
         )
 
+        m_w = m.get("width") or 0
+        m_h = m.get("height") or 0
+        m_px = m_w * m_h
+        if mid == ref_id or q_status == "reference" or (keeper_md5 and m_md5 == keeper_md5):
+            m_quality = 1.0
+        elif m_ssim is not None:
+            m_quality = float(m_ssim)
+        else:
+            m_quality = 0.0
+
+        is_keeper_at_least_as_good = (k_px >= m_px) and (k_quality >= m_quality - 0.005)
+
         # Unalignable, low-confidence or inconclusive goes to review_ids, never delete_safe
         if q_status == "unalignable":
             review_ids.append(mid)
@@ -252,9 +286,17 @@ def choose_keeper(
         elif q_status not in ("reference", "aligned"):
             review_ids.append(mid)
             reasons[mid] = f"Unverified quality status '{q_status}' (manual review required)"
+        elif not is_keeper_at_least_as_good:
+            # Member is better than keeper in resolution or quality -> review
+            review_ids.append(mid)
+            reasons[mid] = "better than recommended keeper"
         elif is_byte_identical:
             delete_safe_ids.append(mid)
             reasons[mid] = "Byte-identical copy of keeper (100.0% quality retained)"
+        elif mode == "conservative" and keeper_id != ref_id:
+            # In conservative mode, byte-identical members are the only automatic delete_safe members when keeper is not reference
+            review_ids.append(mid)
+            reasons[mid] = "Conservative mode: non-identical duplicate requires manual review when keeper is not reference"
         elif q_status in ("reference", "aligned") and not is_low_conf:
             delete_safe_ids.append(mid)
             reasons[mid] = f"Verified aligned duplicate ({retained_pct}% quality retained)"
