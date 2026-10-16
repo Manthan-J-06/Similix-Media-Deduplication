@@ -172,6 +172,37 @@ def load_proxy_rgb(
     return arr, actual_scale, orig_dims
 
 
+def detect_orthogonal_rotation(
+    M_full: np.ndarray,
+    tol_scale: float = 0.05,
+    tol_angle_deg: float = 3.0,
+) -> int | None:
+    """
+    Check if an affine transform matrix represents a pure 90/180/270 degree rotation
+    (scale ~ 1.0, angle near 90/180/270).
+    Returns cv2.ROTATE_* flag if detected, else None.
+    """
+    a, b = M_full[0, 0], M_full[0, 1]
+    c, d = M_full[1, 0], M_full[1, 1]
+    scale = float(np.sqrt(a * a + c * c))
+    if abs(scale - 1.0) > tol_scale:
+        return None
+
+    angle_deg = float(np.degrees(np.arctan2(c, a))) % 360.0
+
+    # 90° clockwise: a ~ 0, c ~ 1 -> atan2(1, 0) = 90°
+    if abs(angle_deg - 90.0) <= tol_angle_deg:
+        return cv2.ROTATE_90_CLOCKWISE
+    # 180°: a ~ -1, c ~ 0 -> atan2(0, -1) = 180°
+    elif abs(angle_deg - 180.0) <= tol_angle_deg:
+        return cv2.ROTATE_180
+    # 270° clockwise (= 90° CCW): a ~ 0, c ~ -1 -> atan2(-1, 0) = 270° (or -90°)
+    elif abs(angle_deg - 270.0) <= tol_angle_deg:
+        return cv2.ROTATE_90_COUNTERCLOCKWISE
+
+    return None
+
+
 def align_and_compute_metrics(
     member_path: str | Path | Image.Image | np.ndarray,
     reference_path: str | Path | Image.Image | np.ndarray,
@@ -332,16 +363,47 @@ def align_and_compute_metrics(
             inlier_ratio=round(inlier_ratio, 4),
         )
 
-    # Warp member image to reference coordinates
-    M_proxy = full_matrix_to_proxy(
-        M_full,
-        m_rgb.shape[:2],
-        m_orig,
-        ref_rgb.shape[:2],
-        ref_orig,
-    )
     ref_w, ref_h = ref_rgb.shape[1], ref_rgb.shape[0]
-    warped_rgb = cv2.warpAffine(m_rgb, M_proxy, (ref_w, ref_h))
+    rot_code = detect_orthogonal_rotation(M_full)
+
+    # 1. Exact orthogonal rotation (avoids interpolation artifacts)
+    if rot_code is not None:
+        rotated_rgb = cv2.rotate(m_rgb, rot_code)
+        if rotated_rgb.shape == ref_rgb.shape:
+            warped_rgb = rotated_rgb
+        else:
+            M_proxy = full_matrix_to_proxy(
+                M_full,
+                m_rgb.shape[:2],
+                m_orig,
+                ref_rgb.shape[:2],
+                ref_orig,
+            )
+            warped_rgb = cv2.warpAffine(m_rgb, M_proxy, (ref_w, ref_h))
+    else:
+        # 2. Check near-identity (identical coordinates)
+        a, c = M_full[0, 0], M_full[1, 0]
+        scale = float(np.sqrt(a * a + c * c))
+        angle_deg = float(np.degrees(np.arctan2(c, a))) % 360.0
+        is_identity = (
+            abs(scale - 1.0) <= 0.02
+            and (angle_deg <= 1.0 or angle_deg >= 359.0)
+            and m_rgb.shape == ref_rgb.shape
+            and abs(M_full[0, 2]) <= 1.0
+            and abs(M_full[1, 2]) <= 1.0
+        )
+        if is_identity:
+            warped_rgb = m_rgb
+        else:
+            M_proxy = full_matrix_to_proxy(
+                M_full,
+                m_rgb.shape[:2],
+                m_orig,
+                ref_rgb.shape[:2],
+                ref_orig,
+            )
+            warped_rgb = cv2.warpAffine(m_rgb, M_proxy, (ref_w, ref_h))
+
     warped_gray = cv2.cvtColor(warped_rgb, cv2.COLOR_RGB2GRAY)
 
     # Compute SSIM
