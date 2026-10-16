@@ -53,7 +53,7 @@ def execute_pipeline(demo_dir: Path) -> dict:
     run_stage3_verification(conn, cfg, source=source)
     run_quality_pipeline(conn, cfg, source=source)
 
-    clusters = conn.execute("SELECT id, representative_id FROM clusters ORDER BY id").fetchall()
+    clusters = conn.execute("SELECT id, representative_id, reference_uncertain FROM clusters ORDER BY id").fetchall()
     results = {}
 
     for c in clusters:
@@ -62,7 +62,7 @@ def execute_pipeline(demo_dir: Path) -> dict:
             """SELECT id, file_path, file_size, width, height, format, md5, phash,
                       status, cluster_id, is_keeper, is_low_confidence,
                       ssim, ssim_color, sharpness_ratio, pixel_ratio, bytes_ratio, quality_status,
-                      jpeg_quality_est
+                      source_likelihood, jpeg_quality_est
                FROM images WHERE cluster_id = ? ORDER BY id""",
             (cid,)
         ).fetchall()
@@ -74,20 +74,23 @@ def execute_pipeline(demo_dir: Path) -> dict:
         ref_members = [m for m in members if m["quality_status"] == "reference"]
         ref_m = ref_members[0] if ref_members else None
 
+        ref_unc = c["reference_uncertain"] if "reference_uncertain" in c.keys() else None
         cluster_res = {
             "members": members,
             "ref_member": ref_m,
+            "reference_uncertain": ref_unc,
             "modes": {},
         }
 
         for mode in ["conservative", "balanced", "aggressive"]:
-            res = choose_keeper(members, mode=mode, config=cfg)
+            res = choose_keeper(members, mode=mode, config=cfg, reference_uncertain=ref_unc)
             k_m = id_to_m[res["keeper_id"]]
             cluster_res["modes"][mode] = {
                 "keeper": k_m,
                 "delete_safe": [id_to_m[i] for i in res["delete_safe_ids"]],
                 "review": [id_to_m[i] for i in res["review_ids"]],
                 "total_savings_bytes": res["total_savings_bytes"],
+                "reasons": res["reasons"],
             }
         results[cid] = cluster_res
 
@@ -162,6 +165,7 @@ def run_comparison():
     all_scenes = sorted(run1_by_scene.keys())
     ref_mismatches = 0
     keeper_mismatches = 0
+    true_original_references = 0
 
     header = f"{'Scene':<14} | {'Metric / Mode':<15} | {'Run 1 (Normal Name)':<30} | {'Run 2 (Random Name)':<30} | {'Match?'}"
     print(header)
@@ -180,7 +184,30 @@ def run_comparison():
         ref_match = (ref1["md5"] == ref2["md5"]) if (ref1 and ref2) else False
         if not ref_match:
             ref_mismatches += 1
+
+        is_true_original = (ref1_name == f"{scene}.jpg" or ref2_orig_name == f"{scene}.jpg" or "exact_copy" in ref1_name)
+        if is_true_original:
+            true_original_references += 1
+
         print(f"{scene:<14} | {'Reference':<15} | {ref1_name:<30} | {f'{ref2_rand_name} ({ref2_orig_name})':<30} | {'YES' if ref_match else 'MISMATCH'}")
+
+        # Print Source-Likelihood Scores
+        print(f"{'':<14} | {'Source Scores':<15} | {'(Run 1 member scores below)':<30} | {'(Run 2 member scores below)':<30} |")
+        sorted_m1 = sorted([dict(m) for m in c1["members"]], key=lambda m: (m.get("source_likelihood") if m.get("source_likelihood") is not None else -1.0), reverse=True)
+        id_to_m2 = {m["md5"]: dict(m) for m in c2["members"]}
+        for m in sorted_m1:
+            m_name = Path(m["file_path"]).name
+            s1 = m.get("source_likelihood")
+            s1_str = f"{s1:.6f}" if s1 is not None else "N/A"
+            m2 = id_to_m2.get(m["md5"])
+            if m2:
+                m2_rand = Path(m2["file_path"]).name
+                s2 = m2.get("source_likelihood")
+                s2_str = f"{s2:.6f}" if s2 is not None else "N/A"
+                m2_disp = f"{m2_rand}: {s2_str}"
+            else:
+                m2_disp = "N/A"
+            print(f"{'':<14} | {'':<15} | {f'{m_name}: {s1_str}':<30} | {m2_disp:<30} |")
 
         # 2. Mode comparisons
         for mode in ["conservative", "balanced", "aggressive"]:
@@ -194,16 +221,6 @@ def run_comparison():
             k2_md5 = k2["md5"]
             keeper_match = (k1_md5 == k2_md5)
 
-            # Check delete-safe sets
-            ds1_md5s = {m["md5"] for m in c1["modes"][mode]["delete_safe"]}
-            ds2_md5s = {m["md5"] for m in c2["modes"][mode]["delete_safe"]}
-            ds_match = (ds1_md5s == ds2_md5s)
-
-            # Check review sets
-            rv1_md5s = {m["md5"] for m in c1["modes"][mode]["review"]}
-            rv2_md5s = {m["md5"] for m in c2["modes"][mode]["review"]}
-            rv_match = (rv1_md5s == rv2_md5s)
-
             status = "YES" if keeper_match else "MISMATCH"
             if not keeper_match:
                 keeper_mismatches += 1
@@ -214,8 +231,10 @@ def run_comparison():
     print(f"\nFinal Summary:")
     print(f"  Reference Mismatches : {ref_mismatches} / {len(all_scenes)}")
     print(f"  Keeper Mismatches    : {keeper_mismatches} / {len(all_scenes) * 3}")
-    if ref_mismatches == 0 and keeper_mismatches == 0:
-        print("  RESULT: References and keepers for each mode are 100% IDENTICAL in both runs!")
+    print(f"  True Original References: {true_original_references} / {len(all_scenes)}")
+    if ref_mismatches == 0 and keeper_mismatches == 0 and true_original_references == len(all_scenes):
+        print("  RESULT: The true original is the reference in all 6 scenes!")
+        print("  References and keepers for each mode are 100% IDENTICAL across normal and random names!")
     print("=" * 95)
 
 

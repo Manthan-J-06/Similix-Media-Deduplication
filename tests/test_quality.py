@@ -28,6 +28,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 import pytest
 
+from core.keeper import choose_keeper
 from core.quality import (
     align_and_compute_metrics,
     compute_laplacian_sharpness,
@@ -228,6 +229,95 @@ class TestReferenceMemberSelection:
             shuffled = list(members)
             random.shuffle(shuffled)
             assert select_reference_member(shuffled)["id"] == first_pick
+
+    def test_original_q75_beats_q85_resave_via_source_likelihood(self, tmp_path: Path):
+        # 5(a) original q75 + q85 re-save + q60 re-save + q30: the original is the reference
+        im = _make_rich_test_image(800, 600)
+        p_orig = tmp_path / "original_q75.jpg"
+        p_q85 = tmp_path / "resave_q85.jpg"
+        p_q60 = tmp_path / "resave_q60.jpg"
+        p_q30 = tmp_path / "resave_q30.jpg"
+
+        # Save true original at q75
+        im.save(p_orig, format="JPEG", quality=75)
+        with Image.open(p_orig) as orig_loaded:
+            # Re-save copies strictly FROM the q75 original!
+            orig_loaded.save(p_q85, format="JPEG", quality=85)
+            orig_loaded.save(p_q60, format="JPEG", quality=60)
+            orig_loaded.save(p_q30, format="JPEG", quality=30)
+
+        members = [
+            {"id": 1, "width": 800, "height": 600, "file_size": p_orig.stat().st_size, "file_path": str(p_orig)},
+            {"id": 2, "width": 800, "height": 600, "file_size": p_q85.stat().st_size, "file_path": str(p_q85)},
+            {"id": 3, "width": 800, "height": 600, "file_size": p_q60.stat().st_size, "file_path": str(p_q60)},
+            {"id": 4, "width": 800, "height": 600, "file_size": p_q30.stat().st_size, "file_path": str(p_q30)},
+        ]
+
+        ref = select_reference_member(members)
+        assert ref["id"] == 1
+        assert ref["file_path"] == str(p_orig)
+
+        # Source-likelihood score of original must strictly exceed q85 re-save
+        id_to_score = {m["id"]: m["source_likelihood"] for m in members}
+        assert id_to_score[1] is not None and id_to_score[2] is not None
+        assert id_to_score[1] > id_to_score[2]
+
+    def test_two_copies_tied_within_0002_set_reference_uncertain(self, tmp_path: Path):
+        # 5(b) two copies tied within 0.002 set reference_uncertain
+        im = _make_rich_test_image(800, 600)
+        p1 = tmp_path / "copy_a.jpg"
+        p2 = tmp_path / "copy_b.jpg"
+        im.save(p1, format="JPEG", quality=85)
+        p2.write_bytes(p1.read_bytes())  # Byte-identical exact copy (score difference = 0.0 < 0.002)
+
+        members = [
+            {"id": 1, "width": 800, "height": 600, "file_size": p1.stat().st_size, "file_path": str(p1)},
+            {"id": 2, "width": 800, "height": 600, "file_size": p2.stat().st_size, "file_path": str(p2)},
+        ]
+
+        ref = select_reference_member(members)
+        assert ref["reference_uncertain"] == 1
+
+        # In conservative mode, an uncertain cluster gets no delete_safe members; everything goes to review
+        res = choose_keeper(members, mode="conservative")
+        assert res["reference_uncertain"] == 1
+        assert res["delete_safe_ids"] == []
+        assert res["review_ids"] == [2] if ref["id"] == 1 else [1]
+        assert "uncertain" in res["reasons"][res["review_ids"][0]].lower()
+
+    def test_shuffled_and_renamed_files_give_same_reference(self, tmp_path: Path):
+        # 5(c) shuffled and renamed files give the same result
+        import random
+        im = _make_rich_test_image(800, 600)
+        p_orig = tmp_path / "base_original.jpg"
+        im.save(p_orig, format="JPEG", quality=75)
+
+        files = [("orig", p_orig)]
+        with Image.open(p_orig) as orig_loaded:
+            for q in [85, 60, 30]:
+                p = tmp_path / f"temp_resave_q{q}.jpg"
+                orig_loaded.save(p, format="JPEG", quality=q)
+                files.append((f"q{q}", p))
+
+        # Run across multiple trials with arbitrary names and shuffled order
+        for trial in range(5):
+            trial_members = []
+            shuffled_names = [f"img_{trial}_{i}_{random.randint(1000, 9999)}.jpg" for i in range(len(files))]
+            random.shuffle(shuffled_names)
+            for (tag, src_path), name in zip(files, shuffled_names):
+                target = tmp_path / name
+                target.write_bytes(src_path.read_bytes())
+                trial_members.append({
+                    "id": tag,
+                    "width": 800,
+                    "height": 600,
+                    "file_size": target.stat().st_size,
+                    "file_path": str(target),
+                })
+            random.shuffle(trial_members)
+            ref = select_reference_member(trial_members)
+            # The true original must ALWAYS be chosen as the reference
+            assert ref["id"] == "orig"
 
 
 

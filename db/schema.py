@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS images (
     pixel_ratio   REAL,                          -- pixel count ratio (member / reference)
     bytes_ratio   REAL,                          -- file size ratio (member / reference)
     jpeg_quality_est INTEGER,                    -- estimated JPEG quality (1-100) from quantization tables
+    source_likelihood REAL,                      -- mean SSIM against same-resolution lossy peers
     quality_status TEXT,                         -- 'reference' | 'aligned' | 'unalignable'
     is_recommended_keeper INTEGER NOT NULL DEFAULT 0, -- recommended keeper flag (glow flag)
     delete_safe   INTEGER NOT NULL DEFAULT 0,    -- 1 = eligible for deletion
@@ -59,6 +60,7 @@ CREATE TABLE IF NOT EXISTS clusters (
     representative_id INTEGER REFERENCES images(id) ON DELETE SET NULL,
     stage_detected    INTEGER NOT NULL,           -- pipeline stage that found this cluster (0, 1, 2...)
     member_count      INTEGER NOT NULL DEFAULT 0,
+    reference_uncertain INTEGER NOT NULL DEFAULT 0, -- 1 = reference uncertain (SSIM tie <0.002 or EXIF/mtime conflict)
     created_at        TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 """

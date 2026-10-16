@@ -53,10 +53,17 @@ def init_db(db_path: str | Path) -> sqlite3.Connection:
         ("pixel_ratio", "REAL"),
         ("bytes_ratio", "REAL"),
         ("jpeg_quality_est", "INTEGER"),
+        ("source_likelihood", "REAL"),
         ("quality_status", "TEXT"),
     ):
         if col not in existing_cols:
             conn.execute(f"ALTER TABLE images ADD COLUMN {col} {col_type};")
+
+    existing_cluster_cols = {
+        col[1] for col in conn.execute("PRAGMA table_info(clusters)").fetchall()
+    }
+    if "reference_uncertain" not in existing_cluster_cols:
+        conn.execute("ALTER TABLE clusters ADD COLUMN reference_uncertain INTEGER NOT NULL DEFAULT 0;")
 
     # Backfill link_signal for previously clustered rows if unset
     conn.execute(

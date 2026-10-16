@@ -72,6 +72,7 @@ class MemberQualityRecord:
     width: int
     height: int
     file_size: int
+    source_likelihood: float | None = None
 
 
 @dataclass
@@ -188,74 +189,280 @@ def check_exif_metadata(image_path: str | Path | None = None, im: Image.Image | 
         return False, False
 
 
-def select_reference_member(members: list[sqlite3.Row | dict[str, Any]]) -> sqlite3.Row | dict[str, Any]:
+def _get_exif_score(m: dict[str, Any] | sqlite3.Row) -> int:
+    has_time = m.get("has_exif_time") if "has_exif_time" in m.keys() else None
+    has_make = m.get("has_exif_make") if "has_exif_make" in m.keys() else None
+    p = str(m.get("file_path") or "")
+    if (has_time is None or has_make is None) and p and os.path.exists(p):
+        has_time, has_make = check_exif_metadata(p)
+    return int(bool(has_time)) + int(bool(has_make))
+
+
+def _get_mtime(m: dict[str, Any] | sqlite3.Row) -> float:
+    mtime = float(m["modified_time"]) if ("modified_time" in m.keys() and m["modified_time"]) else 0.0
+    p = str(m.get("file_path") or "")
+    if mtime == 0.0 and p and os.path.exists(p):
+        try:
+            mtime = float(os.path.getmtime(p))
+        except Exception:
+            mtime = 0.0
+    return mtime
+
+
+def _get_jpeg_quality(m: dict[str, Any] | sqlite3.Row) -> int:
+    q_est = m.get("jpeg_quality_est") if "jpeg_quality_est" in m.keys() else None
+    p = str(m.get("file_path") or "")
+    lossless = _is_lossless_member(m)
+    if q_est is None and not lossless and p and os.path.exists(p):
+        q_est = extract_jpeg_quality_estimate(p)
+    return int(q_est) if q_est is not None else 0
+
+
+def compute_source_likelihood_scores(
+    members: list[sqlite3.Row | dict[str, Any]],
+    source: ImageSource | None = None,
+    proxy_size: int = 1024,
+) -> dict[Any, float | None]:
+    """
+    Compute source-likelihood score for members:
+    For same-resolution lossy members, compute the mean SSIM of each member against the others
+    using ~1024px proxies, caching pairwise SSIM results.
+    Returns a mapping from member id (or file_path) to float score (or None if no same-res peers).
+    """
+    scores: dict[Any, float | None] = {}
+    if not members:
+        return scores
+
+    # If all members already have precomputed source_likelihood, reuse it
+    all_precomputed = True
+    for m in members:
+        mid = m["id"] if ("id" in m.keys() and m["id"] is not None) else m.get("file_path")
+        val = m.get("source_likelihood") if "source_likelihood" in m.keys() else None
+        if val is None:
+            all_precomputed = False
+            break
+        scores[mid] = float(val)
+    if all_precomputed:
+        return scores
+
+    # Group members by resolution (width, height)
+    by_res: dict[tuple[int, int], list[sqlite3.Row | dict[str, Any]]] = {}
+    for m in members:
+        w = m.get("width") or 0
+        h = m.get("height") or 0
+        by_res.setdefault((w, h), []).append(m)
+
+    gray_cache: dict[Any, np.ndarray | None] = {}
+    ssim_cache: dict[tuple[Any, Any], float] = {}
+
+    def get_gray(m: sqlite3.Row | dict[str, Any], mid: Any) -> np.ndarray | None:
+        if mid in gray_cache:
+            return gray_cache[mid]
+        p = m.get("file_path")
+        if not p:
+            gray_cache[mid] = None
+            return None
+        try:
+            if source is not None or os.path.exists(str(p)):
+                arr, _, _ = load_proxy_rgb(p, proxy_size=proxy_size, source=source)
+                gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+                gray_cache[mid] = gray
+                return gray
+        except Exception:
+            pass
+        gray_cache[mid] = None
+        return None
+
+    for (w, h), group in by_res.items():
+        lossy_members = [m for m in group if not _is_lossless_member(m)]
+        if len(lossy_members) < 2:
+            for m in group:
+                mid = m["id"] if ("id" in m.keys() and m["id"] is not None) else m.get("file_path")
+                if m.get("source_likelihood") is not None:
+                    scores[mid] = float(m["source_likelihood"])
+                else:
+                    scores[mid] = 1.0 if not _is_lossless_member(m) else None
+            continue
+
+        valid_lossy: list[tuple[Any, np.ndarray]] = []
+        for m in lossy_members:
+            mid = m["id"] if ("id" in m.keys() and m["id"] is not None) else m.get("file_path")
+            g = get_gray(m, mid)
+            if g is not None:
+                valid_lossy.append((mid, g))
+            else:
+                existing = m.get("source_likelihood")
+                scores[mid] = float(existing) if existing is not None else 0.0
+
+        if len(valid_lossy) >= 2:
+            for i in range(len(valid_lossy)):
+                id_i, g_i = valid_lossy[i]
+                for j in range(i + 1, len(valid_lossy)):
+                    id_j, g_j = valid_lossy[j]
+                    cache_key = (id_i, id_j)
+                    if cache_key not in ssim_cache:
+                        if g_i.shape == g_j.shape:
+                            sim = float(ssim(g_i, g_j, data_range=255))
+                        elif g_i.shape == g_j.shape[::-1]:
+                            rot_90 = cv2.rotate(g_j, cv2.ROTATE_90_CLOCKWISE)
+                            rot_270 = cv2.rotate(g_j, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                            sim = max(
+                                float(ssim(g_i, rot_90, data_range=255)),
+                                float(ssim(g_i, rot_270, data_range=255)),
+                            )
+                        else:
+                            cw = min(g_i.shape[1], g_j.shape[1])
+                            ch = min(g_i.shape[0], g_j.shape[0])
+                            gi_r = cv2.resize(g_i, (cw, ch), interpolation=cv2.INTER_AREA)
+                            gj_r = cv2.resize(g_j, (cw, ch), interpolation=cv2.INTER_AREA)
+                            sim = float(ssim(gi_r, gj_r, data_range=255))
+                        ssim_cache[(id_i, id_j)] = sim
+                        ssim_cache[(id_j, id_i)] = sim
+
+            for id_i, _ in valid_lossy:
+                peer_sims = [ssim_cache[(id_i, id_j)] for id_j, _ in valid_lossy if id_j != id_i]
+                if peer_sims:
+                    scores[id_i] = round(float(np.mean(peer_sims)), 6)
+                else:
+                    scores[id_i] = 1.0
+        elif len(valid_lossy) == 1:
+            scores[valid_lossy[0][0]] = 1.0
+
+        for m in group:
+            if _is_lossless_member(m):
+                mid = m["id"] if ("id" in m.keys() and m["id"] is not None) else m.get("file_path")
+                scores[mid] = float(m["source_likelihood"]) if m.get("source_likelihood") is not None else None
+
+    return scores
+
+
+def select_reference_member(
+    members: list[sqlite3.Row | dict[str, Any]],
+    source: ImageSource | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> dict[str, Any]:
     """
     Select the reference member for a duplicate cluster:
     1. Highest pixel count (width * height, descending)
     2. Lossless format only if no lossy twin in cluster of same resolution
-    3. Highest jpeg_quality_est (descending)
+    3. Source-likelihood score: mean SSIM of each member against the others in same-res lossy pool (descending)
     4. Presence of EXIF capture time and camera make (descending)
     5. Earliest modified time (ascending)
-    6. Filename rule: canonical non-derived before copy suffixes, then shortest path
-    7. Smallest file size (ascending)
-    8. Deterministic tie-breakers: file_path ascending, ID ascending
+    6. Highest jpeg_quality_est (descending, tiebreaker)
+    7. Filename rule: canonical non-derived before copy suffixes, then shortest path
+    8. Smallest file size (ascending)
+    9. Deterministic tie-breakers: file_path ascending, ID ascending
+
+    If top two candidates' source-likelihood scores differ by < 0.002, or EXIF/mtime
+    contradict the SSIM ranking, sets reference_uncertain = 1 on the cluster.
     """
     if not members:
         raise ValueError("Cannot select reference from empty member list")
 
+    member_dicts = [dict(m) for m in members]
+
     # Map each pixel count to whether there is any lossy member with that pixel count
     pixel_has_lossy: dict[int, bool] = {}
-    for m in members:
-        px = (m["width"] or 0) * (m["height"] or 0)
+    for m in member_dicts:
+        px = (m.get("width") or 0) * (m.get("height") or 0)
         if not _is_lossless_member(m):
             pixel_has_lossy[px] = True
 
-    def key_fn(m: sqlite3.Row | dict[str, Any]) -> tuple:
-        w = m["width"] or 0
-        h = m["height"] or 0
-        px = w * h
-        sz = m["file_size"] or 0
-        p = str(m["file_path"] if "file_path" in m.keys() else "")
-        m_id = m["id"] if "id" in m.keys() else 0
+    # 1. Compute source-likelihood scores
+    sl_scores = compute_source_likelihood_scores(member_dicts, source=source)
+    for m in member_dicts:
+        mid = m["id"] if ("id" in m.keys() and m["id"] is not None) else m.get("file_path")
+        m["source_likelihood"] = sl_scores.get(mid)
 
-        # 1. Highest pixel count: -px
-        # 2. Prefer lossless only if no lossy twin
+    # 2. Identify top candidate pool at max resolution
+    max_px = max(((m.get("width") or 0) * (m.get("height") or 0)) for m in member_dicts)
+    cands_at_max = [m for m in member_dicts if ((m.get("width") or 0) * (m.get("height") or 0)) == max_px]
+
+    has_lossy_twin = pixel_has_lossy.get(max_px, False)
+    lossless_cands = [m for m in cands_at_max if _is_lossless_member(m)]
+    lossy_cands = [m for m in cands_at_max if not _is_lossless_member(m)]
+
+    if lossless_cands and not has_lossy_twin:
+        top_cands = lossless_cands
+    else:
+        top_cands = lossy_cands if lossy_cands else cands_at_max
+
+    # 3. Check reference_uncertain
+    reference_uncertain = 0
+    if len(top_cands) >= 2:
+        top_by_ssim = sorted(
+            top_cands,
+            key=lambda m: float(m.get("source_likelihood") or 0.0),
+            reverse=True,
+        )
+        c1 = top_by_ssim[0]
+        c2 = top_by_ssim[1]
+        s1 = float(c1.get("source_likelihood") or 0.0)
+        s2 = float(c2.get("source_likelihood") or 0.0)
+
+        # Condition 1: SSIM difference < 0.002
+        is_close_score = (s1 - s2) < 0.002
+
+        # Condition 2: EXIF contradiction (c2 has EXIF while c1 lacks it)
+        exif1 = _get_exif_score(c1)
+        exif2 = _get_exif_score(c2)
+        is_exif_contradiction = (exif2 > exif1)
+
+        # Condition 3: mtime contradiction (c2 has earlier modified time than c1)
+        mtime1 = _get_mtime(c1)
+        mtime2 = _get_mtime(c2)
+        is_mtime_contradiction = (mtime1 > 0.0 and mtime2 > 0.0 and mtime2 < mtime1)
+
+        if is_close_score or is_exif_contradiction or is_mtime_contradiction:
+            reference_uncertain = 1
+
+    # 4. Sorting key_fn for reference selection
+    def key_fn(m: dict[str, Any]) -> tuple:
+        w = m.get("width") or 0
+        h = m.get("height") or 0
+        px = w * h
+        sz = m.get("file_size") or 0
+        p = str(m.get("file_path") or "")
+        m_id = m.get("id") or 0
+
         lossless = _is_lossless_member(m)
-        has_lossy_twin = pixel_has_lossy.get(px, False)
-        prefer_lossless = (lossless and not has_lossy_twin)
+        has_lossy = pixel_has_lossy.get(px, False)
+        prefer_lossless = (lossless and not has_lossy)
         lossless_rank = 0 if prefer_lossless else 1
 
-        # 3. Highest jpeg_quality_est (1-100 for JPEG, 0 for non-JPEG/missing)
-        q_est = m.get("jpeg_quality_est") if "jpeg_quality_est" in m.keys() else None
-        if q_est is None and not lossless and p and os.path.exists(p):
-            q_est = extract_jpeg_quality_estimate(p)
-        q_val = int(q_est) if q_est is not None else 0
+        src_score = float(m.get("source_likelihood") or 0.0)
+        exif_score = _get_exif_score(m)
+        mtime = _get_mtime(m)
+        q_val = _get_jpeg_quality(m)
 
-        # 4. Presence of EXIF capture time and camera make
-        has_time = m.get("has_exif_time") if "has_exif_time" in m.keys() else None
-        has_make = m.get("has_exif_make") if "has_exif_make" in m.keys() else None
-        if (has_time is None or has_make is None) and p and os.path.exists(p):
-            has_time, has_make = check_exif_metadata(p)
-        exif_score = int(bool(has_time)) + int(bool(has_make))
-
-        # 5. Earliest modified time
-        mtime = float(m["modified_time"]) if ("modified_time" in m.keys() and m["modified_time"]) else 0.0
-        if mtime == 0.0 and p and os.path.exists(p):
-            try:
-                mtime = float(os.path.getmtime(p))
-            except Exception:
-                mtime = 0.0
-
-        # 6. Filename rule: canonical non-derived before copy suffixes, then shortest path
         stem = Path(p).stem
         is_derived = 1 if re.search(r"(__|_copy|\bcopy\b|\s\(\d+\)|_resave)", stem, re.IGNORECASE) else 0
         path_len = len(p)
 
-        # 7. Smallest file size: sz ascending
-        # 8. Deterministic tie-breaker: path ascending, m_id ascending
-        return (-px, lossless_rank, -q_val, -exif_score, mtime, is_derived, path_len, sz, p, m_id)
+        return (
+            -px,
+            lossless_rank,
+            -src_score,
+            -exif_score,
+            mtime,
+            -q_val,
+            is_derived,
+            path_len,
+            sz,
+            p,
+            m_id,
+        )
 
-    return min(members, key=key_fn)
+    ref = min(member_dicts, key=key_fn)
+    ref["reference_uncertain"] = reference_uncertain
+
+    # Update input dicts in-place if callers passed dict objects
+    for orig_m, d in zip(members, member_dicts):
+        if isinstance(orig_m, dict):
+            orig_m["source_likelihood"] = d.get("source_likelihood")
+            orig_m["reference_uncertain"] = reference_uncertain
+
+    return ref
 
 
 def compute_laplacian_sharpness(gray_img: np.ndarray) -> float:
@@ -609,7 +816,7 @@ def align_and_compute_metrics(
 
 
 def ensure_quality_columns(conn: sqlite3.Connection) -> None:
-    """Ensure images table has all Stage 4 quality columns including jpeg_quality_est."""
+    """Ensure images table has all Stage 4 quality columns including jpeg_quality_est and source_likelihood."""
     existing_cols = {col[1] for col in conn.execute("PRAGMA table_info(images)").fetchall()}
     cols_to_add = [
         ("ssim", "REAL"),
@@ -619,6 +826,7 @@ def ensure_quality_columns(conn: sqlite3.Connection) -> None:
         ("bytes_ratio", "REAL"),
         ("quality_status", "TEXT"),
         ("jpeg_quality_est", "INTEGER"),
+        ("source_likelihood", "REAL"),
     ]
     for col_name, col_def in cols_to_add:
         if col_name not in existing_cols:
@@ -626,6 +834,13 @@ def ensure_quality_columns(conn: sqlite3.Connection) -> None:
                 conn.execute(f"ALTER TABLE images ADD COLUMN {col_name} {col_def};")
             except sqlite3.OperationalError:
                 pass
+
+    existing_cluster_cols = {col[1] for col in conn.execute("PRAGMA table_info(clusters)").fetchall()}
+    if "reference_uncertain" not in existing_cluster_cols:
+        try:
+            conn.execute("ALTER TABLE clusters ADD COLUMN reference_uncertain INTEGER NOT NULL DEFAULT 0;")
+        except sqlite3.OperationalError:
+            pass
 
 
 def run_quality_pipeline(
@@ -648,7 +863,7 @@ def run_quality_pipeline(
         cid = c["id"]
         members = conn.execute(
             """
-            SELECT id, cluster_id, file_path, width, height, file_size, format, modified_time, jpeg_quality_est
+            SELECT id, cluster_id, file_path, width, height, file_size, format, modified_time, jpeg_quality_est, source_likelihood
             FROM images
             WHERE cluster_id = ?
             ORDER BY id
@@ -711,11 +926,25 @@ def run_quality_pipeline(
 
             member_rows.append(d)
 
-        ref_member = select_reference_member(member_rows)
+        ref_member = select_reference_member(member_rows, source=source, conn=conn)
         ref_id = ref_member["id"]
         ref_path = ref_member["file_path"]
         ref_orig = (ref_member["width"] or 0, ref_member["height"] or 0)
         ref_sz = ref_member["file_size"] or 0
+        ref_uncertain = ref_member.get("reference_uncertain", 0)
+
+        # Update cluster representative and reference_uncertain in SQLite
+        conn.execute(
+            "UPDATE clusters SET representative_id = ?, reference_uncertain = ? WHERE id = ?",
+            (ref_id, ref_uncertain, cid),
+        )
+
+        # Update source_likelihood for all members in SQLite
+        for d in member_rows:
+            conn.execute(
+                "UPDATE images SET source_likelihood = ? WHERE id = ?",
+                (d.get("source_likelihood"), d["id"]),
+            )
 
         # Mark reference member in DB
         conn.execute(
@@ -748,6 +977,7 @@ def run_quality_pipeline(
                 width=ref_orig[0],
                 height=ref_orig[1],
                 file_size=ref_sz,
+                source_likelihood=ref_member.get("source_likelihood"),
             )
         )
 
@@ -819,6 +1049,7 @@ def run_quality_pipeline(
                     width=m_orig[0],
                     height=m_orig[1],
                     file_size=m_sz,
+                    source_likelihood=m.get("source_likelihood"),
                 )
             )
 

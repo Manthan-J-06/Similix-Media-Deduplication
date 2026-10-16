@@ -138,6 +138,7 @@ def choose_keeper(
     cluster_members: list[dict[str, Any] | sqlite3.Row],
     mode: str = "balanced",
     config: dict | None = None,
+    reference_uncertain: int | bool | None = None,
 ) -> dict[str, Any]:
     """
     Pure function of stored metrics (no image reading), so a UI slider can recompute instantly.
@@ -150,6 +151,7 @@ def choose_keeper(
         "reasons": dict[int, str],
         "total_savings_bytes": int,
         "quality_retained": dict[int, float],
+        "reference_uncertain": int,
     }
     """
     if not cluster_members:
@@ -160,6 +162,7 @@ def choose_keeper(
             "reasons": {},
             "total_savings_bytes": 0,
             "quality_retained": {},
+            "reference_uncertain": 0,
         }
 
     # Normalize rows to dictionaries
@@ -180,6 +183,14 @@ def choose_keeper(
     ref_sz = ref_member.get("file_size") or 0
     min_saving = float(limits.get("min_saving_ratio", 0.0))
     max_non_ref_sz = ref_sz * (1.0 - min_saving)
+
+    # Determine reference_uncertain flag
+    if reference_uncertain is not None:
+        is_uncertain = bool(reference_uncertain)
+    else:
+        is_uncertain = any(bool(m.get("reference_uncertain")) for m in members if hasattr(m, "get"))
+        if not is_uncertain and ref_member and hasattr(ref_member, "get"):
+            is_uncertain = bool(ref_member.get("reference_uncertain"))
 
     # 1. Select Candidates & Pick Keeper
     # Conservative mode: keeper = the reference.
@@ -231,6 +242,26 @@ def choose_keeper(
         k_pct = round(float(k_ssim) * 100.0, 1) if k_ssim is not None else 100.0
         reasons[keeper_id] = f"Recommended keeper (smallest candidate in {mode} mode, {k_pct}% quality retained)"
         quality_retained[keeper_id] = k_pct
+
+    # In conservative mode, if the reference is uncertain, get no delete_safe members; everything goes to review
+    if mode == "conservative" and is_uncertain:
+        for m in members:
+            mid = m.get("id")
+            if mid != keeper_id:
+                m_ssim = m.get("ssim")
+                quality_retained[mid] = round(float(m_ssim) * 100.0, 1) if m_ssim is not None else 0.0
+                reasons[mid] = "Cluster reference is uncertain; manual review required in conservative mode"
+
+        review_ids = [m.get("id") for m in members if m.get("id") != keeper_id]
+        return {
+            "keeper_id": keeper_id,
+            "delete_safe_ids": [],
+            "review_ids": review_ids,
+            "reasons": reasons,
+            "total_savings_bytes": 0,
+            "quality_retained": quality_retained,
+            "reference_uncertain": 1,
+        }
 
     # Map byte-identical groups by (md5, file_size)
     exact_groups: dict[tuple[str, int], list[dict[str, Any]]] = {}
@@ -382,6 +413,7 @@ def choose_keeper(
         "reasons": reasons,
         "total_savings_bytes": total_savings,
         "quality_retained": quality_retained,
+        "reference_uncertain": 1 if is_uncertain else 0,
     }
 
 
@@ -490,7 +522,7 @@ def run_keeper_pipeline(
 
     # Fetch all clusters with their members
     cluster_rows = conn.execute(
-        "SELECT id, representative_id FROM clusters ORDER BY id"
+        "SELECT id, representative_id, reference_uncertain FROM clusters ORDER BY id"
     ).fetchall()
 
     run_res = KeeperRunResult()
@@ -501,7 +533,8 @@ def run_keeper_pipeline(
             """
             SELECT id, file_path, file_size, width, height, format, md5, phash,
                    status, cluster_id, is_keeper, is_low_confidence,
-                   ssim, ssim_color, sharpness_ratio, pixel_ratio, bytes_ratio, quality_status
+                   ssim, ssim_color, sharpness_ratio, pixel_ratio, bytes_ratio, quality_status,
+                   source_likelihood, jpeg_quality_est
             FROM images
             WHERE cluster_id = ?
             ORDER BY id
@@ -512,7 +545,8 @@ def run_keeper_pipeline(
         if not members:
             continue
 
-        decision = choose_keeper(members, mode=mode, config=config)
+        ref_unc = c["reference_uncertain"] if "reference_uncertain" in c.keys() else None
+        decision = choose_keeper(members, mode=mode, config=config, reference_uncertain=ref_unc)
         keeper_id = decision["keeper_id"]
         delete_safe_ids = set(decision["delete_safe_ids"])
         review_ids = set(decision["review_ids"])
