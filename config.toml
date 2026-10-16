@@ -91,6 +91,7 @@ ssim_color = 0.97
 pixel_ratio_floor = 0.90
 min_saving_ratio = 0.0
 allow_blur_flag = false
+allow_resolution_loss = false
 
 [keeper.modes.balanced]
 ssim_gray = 0.98
@@ -98,6 +99,7 @@ ssim_color = 0.97
 pixel_ratio_floor = 0.60
 min_saving_ratio = 0.10
 allow_blur_flag = false
+allow_resolution_loss = false
 
 [keeper.modes.aggressive]
 ssim_gray = 0.95
@@ -105,6 +107,7 @@ ssim_color = 0.94
 pixel_ratio_floor = 0.25
 min_saving_ratio = 0.30
 allow_blur_flag = true
+allow_resolution_loss = false
 
 # ── Confidence score model ───────────────────────────────────────────────────
 [confidence]

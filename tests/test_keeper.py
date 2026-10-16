@@ -312,8 +312,8 @@ class TestMemberBetterThanKeeperGoesToReview:
                 "is_low_confidence": 0,
             },
         ]
-        # In aggressive mode, candidate 2 qualifies and becomes keeper
-        res = choose_keeper(members, mode="aggressive")
+        # In aggressive mode with allow_resolution_loss=True, candidate 2 qualifies and becomes keeper
+        res = choose_keeper(members, mode="aggressive", allow_resolution_loss=True)
         assert res["keeper_id"] == 2
         # Member 1 is better than keeper in resolution (1024x768 > 600x450) and quality (1.0 > 0.96)
         assert 1 in res["review_ids"]
@@ -328,7 +328,7 @@ class TestCraftedFourMemberClusterThreeModes:
         gives three different keepers across the three modes under Prompt 10 limits:
         - Conservative: keeper = reference (original)
         - Balanced: ssim >= 0.98, ssim_color >= 0.97, pixel_ratio >= 0.60, min_saving >= 0.10
-        - Aggressive: ssim >= 0.95, ssim_color >= 0.94, pixel_ratio >= 0.25, min_saving >= 0.30
+        - Aggressive (with allow_resolution_loss=True): ssim >= 0.95, ssim_color >= 0.94, pixel_ratio >= 0.25, min_saving >= 0.30
         """
         members = [
             # 1. Original (Reference)
@@ -397,7 +397,7 @@ class TestCraftedFourMemberClusterThreeModes:
 
         res_cons = choose_keeper(members, mode="conservative")
         res_bal = choose_keeper(members, mode="balanced")
-        res_agg = choose_keeper(members, mode="aggressive")
+        res_agg = choose_keeper(members, mode="aggressive", allow_resolution_loss=True)
 
         # Conservative chooses original (id 1)
         assert res_cons["keeper_id"] == 1
@@ -405,13 +405,101 @@ class TestCraftedFourMemberClusterThreeModes:
         # Balanced chooses q60 (id 2)
         assert res_bal["keeper_id"] == 2
 
-        # Aggressive chooses 50% scale (id 3)
+        # Aggressive chooses 50% scale (id 3) when allow_resolution_loss=True
         assert res_agg["keeper_id"] == 3
 
         # All three modes return distinct keepers!
         assert res_cons["keeper_id"] != res_bal["keeper_id"]
         assert res_bal["keeper_id"] != res_agg["keeper_id"]
         assert res_cons["keeper_id"] != res_agg["keeper_id"]
+
+        # When allow_resolution_loss is False (default), aggressive keeps full-res file (id 1)
+        res_agg_default = choose_keeper(members, mode="aggressive")
+        assert res_agg_default["keeper_id"] == 1
+
+
+class TestAllowResolutionLoss:
+    """
+    2. Add [keeper.modes] allow_resolution_loss (conservative false, balanced
+       false, aggressive false by default, plus a user override flag).
+       A keeper with lower pixel count than the reference is allowed only when
+       this is true. With it false, aggressive mode keeps the best-resolution
+       copy that meets its limits.
+       Tests: aggressive mode with the flag off keeps a full-resolution file;
+       with it on, the scale_50pct copy can become keeper.
+    """
+    def test_aggressive_mode_with_flag_off_keeps_full_resolution_file(self):
+        members = [
+            {
+                "id": 1,
+                "file_path": "/photos/original.jpg",
+                "file_size": 200_000,
+                "width": 1000,
+                "height": 1000,
+                "md5": "md5_orig",
+                "quality_status": "reference",
+                "ssim": 1.0,
+                "ssim_color": 1.0,
+                "pixel_ratio": 1.0,
+                "is_low_confidence": 0,
+            },
+            {
+                "id": 2,
+                "file_path": "/photos/scale_50pct.jpg",
+                "file_size": 80_000,
+                "width": 500,
+                "height": 500,
+                "md5": "md5_scale",
+                "quality_status": "aligned",
+                "ssim": 0.96,
+                "ssim_color": 0.95,
+                "pixel_ratio": 0.25,
+                "is_low_confidence": 0,
+            },
+        ]
+        # Flag off by default in aggressive mode: keeps full-resolution copy (id 1)
+        res_default = choose_keeper(members, mode="aggressive")
+        assert res_default["keeper_id"] == 1
+        assert res_default["allow_resolution_loss"] is False
+
+        # Flag off via explicit user override
+        res_explicit_false = choose_keeper(members, mode="aggressive", allow_resolution_loss=False)
+        assert res_explicit_false["keeper_id"] == 1
+        assert res_explicit_false["allow_resolution_loss"] is False
+
+    def test_aggressive_mode_with_flag_on_scale_50pct_can_become_keeper(self):
+        members = [
+            {
+                "id": 1,
+                "file_path": "/photos/original.jpg",
+                "file_size": 200_000,
+                "width": 1000,
+                "height": 1000,
+                "md5": "md5_orig",
+                "quality_status": "reference",
+                "ssim": 1.0,
+                "ssim_color": 1.0,
+                "pixel_ratio": 1.0,
+                "is_low_confidence": 0,
+            },
+            {
+                "id": 2,
+                "file_path": "/photos/scale_50pct.jpg",
+                "file_size": 80_000,
+                "width": 500,
+                "height": 500,
+                "md5": "md5_scale",
+                "quality_status": "aligned",
+                "ssim": 0.96,
+                "ssim_color": 0.95,
+                "pixel_ratio": 0.25,
+                "is_low_confidence": 0,
+            },
+        ]
+        # Flag on via user override: scale_50pct copy becomes keeper
+        res_override = choose_keeper(members, mode="aggressive", allow_resolution_loss=True)
+        assert res_override["keeper_id"] == 2
+        assert res_override["allow_resolution_loss"] is True
 
 
 class TestConservativeModeRules:

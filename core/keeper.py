@@ -42,6 +42,7 @@ DEFAULT_KEEPER_MODES: dict[str, dict[str, Any]] = {
         "pixel_ratio_floor": 0.90,
         "min_saving_ratio": 0.0,
         "allow_blur_flag": False,
+        "allow_resolution_loss": False,
     },
     "balanced": {
         "ssim_gray": 0.98,
@@ -49,6 +50,7 @@ DEFAULT_KEEPER_MODES: dict[str, dict[str, Any]] = {
         "pixel_ratio_floor": 0.60,
         "min_saving_ratio": 0.10,
         "allow_blur_flag": False,
+        "allow_resolution_loss": False,
     },
     "aggressive": {
         "ssim_gray": 0.95,
@@ -56,6 +58,7 @@ DEFAULT_KEEPER_MODES: dict[str, dict[str, Any]] = {
         "pixel_ratio_floor": 0.25,
         "min_saving_ratio": 0.30,
         "allow_blur_flag": True,
+        "allow_resolution_loss": False,
     },
 }
 
@@ -139,6 +142,7 @@ def choose_keeper(
     mode: str = "balanced",
     config: dict | None = None,
     reference_uncertain: int | bool | None = None,
+    allow_resolution_loss: bool | None = None,
 ) -> dict[str, Any]:
     """
     Pure function of stored metrics (no image reading), so a UI slider can recompute instantly.
@@ -152,6 +156,7 @@ def choose_keeper(
         "total_savings_bytes": int,
         "quality_retained": dict[int, float],
         "reference_uncertain": int,
+        "allow_resolution_loss": bool,
     }
     """
     if not cluster_members:
@@ -163,11 +168,15 @@ def choose_keeper(
             "total_savings_bytes": 0,
             "quality_retained": {},
             "reference_uncertain": 0,
+            "allow_resolution_loss": False,
         }
 
     # Normalize rows to dictionaries
     members = [dict(m) if not isinstance(m, dict) else m for m in cluster_members]
     limits = get_mode_limits(mode, config)
+    res_loss_allowed = limits.get("allow_resolution_loss", False)
+    if allow_resolution_loss is not None:
+        res_loss_allowed = bool(allow_resolution_loss)
 
     # Identify the cluster reference member
     ref_member = None
@@ -181,6 +190,9 @@ def choose_keeper(
 
     ref_id = ref_member.get("id")
     ref_sz = ref_member.get("file_size") or 0
+    ref_w = ref_member.get("width") or 0
+    ref_h = ref_member.get("height") or 0
+    ref_px = ref_w * ref_h
     min_saving = float(limits.get("min_saving_ratio", 0.0))
     max_non_ref_sz = ref_sz * (1.0 - min_saving)
 
@@ -203,6 +215,12 @@ def choose_keeper(
         for m in members:
             is_ref = (m.get("id") == ref_id)
             if _is_member_candidate(m, limits, is_reference=is_ref):
+                m_w = m.get("width") or 0
+                m_h = m.get("height") or 0
+                m_px = m_w * m_h
+                # A keeper with lower pixel count than reference is allowed only when allow_resolution_loss is True
+                if (not res_loss_allowed) and (m_px < ref_px):
+                    continue
                 if is_ref:
                     candidates.append(m)
                 else:
@@ -261,6 +279,7 @@ def choose_keeper(
             "total_savings_bytes": 0,
             "quality_retained": quality_retained,
             "reference_uncertain": 1,
+            "allow_resolution_loss": res_loss_allowed,
         }
 
     # Map byte-identical groups by (md5, file_size)
@@ -414,6 +433,7 @@ def choose_keeper(
         "total_savings_bytes": total_savings,
         "quality_retained": quality_retained,
         "reference_uncertain": 1 if is_uncertain else 0,
+        "allow_resolution_loss": res_loss_allowed,
     }
 
 
@@ -513,6 +533,7 @@ def run_keeper_pipeline(
     conn: sqlite3.Connection,
     mode: str = "balanced",
     config: dict | None = None,
+    allow_resolution_loss: bool | None = None,
 ) -> KeeperRunResult:
     """
     Run keeper selection across all duplicate clusters in SQLite and store recommendations.
@@ -546,7 +567,13 @@ def run_keeper_pipeline(
             continue
 
         ref_unc = c["reference_uncertain"] if "reference_uncertain" in c.keys() else None
-        decision = choose_keeper(members, mode=mode, config=config, reference_uncertain=ref_unc)
+        decision = choose_keeper(
+            members,
+            mode=mode,
+            config=config,
+            reference_uncertain=ref_unc,
+            allow_resolution_loss=allow_resolution_loss,
+        )
         keeper_id = decision["keeper_id"]
         delete_safe_ids = set(decision["delete_safe_ids"])
         review_ids = set(decision["review_ids"])

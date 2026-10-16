@@ -280,7 +280,12 @@ def cmd_keeper(args: argparse.Namespace) -> None:
     print()
 
     from core.keeper import run_keeper_pipeline
-    res = run_keeper_pipeline(conn, mode=mode, config=cfg)
+    res = run_keeper_pipeline(
+        conn,
+        mode=mode,
+        config=cfg,
+        allow_resolution_loss=args.allow_resolution_loss,
+    )
 
     print("--------------------------------------------------")
     print(f"Clusters evaluated       : {res.clusters_evaluated}")
@@ -326,6 +331,7 @@ def main(argv: list[str] | None = None) -> None:
 
     keeper_parser = subparsers.add_parser("keeper", help="Select keepers and calculate safe deletions (Stage 4)")
     keeper_parser.add_argument("--mode", choices=["conservative", "balanced", "aggressive"], default=None, help="Keeper policy mode")
+    keeper_parser.add_argument("--allow-resolution-loss", action=argparse.BooleanOptionalAction, default=None, help="Allow keeper with lower pixel count than reference")
     keeper_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
     keeper_parser.add_argument("--db", default=None, help="Path to SQLite database file")
 

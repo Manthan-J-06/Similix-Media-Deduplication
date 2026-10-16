@@ -23,6 +23,7 @@ For each duplicate cluster:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import os
 from pathlib import Path
 import pickle
@@ -94,6 +95,37 @@ def _is_lossless_member(m: sqlite3.Row | dict[str, Any]) -> bool:
         p = str(m["file_path"])
         fmt = Path(p).suffix.lstrip(".").upper()
     return fmt.upper() in LOSSLESS_FORMATS
+
+
+def _member_content_key(m: sqlite3.Row | dict[str, Any]) -> Any:
+    md5_val = None
+    sz_val = 0
+    if isinstance(m, dict):
+        md5_val = m.get("md5")
+        sz_val = m.get("file_size") or 0
+        p = m.get("file_path")
+    elif hasattr(m, "keys"):
+        if "md5" in m.keys():
+            md5_val = m["md5"]
+        if "file_size" in m.keys():
+            sz_val = m["file_size"] or 0
+        p = m["file_path"] if "file_path" in m.keys() else None
+    else:
+        p = None
+
+    if md5_val is None and p and os.path.exists(str(p)):
+        try:
+            with open(str(p), "rb") as f:
+                md5_val = hashlib.md5(f.read()).hexdigest()
+            sz_val = os.path.getsize(str(p))
+        except Exception:
+            pass
+
+    if md5_val is not None:
+        return (md5_val, sz_val)
+    mid = m["id"] if ("id" in m.keys() and m["id"] is not None) else (m["file_path"] if "file_path" in m.keys() else None)
+    return mid
+
 
 
 # Standard IJG 50% luminance quantization table (8x8)
@@ -190,17 +222,19 @@ def check_exif_metadata(image_path: str | Path | None = None, im: Image.Image | 
 
 
 def _get_exif_score(m: dict[str, Any] | sqlite3.Row) -> int:
-    has_time = m.get("has_exif_time") if "has_exif_time" in m.keys() else None
-    has_make = m.get("has_exif_make") if "has_exif_make" in m.keys() else None
-    p = str(m.get("file_path") or "")
+    d = dict(m) if not isinstance(m, dict) else m
+    has_time = d.get("has_exif_time")
+    has_make = d.get("has_exif_make")
+    p = str(d.get("file_path") or "")
     if (has_time is None or has_make is None) and p and os.path.exists(p):
         has_time, has_make = check_exif_metadata(p)
     return int(bool(has_time)) + int(bool(has_make))
 
 
 def _get_mtime(m: dict[str, Any] | sqlite3.Row) -> float:
-    mtime = float(m["modified_time"]) if ("modified_time" in m.keys() and m["modified_time"]) else 0.0
-    p = str(m.get("file_path") or "")
+    d = dict(m) if not isinstance(m, dict) else m
+    mtime = float(d["modified_time"]) if d.get("modified_time") else 0.0
+    p = str(d.get("file_path") or "")
     if mtime == 0.0 and p and os.path.exists(p):
         try:
             mtime = float(os.path.getmtime(p))
@@ -210,8 +244,9 @@ def _get_mtime(m: dict[str, Any] | sqlite3.Row) -> float:
 
 
 def _get_jpeg_quality(m: dict[str, Any] | sqlite3.Row) -> int:
-    q_est = m.get("jpeg_quality_est") if "jpeg_quality_est" in m.keys() else None
-    p = str(m.get("file_path") or "")
+    d = dict(m) if not isinstance(m, dict) else m
+    q_est = d.get("jpeg_quality_est")
+    p = str(d.get("file_path") or "")
     lossless = _is_lossless_member(m)
     if q_est is None and not lossless and p and os.path.exists(p):
         q_est = extract_jpeg_quality_estimate(p)
@@ -275,7 +310,28 @@ def compute_source_likelihood_scores(
 
     for (w, h), group in by_res.items():
         lossy_members = [m for m in group if not _is_lossless_member(m)]
-        if len(lossy_members) < 2:
+
+        # Collapse byte-identical members (same md5 and file_size) into distinct candidates
+        content_groups: dict[Any, list[sqlite3.Row | dict[str, Any]]] = {}
+        for m in lossy_members:
+            ck = _member_content_key(m)
+            content_groups.setdefault(ck, []).append(m)
+
+        def candidate_rep_key(m: sqlite3.Row | dict[str, Any]) -> tuple:
+            p = str(m["file_path"] if "file_path" in m.keys() else "")
+            stem = Path(p).stem
+            is_derived = 1 if re.search(r"(__|_copy|\bcopy\b|\s\(\d+\)|_resave)", stem, re.IGNORECASE) else 0
+            mid = m["id"] if ("id" in m.keys() and m["id"] is not None) else 0
+            return (is_derived, len(p), p, mid)
+
+        group_rep_map: dict[Any, sqlite3.Row | dict[str, Any]] = {}
+        distinct_lossy: list[sqlite3.Row | dict[str, Any]] = []
+        for ck, grp in content_groups.items():
+            rep = min(grp, key=candidate_rep_key)
+            group_rep_map[ck] = rep
+            distinct_lossy.append(rep)
+
+        if len(distinct_lossy) < 2:
             for m in group:
                 mid = m["id"] if ("id" in m.keys() and m["id"] is not None) else m.get("file_path")
                 if m.get("source_likelihood") is not None:
@@ -285,7 +341,7 @@ def compute_source_likelihood_scores(
             continue
 
         valid_lossy: list[tuple[Any, np.ndarray]] = []
-        for m in lossy_members:
+        for m in distinct_lossy:
             mid = m["id"] if ("id" in m.keys() and m["id"] is not None) else m.get("file_path")
             g = get_gray(m, mid)
             if g is not None:
@@ -319,14 +375,27 @@ def compute_source_likelihood_scores(
                         ssim_cache[(id_i, id_j)] = sim
                         ssim_cache[(id_j, id_i)] = sim
 
+            rep_scores: dict[Any, float] = {}
             for id_i, _ in valid_lossy:
                 peer_sims = [ssim_cache[(id_i, id_j)] for id_j, _ in valid_lossy if id_j != id_i]
                 if peer_sims:
-                    scores[id_i] = round(float(np.mean(peer_sims)), 6)
+                    rep_scores[id_i] = round(float(np.mean(peer_sims)), 6)
                 else:
-                    scores[id_i] = 1.0
+                    rep_scores[id_i] = 1.0
+
+            # Distribute scores to all members in each content group
+            for ck, grp in content_groups.items():
+                rep = group_rep_map[ck]
+                rep_id = rep["id"] if ("id" in rep.keys() and rep["id"] is not None) else rep.get("file_path")
+                grp_score = rep_scores.get(rep_id, 1.0)
+                for m in grp:
+                    mid = m["id"] if ("id" in m.keys() and m["id"] is not None) else m.get("file_path")
+                    scores[mid] = grp_score
         elif len(valid_lossy) == 1:
-            scores[valid_lossy[0][0]] = 1.0
+            for ck, grp in content_groups.items():
+                for m in grp:
+                    mid = m["id"] if ("id" in m.keys() and m["id"] is not None) else m.get("file_path")
+                    scores[mid] = 1.0
 
         for m in group:
             if _is_lossless_member(m):
@@ -334,6 +403,7 @@ def compute_source_likelihood_scores(
                 scores[mid] = float(m["source_likelihood"]) if m.get("source_likelihood") is not None else None
 
     return scores
+
 
 
 def select_reference_member(
@@ -387,36 +457,7 @@ def select_reference_member(
     else:
         top_cands = lossy_cands if lossy_cands else cands_at_max
 
-    # 3. Check reference_uncertain
-    reference_uncertain = 0
-    if len(top_cands) >= 2:
-        top_by_ssim = sorted(
-            top_cands,
-            key=lambda m: float(m.get("source_likelihood") or 0.0),
-            reverse=True,
-        )
-        c1 = top_by_ssim[0]
-        c2 = top_by_ssim[1]
-        s1 = float(c1.get("source_likelihood") or 0.0)
-        s2 = float(c2.get("source_likelihood") or 0.0)
-
-        # Condition 1: SSIM difference < 0.002
-        is_close_score = (s1 - s2) < 0.002
-
-        # Condition 2: EXIF contradiction (c2 has EXIF while c1 lacks it)
-        exif1 = _get_exif_score(c1)
-        exif2 = _get_exif_score(c2)
-        is_exif_contradiction = (exif2 > exif1)
-
-        # Condition 3: mtime contradiction (c2 has earlier modified time than c1)
-        mtime1 = _get_mtime(c1)
-        mtime2 = _get_mtime(c2)
-        is_mtime_contradiction = (mtime1 > 0.0 and mtime2 > 0.0 and mtime2 < mtime1)
-
-        if is_close_score or is_exif_contradiction or is_mtime_contradiction:
-            reference_uncertain = 1
-
-    # 4. Sorting key_fn for reference selection
+    # 3. Sorting key_fn for reference selection
     def key_fn(m: dict[str, Any]) -> tuple:
         w = m.get("width") or 0
         h = m.get("height") or 0
@@ -452,6 +493,43 @@ def select_reference_member(
             p,
             m_id,
         )
+
+    # 4. Collapse byte-identical members into distinct candidates before uncertainty check
+    top_content_groups: dict[Any, list[dict[str, Any]]] = {}
+    for m in top_cands:
+        ck = _member_content_key(m)
+        top_content_groups.setdefault(ck, []).append(m)
+
+    distinct_top_cands = [min(grp, key=key_fn) for grp in top_content_groups.values()]
+
+    # 5. Check reference_uncertain on distinct candidates
+    reference_uncertain = 0
+    if len(distinct_top_cands) >= 2:
+        top_by_ssim = sorted(
+            distinct_top_cands,
+            key=lambda m: float(m.get("source_likelihood") or 0.0),
+            reverse=True,
+        )
+        c1 = top_by_ssim[0]
+        c2 = top_by_ssim[1]
+        s1 = float(c1.get("source_likelihood") or 0.0)
+        s2 = float(c2.get("source_likelihood") or 0.0)
+
+        # Condition 1: SSIM difference < 0.002
+        is_close_score = (s1 - s2) < 0.002
+
+        # Condition 2: EXIF contradiction (c2 has EXIF while c1 lacks it)
+        exif1 = _get_exif_score(c1)
+        exif2 = _get_exif_score(c2)
+        is_exif_contradiction = (exif2 > exif1)
+
+        # Condition 3: mtime contradiction (c2 has earlier modified time than c1)
+        mtime1 = _get_mtime(c1)
+        mtime2 = _get_mtime(c2)
+        is_mtime_contradiction = (mtime1 > 0.0 and mtime2 > 0.0 and mtime2 < mtime1)
+
+        if is_close_score or is_exif_contradiction or is_mtime_contradiction:
+            reference_uncertain = 1
 
     ref = min(member_dicts, key=key_fn)
     ref["reference_uncertain"] = reference_uncertain

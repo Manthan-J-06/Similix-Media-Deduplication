@@ -263,12 +263,15 @@ class TestReferenceMemberSelection:
         assert id_to_score[1] > id_to_score[2]
 
     def test_two_copies_tied_within_0002_set_reference_uncertain(self, tmp_path: Path):
-        # 5(b) two copies tied within 0.002 set reference_uncertain
+        # Two distinct candidates tied within 0.002 set reference_uncertain = 1
         im = _make_rich_test_image(800, 600)
         p1 = tmp_path / "copy_a.jpg"
         p2 = tmp_path / "copy_b.jpg"
         im.save(p1, format="JPEG", quality=85)
-        p2.write_bytes(p1.read_bytes())  # Byte-identical exact copy (score difference = 0.0 < 0.002)
+        # Distinct candidate with 1 pixel changed (distinct md5, but SSIM difference < 0.002)
+        im2 = im.copy()
+        im2.putpixel((0, 0), (255, 255, 255))
+        im2.save(p2, format="JPEG", quality=85)
 
         members = [
             {"id": 1, "width": 800, "height": 600, "file_size": p1.stat().st_size, "file_path": str(p1)},
@@ -284,6 +287,51 @@ class TestReferenceMemberSelection:
         assert res["delete_safe_ids"] == []
         assert res["review_ids"] == [2] if ref["id"] == 1 else [1]
         assert "uncertain" in res["reasons"][res["review_ids"][0]].lower()
+
+    def test_exact_copy_collapsed_reference_uncertain_zero_and_delete_safe_in_every_mode(self, tmp_path: Path):
+        """
+        1. Before computing source-likelihood or the uncertainty check, collapse
+        byte-identical members (same md5 and size) into one candidate. The
+        reference_uncertain flag must compare only distinct candidates.
+        A cluster of an original, its exact copy, and q60/q30 re-saves must have
+        reference_uncertain = 0, and the exact copy must still be delete_safe in every mode.
+        """
+        im = _make_rich_test_image(800, 600)
+        p_orig = tmp_path / "original.jpg"
+        p_exact = tmp_path / "original__exact_copy.jpg"
+        p_q60 = tmp_path / "resave_q60.jpg"
+        p_q30 = tmp_path / "resave_q30.jpg"
+
+        im.save(p_orig, format="JPEG", quality=75)
+        p_exact.write_bytes(p_orig.read_bytes())  # Byte-identical exact copy
+
+        with Image.open(p_orig) as orig_loaded:
+            orig_loaded.save(p_q60, format="JPEG", quality=60)
+            orig_loaded.save(p_q30, format="JPEG", quality=30)
+
+        import hashlib
+        orig_md5 = hashlib.md5(p_orig.read_bytes()).hexdigest()
+        q60_md5 = hashlib.md5(p_q60.read_bytes()).hexdigest()
+        q30_md5 = hashlib.md5(p_q30.read_bytes()).hexdigest()
+
+        members = [
+            {"id": 1, "width": 800, "height": 600, "file_size": p_orig.stat().st_size, "file_path": str(p_orig), "md5": orig_md5, "quality_status": "reference"},
+            {"id": 2, "width": 800, "height": 600, "file_size": p_exact.stat().st_size, "file_path": str(p_exact), "md5": orig_md5, "quality_status": "aligned"},
+            {"id": 3, "width": 800, "height": 600, "file_size": p_q60.stat().st_size, "file_path": str(p_q60), "md5": q60_md5, "quality_status": "aligned"},
+            {"id": 4, "width": 800, "height": 600, "file_size": p_q30.stat().st_size, "file_path": str(p_q30), "md5": q30_md5, "quality_status": "aligned"},
+        ]
+
+        ref = select_reference_member(members)
+        assert ref["id"] == 1
+        # reference_uncertain must be 0 because exact copy was collapsed and original clearly beats q60/q30
+        assert ref["reference_uncertain"] == 0
+
+        # Exact copy must still be delete_safe in every mode
+        for mode in ["conservative", "balanced", "aggressive"]:
+            res = choose_keeper(members, mode=mode)
+            assert res["reference_uncertain"] == 0
+            assert 2 in res["delete_safe_ids"], f"Exact copy (id=2) was not delete_safe in mode {mode}"
+            assert res["keeper_id"] != 2
 
     def test_shuffled_and_renamed_files_give_same_reference(self, tmp_path: Path):
         # 5(c) shuffled and renamed files give the same result

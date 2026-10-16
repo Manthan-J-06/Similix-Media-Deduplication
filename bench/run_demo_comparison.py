@@ -190,6 +190,10 @@ def run_comparison():
             true_original_references += 1
 
         print(f"{scene:<14} | {'Reference':<15} | {ref1_name:<30} | {f'{ref2_rand_name} ({ref2_orig_name})':<30} | {'YES' if ref_match else 'MISMATCH'}")
+        unc1 = c1.get("reference_uncertain", 0)
+        unc2 = c2.get("reference_uncertain", 0)
+        unc_match = (unc1 == unc2)
+        print(f"{'':<14} | {'Ref Uncertain':<15} | {str(unc1):<30} | {str(unc2):<30} | {'YES' if unc_match else 'MISMATCH'}")
 
         # Print Source-Likelihood Scores
         print(f"{'':<14} | {'Source Scores':<15} | {'(Run 1 member scores below)':<30} | {'(Run 2 member scores below)':<30} |")
@@ -225,6 +229,15 @@ def run_comparison():
             if not keeper_match:
                 keeper_mismatches += 1
             print(f"{'':<14} | {mode.capitalize() + ' Keeper':<15} | {k1_name:<30} | {f'{k2_rand_name} ({k2_orig_name})':<30} | {status}")
+
+            # Delete-safe list
+            ds1_names = [Path(m["file_path"]).name for m in c1["modes"][mode]["delete_safe"]]
+            ds2_rand_names = [Path(m["file_path"]).name for m in c2["modes"][mode]["delete_safe"]]
+            ds2_orig_names = [name_mapping.get(n, "Unknown") for n in ds2_rand_names]
+            ds_match = (sorted([m["md5"] for m in c1["modes"][mode]["delete_safe"]]) == sorted([m["md5"] for m in c2["modes"][mode]["delete_safe"]]))
+            ds1_str = ", ".join(ds1_names) if ds1_names else "(none)"
+            ds2_str = ", ".join(ds2_orig_names) if ds2_orig_names else "(none)"
+            print(f"{'':<14} | {mode.capitalize()[:4] + ' DelSafe':<15} | {ds1_str:<30} | {ds2_str:<30} | {'YES' if ds_match else 'MISMATCH'}")
 
         print("-" * 95)
 
