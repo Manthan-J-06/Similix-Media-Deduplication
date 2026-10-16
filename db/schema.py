@@ -37,6 +37,12 @@ CREATE TABLE IF NOT EXISTS images (
     pixel_ratio   REAL,                          -- pixel count ratio (member / reference)
     bytes_ratio   REAL,                          -- file size ratio (member / reference)
     quality_status TEXT,                         -- 'reference' | 'aligned' | 'unalignable'
+    is_recommended_keeper INTEGER NOT NULL DEFAULT 0, -- recommended keeper flag (glow flag)
+    delete_safe   INTEGER NOT NULL DEFAULT 0,    -- 1 = eligible for deletion
+    review_flag   INTEGER NOT NULL DEFAULT 0,    -- 1 = requires manual review
+    quality_retained_pct REAL,                   -- % quality retained vs reference
+    bytes_saved_if_deleted INTEGER DEFAULT 0,    -- bytes reclaimed if this member is deleted
+    reason        TEXT,                          -- explanation for keeper / delete / review verdict
     created_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
     updated_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );

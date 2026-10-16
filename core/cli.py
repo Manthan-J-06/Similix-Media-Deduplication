@@ -265,6 +265,32 @@ def cmd_quality(args: argparse.Namespace) -> None:
     print("--------------------------------------------------")
 
 
+def cmd_keeper(args: argparse.Namespace) -> None:
+    cfg = load_config(args.config)
+    db_path = args.db or cfg.get("general", {}).get("db_path", "argus.db")
+    conn = init_db(db_path)
+
+    mode = args.mode or cfg.get("keeper", {}).get("default_mode", "balanced")
+
+    print("==================================================")
+    print("  ARGUS Stage 4 Keeper Selection & Deletion Plan")
+    print("==================================================")
+    print(f"Database         : {db_path}")
+    print(f"Keeper Mode      : {mode.upper()}")
+    print()
+
+    from core.keeper import run_keeper_pipeline
+    res = run_keeper_pipeline(conn, mode=mode, config=cfg)
+
+    print("--------------------------------------------------")
+    print(f"Clusters evaluated       : {res.clusters_evaluated}")
+    print(f"Recommended keepers      : {res.total_keepers}")
+    print(f"Delete-safe members      : {res.total_delete_safe}")
+    print(f"Members for manual review: {res.total_review}")
+    print(f"Total potential savings  : {res.total_bytes_saved:,} bytes ({res.total_bytes_saved / (1024*1024):.2f} MB)")
+    print("--------------------------------------------------")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="argus",
@@ -298,6 +324,11 @@ def main(argv: list[str] | None = None) -> None:
     quality_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
     quality_parser.add_argument("--db", default=None, help="Path to SQLite database file")
 
+    keeper_parser = subparsers.add_parser("keeper", help="Select keepers and calculate safe deletions (Stage 4)")
+    keeper_parser.add_argument("--mode", choices=["conservative", "balanced", "aggressive"], default=None, help="Keeper policy mode")
+    keeper_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
+    keeper_parser.add_argument("--db", default=None, help="Path to SQLite database file")
+
     args = parser.parse_args(argv)
     if args.subcommand == "scan":
         cmd_scan(args)
@@ -309,6 +340,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_verify(args)
     elif args.subcommand == "quality":
         cmd_quality(args)
+    elif args.subcommand == "keeper":
+        cmd_keeper(args)
 
 
 if __name__ == "__main__":

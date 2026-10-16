@@ -1,0 +1,483 @@
+"""
+core/keeper.py — Stage 4: Recommendation and keeper selection.
+
+1. Pure function of stored metrics (no image reading), so UI slider can recompute instantly:
+   choose_keeper(cluster_members, mode) -> {keeper_id, delete_safe_ids, review_ids, reasons}.
+   Modes (config.toml [keeper.modes]):
+   - conservative: ssim_gray=0.98, ssim_color=0.97, pixel_ratio_floor=0.90, allow_blur_flag=False
+   - balanced:     ssim_gray=0.95, ssim_color=0.94, pixel_ratio_floor=0.60, allow_blur_flag=False
+   - aggressive:   ssim_gray=0.92, ssim_color=0.90, pixel_ratio_floor=0.25, allow_blur_flag=True
+
+2. Candidates = members with quality_status in (reference, aligned), not is_low_confidence,
+   meeting the mode limits. Keeper = smallest file among candidates; ties go to higher pixel count,
+   then shorter path. If no other candidate qualifies, the reference is the keeper.
+
+3. delete_safe = members that are (a) byte-identical to the keeper, or (b) verified, aligned,
+   and not low-confidence in the same cluster. Anything unalignable, low-confidence or inconclusive
+   goes to review_ids, never delete_safe. Never mark every member of a cluster as delete_safe.
+
+4. Store per member: is_recommended_keeper (the glow flag), delete_safe, review_flag,
+   quality_retained_pct (derived from SSIM vs reference), bytes_saved_if_deleted, and a short reason string.
+
+5. Fused duplicate confidence: logistic regression model inference on stored features.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import json
+from pathlib import Path
+import sqlite3
+from typing import Any
+
+import numpy as np
+
+# Default keeper mode limits per specification
+DEFAULT_KEEPER_MODES: dict[str, dict[str, Any]] = {
+    "conservative": {
+        "ssim_gray": 0.98,
+        "ssim_color": 0.97,
+        "pixel_ratio_floor": 0.90,
+        "allow_blur_flag": False,
+    },
+    "balanced": {
+        "ssim_gray": 0.95,
+        "ssim_color": 0.94,
+        "pixel_ratio_floor": 0.60,
+        "allow_blur_flag": False,
+    },
+    "aggressive": {
+        "ssim_gray": 0.92,
+        "ssim_color": 0.90,
+        "pixel_ratio_floor": 0.25,
+        "allow_blur_flag": True,
+    },
+}
+
+_CONFIDENCE_MODEL_CACHE: dict[str, Any] | None = None
+
+
+def get_mode_limits(mode: str, config: dict | None = None) -> dict[str, Any]:
+    """Retrieve mode limits from config.toml or fall back to specification defaults."""
+    if config:
+        modes_cfg = config.get("keeper", {}).get("modes", {})
+        if mode in modes_cfg:
+            return modes_cfg[mode]
+    if mode in DEFAULT_KEEPER_MODES:
+        return DEFAULT_KEEPER_MODES[mode]
+    raise ValueError(f"Unknown keeper mode '{mode}'. Expected one of: {list(DEFAULT_KEEPER_MODES.keys())}")
+
+
+def _is_member_candidate(
+    m: dict[str, Any],
+    limits: dict[str, Any],
+    is_reference: bool = False,
+) -> bool:
+    """
+    Check if a cluster member qualifies as a keeper candidate under the mode limits.
+    Candidates = members with quality_status in (reference, aligned), not is_low_confidence,
+    meeting the mode limits.
+    """
+    if m.get("is_low_confidence"):
+        return False
+
+    q_status = m.get("quality_status")
+    if q_status not in ("reference", "aligned"):
+        return False
+
+    if is_reference or q_status == "reference":
+        return True
+
+    # Mode limits check
+    ssim_gray = m.get("ssim")
+    ssim_color = m.get("ssim_color")
+    px_ratio = m.get("pixel_ratio")
+    
+    # Sharpness / blur flag
+    sharpness = m.get("sharpness_ratio")
+    blur_flag = bool(m.get("blur_flag", False))
+    if sharpness is not None and sharpness < 0.70:
+        blur_flag = True
+
+    if ssim_gray is None or ssim_gray < limits["ssim_gray"]:
+        return False
+    if ssim_color is None or ssim_color < limits["ssim_color"]:
+        return False
+    if px_ratio is None or px_ratio < limits["pixel_ratio_floor"]:
+        return False
+    if not limits.get("allow_blur_flag", False) and blur_flag:
+        return False
+
+    return True
+
+
+def _keeper_candidate_sort_key(m: dict[str, Any]) -> tuple:
+    """
+    Deterministic sort key for keeper among candidates:
+    1. Smallest file size (file_size ascending)
+    2. Higher pixel count (width * height descending)
+    3. Shorter path (len(path) ascending)
+    4. Deterministic string tie-breaker (path ascending)
+    5. ID ascending
+    """
+    file_size = m.get("file_size") or 0
+    w = m.get("width") or 0
+    h = m.get("height") or 0
+    pixel_count = w * h
+    path = str(m.get("file_path") or "")
+    m_id = m.get("id") or 0
+    return (file_size, -pixel_count, len(path), path, m_id)
+
+
+def choose_keeper(
+    cluster_members: list[dict[str, Any] | sqlite3.Row],
+    mode: str = "balanced",
+    config: dict | None = None,
+) -> dict[str, Any]:
+    """
+    Pure function of stored metrics (no image reading), so a UI slider can recompute instantly.
+
+    Returns:
+    {
+        "keeper_id": int | None,
+        "delete_safe_ids": list[int],
+        "review_ids": list[int],
+        "reasons": dict[int, str],
+        "total_savings_bytes": int,
+        "quality_retained": dict[int, float],
+    }
+    """
+    if not cluster_members:
+        return {
+            "keeper_id": None,
+            "delete_safe_ids": [],
+            "review_ids": [],
+            "reasons": {},
+            "total_savings_bytes": 0,
+            "quality_retained": {},
+        }
+
+    # Normalize rows to dictionaries
+    members = [dict(m) if not isinstance(m, dict) else m for m in cluster_members]
+    limits = get_mode_limits(mode, config)
+
+    # Identify the cluster reference member
+    ref_member = None
+    for m in members:
+        if m.get("quality_status") == "reference":
+            ref_member = m
+            break
+
+    if ref_member is None:
+        # Fallback to member with highest pixel count, then least compressed, then shortest path
+        def ref_key(m: dict[str, Any]):
+            w = m.get("width") or 0
+            h = m.get("height") or 0
+            px = w * h
+            sz = m.get("file_size") or 0
+            bpp = (sz / px) if px > 0 else 0.0
+            p = str(m.get("file_path") or "")
+            return (-px, -bpp, len(p), p, m.get("id") or 0)
+        ref_member = min(members, key=ref_key)
+
+    ref_id = ref_member.get("id")
+
+    # 1. Select Candidates meeting mode limits
+    candidates = []
+    for m in members:
+        is_ref = (m.get("id") == ref_id)
+        if _is_member_candidate(m, limits, is_reference=is_ref):
+            candidates.append(m)
+
+    # 2. Pick Keeper
+    # Keeper = smallest file among candidates; ties go to higher pixel count, then shorter path.
+    # If no other candidate qualifies, the reference is the keeper.
+    if candidates:
+        keeper = min(candidates, key=_keeper_candidate_sort_key)
+    else:
+        keeper = ref_member
+
+    keeper_id = keeper.get("id")
+    keeper_md5 = keeper.get("md5")
+    keeper_sz = keeper.get("file_size") or 0
+
+    delete_safe_ids: list[int] = []
+    review_ids: list[int] = []
+    reasons: dict[int, str] = {}
+    quality_retained: dict[int, float] = {}
+
+    # Reason for keeper
+    if keeper_id == ref_id:
+        reasons[keeper_id] = f"Recommended keeper (reference copy, highest fidelity)"
+        quality_retained[keeper_id] = 100.0
+    else:
+        k_ssim = keeper.get("ssim")
+        k_pct = round(float(k_ssim) * 100.0, 1) if k_ssim is not None else 100.0
+        reasons[keeper_id] = f"Recommended keeper (smallest candidate in {mode} mode, {k_pct}% quality retained)"
+        quality_retained[keeper_id] = k_pct
+
+    # 3. Partition remaining members into delete_safe vs review
+    for m in members:
+        mid = m.get("id")
+        if mid == keeper_id:
+            continue
+
+        q_status = m.get("quality_status")
+        is_low_conf = bool(m.get("is_low_confidence"))
+        m_ssim = m.get("ssim")
+        m_md5 = m.get("md5")
+        m_sz = m.get("file_size") or 0
+
+        # Calculate quality retained vs reference
+        if q_status == "reference" or (keeper_md5 and m_md5 == keeper_md5):
+            retained_pct = 100.0
+        elif m_ssim is not None:
+            retained_pct = round(float(m_ssim) * 100.0, 1)
+        else:
+            retained_pct = 0.0
+        quality_retained[mid] = retained_pct
+
+        # Check conditions
+        is_byte_identical = bool(
+            keeper_md5 and m_md5 and m_md5 == keeper_md5 and m_sz == keeper_sz
+        )
+
+        # Unalignable, low-confidence or inconclusive goes to review_ids, never delete_safe
+        if q_status == "unalignable":
+            review_ids.append(mid)
+            reasons[mid] = "Unalignable member (geometric verification/alignment failed)"
+        elif is_low_conf:
+            review_ids.append(mid)
+            reasons[mid] = "Inconclusive keypoints (< 100) / low confidence (manual review required)"
+        elif q_status not in ("reference", "aligned"):
+            review_ids.append(mid)
+            reasons[mid] = f"Unverified quality status '{q_status}' (manual review required)"
+        elif is_byte_identical:
+            delete_safe_ids.append(mid)
+            reasons[mid] = "Byte-identical copy of keeper (100.0% quality retained)"
+        elif q_status in ("reference", "aligned") and not is_low_conf:
+            delete_safe_ids.append(mid)
+            reasons[mid] = f"Verified aligned duplicate ({retained_pct}% quality retained)"
+        else:
+            review_ids.append(mid)
+            reasons[mid] = "Requires manual inspection"
+
+    # Invariant: Never mark every member of a cluster as delete_safe
+    assert keeper_id not in delete_safe_ids, "Keeper cannot be marked delete_safe"
+    assert len(delete_safe_ids) < len(members), "Cannot mark all cluster members as delete_safe"
+
+    # Total savings in bytes if delete_safe members are deleted
+    total_savings = sum(
+        (m.get("file_size") or 0) for m in members if m.get("id") in delete_safe_ids
+    )
+
+    return {
+        "keeper_id": keeper_id,
+        "delete_safe_ids": delete_safe_ids,
+        "review_ids": review_ids,
+        "reasons": reasons,
+        "total_savings_bytes": total_savings,
+        "quality_retained": quality_retained,
+    }
+
+
+def ensure_keeper_columns(conn: sqlite3.Connection) -> None:
+    """Ensure images table has all Stage 4 keeper recommendation columns."""
+    existing_cols = {
+        col[1] for col in conn.execute("PRAGMA table_info(images)").fetchall()
+    }
+    cols_to_add = [
+        ("is_recommended_keeper", "INTEGER NOT NULL DEFAULT 0"),
+        ("delete_safe", "INTEGER NOT NULL DEFAULT 0"),
+        ("review_flag", "INTEGER NOT NULL DEFAULT 0"),
+        ("quality_retained_pct", "REAL"),
+        ("bytes_saved_if_deleted", "INTEGER DEFAULT 0"),
+        ("reason", "TEXT"),
+    ]
+    for col_name, col_def in cols_to_add:
+        if col_name not in existing_cols:
+            try:
+                conn.execute(f"ALTER TABLE images ADD COLUMN {col_name} {col_def};")
+            except sqlite3.OperationalError:
+                pass
+
+
+def predict_duplicate_confidence(
+    phash_distance: int | float,
+    best_clip_cosine: float,
+    sift_inlier_ratio: float,
+    inlier_count: int,
+    md5_match: bool = False,
+    model_path: str | Path | None = None,
+) -> float:
+    """
+    Compute calibrated duplicate confidence percentage (0.0 to 100.0).
+    Exact MD5 matches are fixed at 100.0%.
+    Otherwise uses the logistic regression model trained on the tuning set.
+    """
+    if md5_match:
+        return 100.0
+
+    global _CONFIDENCE_MODEL_CACHE
+    if _CONFIDENCE_MODEL_CACHE is None:
+        p = Path(model_path or "models/duplicate_confidence.json")
+        if not p.is_file():
+            # Fallback path relative to project root
+            p = Path(__file__).resolve().parent.parent / "models" / "duplicate_confidence.json"
+        if p.is_file():
+            _CONFIDENCE_MODEL_CACHE = json.loads(p.read_text(encoding="utf-8"))
+        else:
+            # Fallback hardcoded weights from calibrated model
+            _CONFIDENCE_MODEL_CACHE = {
+                "intercept": -9.69251,
+                "weights": [-0.279621, 13.455433, 5.682465, 0.848134],
+            }
+
+    intercept = float(_CONFIDENCE_MODEL_CACHE.get("intercept", -9.69251))
+    weights = _CONFIDENCE_MODEL_CACHE.get("weights", [-0.279621, 13.455433, 5.682465, 0.848134])
+
+    log_inliers = float(np.log1p(max(0, inlier_count)))
+    features = [
+        float(phash_distance),
+        float(best_clip_cosine),
+        float(sift_inlier_ratio),
+        log_inliers,
+    ]
+
+    logit = intercept + sum(w * f for w, f in zip(weights, features))
+    prob = 1.0 / (1.0 + np.exp(-logit))
+    return round(float(prob) * 100.0, 1)
+
+
+@dataclass
+class KeeperClusterResult:
+    cluster_id: int
+    keeper_id: int
+    keeper_path: str
+    keeper_size: int
+    delete_safe_count: int
+    delete_safe_bytes: int
+    review_count: int
+    delete_safe_paths: list[str] = field(default_factory=list)
+    review_paths: list[str] = field(default_factory=list)
+    reasons: dict[int, str] = field(default_factory=dict)
+
+
+@dataclass
+class KeeperRunResult:
+    clusters_evaluated: int = 0
+    total_keepers: int = 0
+    total_delete_safe: int = 0
+    total_review: int = 0
+    total_bytes_saved: int = 0
+    cluster_results: list[KeeperClusterResult] = field(default_factory=list)
+
+
+def run_keeper_pipeline(
+    conn: sqlite3.Connection,
+    mode: str = "balanced",
+    config: dict | None = None,
+) -> KeeperRunResult:
+    """
+    Run keeper selection across all duplicate clusters in SQLite and store recommendations.
+    Does NOT delete any files.
+    """
+    ensure_keeper_columns(conn)
+
+    # Fetch all clusters with their members
+    cluster_rows = conn.execute(
+        "SELECT id, representative_id FROM clusters ORDER BY id"
+    ).fetchall()
+
+    run_res = KeeperRunResult()
+
+    for c in cluster_rows:
+        cid = c["id"]
+        members = conn.execute(
+            """
+            SELECT id, file_path, file_size, width, height, format, md5, phash,
+                   status, cluster_id, is_keeper, is_low_confidence,
+                   ssim, ssim_color, sharpness_ratio, pixel_ratio, bytes_ratio, quality_status
+            FROM images
+            WHERE cluster_id = ?
+            ORDER BY id
+            """,
+            (cid,),
+        ).fetchall()
+
+        if not members:
+            continue
+
+        decision = choose_keeper(members, mode=mode, config=config)
+        keeper_id = decision["keeper_id"]
+        delete_safe_ids = set(decision["delete_safe_ids"])
+        review_ids = set(decision["review_ids"])
+        reasons = decision["reasons"]
+        quality_retained = decision["quality_retained"]
+
+        id_to_row = {m["id"]: m for m in members}
+        keeper_m = id_to_row[keeper_id]
+
+        c_res = KeeperClusterResult(
+            cluster_id=cid,
+            keeper_id=keeper_id,
+            keeper_path=keeper_m["file_path"],
+            keeper_size=keeper_m["file_size"] or 0,
+            delete_safe_count=len(delete_safe_ids),
+            delete_safe_bytes=decision["total_savings_bytes"],
+            review_count=len(review_ids),
+            delete_safe_paths=[id_to_row[i]["file_path"] for i in decision["delete_safe_ids"]],
+            review_paths=[id_to_row[i]["file_path"] for i in decision["review_ids"]],
+            reasons=reasons,
+        )
+
+        # Update database records
+        for m in members:
+            mid = m["id"]
+            is_k = 1 if (mid == keeper_id) else 0
+            is_del = 1 if (mid in delete_safe_ids) else 0
+            is_rev = 1 if (mid in review_ids) else 0
+            retained = quality_retained.get(mid, 0.0)
+            bytes_saved = (m["file_size"] or 0) if is_del else 0
+            reason_str = reasons.get(mid, "")
+
+            conn.execute(
+                """
+                UPDATE images
+                SET is_recommended_keeper = ?,
+                    is_keeper = ?,
+                    delete_safe = ?,
+                    review_flag = ?,
+                    quality_retained_pct = ?,
+                    bytes_saved_if_deleted = ?,
+                    reason = ?,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                WHERE id = ?
+                """,
+                (
+                    is_k,
+                    is_k,
+                    is_del,
+                    is_rev,
+                    retained,
+                    bytes_saved,
+                    reason_str,
+                    mid,
+                ),
+            )
+
+        # Update cluster representative to keeper
+        conn.execute(
+            "UPDATE clusters SET representative_id = ? WHERE id = ?",
+            (keeper_id, cid),
+        )
+
+        run_res.clusters_evaluated += 1
+        run_res.total_keepers += 1
+        run_res.total_delete_safe += len(delete_safe_ids)
+        run_res.total_review += len(review_ids)
+        run_res.total_bytes_saved += decision["total_savings_bytes"]
+        run_res.cluster_results.append(c_res)
+
+    conn.commit()
+    return run_res

@@ -82,18 +82,30 @@ min_align_inliers = 15
 min_align_inlier_ratio = 0.50
 
 # ── Stage 4: Keeper selection ─────────────────────────────────────────────────
-# (Not yet active — placeholders for when Stage 4 is implemented.)
-[stage4]
-# Keeper score = quality_weight * quality_score - size_weight * size_penalty
-quality_weight = 0.7
-size_weight = 0.3
+[keeper]
+default_mode = "balanced"
 
-# ── Confidence score weights (must sum to 1.0) ────────────────────────────────
+[keeper.modes.conservative]
+ssim_gray = 0.98
+ssim_color = 0.97
+pixel_ratio_floor = 0.90
+allow_blur_flag = false
+
+[keeper.modes.balanced]
+ssim_gray = 0.95
+ssim_color = 0.94
+pixel_ratio_floor = 0.60
+allow_blur_flag = false
+
+[keeper.modes.aggressive]
+ssim_gray = 0.92
+ssim_color = 0.90
+pixel_ratio_floor = 0.25
+allow_blur_flag = true
+
+# ── Confidence score model ───────────────────────────────────────────────────
 [confidence]
-# confidence = w1*phash_sim + w2*clip_sim + w3*ssim_score
-w1 = 0.25   # Stage 1 perceptual hash similarity
-w2 = 0.50   # Stage 2 CLIP cosine similarity
-w3 = 0.25   # Stage 3 SSIM score
+model_path = "models/duplicate_confidence.json"
 
 # ── RAW file handling ─────────────────────────────────────────────────────────
 [raw]

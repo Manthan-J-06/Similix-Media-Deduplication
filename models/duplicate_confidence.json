@@ -1,0 +1,110 @@
+{
+  "model_type": "logistic_regression",
+  "features": [
+    "phash_distance",
+    "best_clip_cosine",
+    "sift_inlier_ratio",
+    "log_inlier_count"
+  ],
+  "weights": [
+    -0.279621,
+    13.455433,
+    5.682465,
+    0.848134
+  ],
+  "intercept": -9.69251,
+  "md5_fixed_confidence": 100.0,
+  "training_metadata": {
+    "dataset": "60% tuning split (seed 42, 120 originals)",
+    "training_pairs": 25687,
+    "positives": 21438,
+    "negatives": 4249,
+    "l2_regularization": 1.0
+  },
+  "test_calibration": {
+    "brier_score": 0.00443,
+    "total_pairs": 16558,
+    "buckets": [
+      {
+        "bucket_idx": 0,
+        "range": "[0.0, 0.1)",
+        "count": 1827,
+        "mean_predicted": 0.008,
+        "observed_positive_rate": 0.0016,
+        "calibration_error": 0.0063
+      },
+      {
+        "bucket_idx": 1,
+        "range": "[0.1, 0.2)",
+        "count": 45,
+        "mean_predicted": 0.1408,
+        "observed_positive_rate": 0.0667,
+        "calibration_error": 0.0741
+      },
+      {
+        "bucket_idx": 2,
+        "range": "[0.2, 0.3)",
+        "count": 45,
+        "mean_predicted": 0.2596,
+        "observed_positive_rate": 0.0444,
+        "calibration_error": 0.2151
+      },
+      {
+        "bucket_idx": 3,
+        "range": "[0.3, 0.4)",
+        "count": 31,
+        "mean_predicted": 0.3422,
+        "observed_positive_rate": 0.2581,
+        "calibration_error": 0.0841
+      },
+      {
+        "bucket_idx": 4,
+        "range": "[0.4, 0.5)",
+        "count": 34,
+        "mean_predicted": 0.4405,
+        "observed_positive_rate": 0.2941,
+        "calibration_error": 0.1464
+      },
+      {
+        "bucket_idx": 5,
+        "range": "[0.5, 0.6)",
+        "count": 15,
+        "mean_predicted": 0.5459,
+        "observed_positive_rate": 0.8,
+        "calibration_error": 0.2541
+      },
+      {
+        "bucket_idx": 6,
+        "range": "[0.6, 0.7)",
+        "count": 13,
+        "mean_predicted": 0.6672,
+        "observed_positive_rate": 0.9231,
+        "calibration_error": 0.2559
+      },
+      {
+        "bucket_idx": 7,
+        "range": "[0.7, 0.8)",
+        "count": 32,
+        "mean_predicted": 0.7508,
+        "observed_positive_rate": 0.9375,
+        "calibration_error": 0.1867
+      },
+      {
+        "bucket_idx": 8,
+        "range": "[0.8, 0.9)",
+        "count": 85,
+        "mean_predicted": 0.862,
+        "observed_positive_rate": 0.9412,
+        "calibration_error": 0.0792
+      },
+      {
+        "bucket_idx": 9,
+        "range": "[0.9, 1.0]",
+        "count": 14431,
+        "mean_predicted": 0.9978,
+        "observed_positive_rate": 0.9974,
+        "calibration_error": 0.0003
+      }
+    ]
+  }
+}
