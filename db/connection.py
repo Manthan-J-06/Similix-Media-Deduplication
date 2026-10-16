@@ -52,6 +52,7 @@ def init_db(db_path: str | Path) -> sqlite3.Connection:
         ("sharpness_ratio", "REAL"),
         ("pixel_ratio", "REAL"),
         ("bytes_ratio", "REAL"),
+        ("jpeg_quality_est", "INTEGER"),
         ("quality_status", "TEXT"),
     ):
         if col not in existing_cols:

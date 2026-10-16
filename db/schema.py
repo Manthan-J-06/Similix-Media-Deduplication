@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS images (
     sharpness_ratio REAL,                        -- Laplacian variance ratio (member / reference)
     pixel_ratio   REAL,                          -- pixel count ratio (member / reference)
     bytes_ratio   REAL,                          -- file size ratio (member / reference)
+    jpeg_quality_est INTEGER,                    -- estimated JPEG quality (1-100) from quantization tables
     quality_status TEXT,                         -- 'reference' | 'aligned' | 'unalignable'
     is_recommended_keeper INTEGER NOT NULL DEFAULT 0, -- recommended keeper flag (glow flag)
     delete_safe   INTEGER NOT NULL DEFAULT 0,    -- 1 = eligible for deletion

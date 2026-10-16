@@ -115,6 +115,121 @@ class TestReferenceMemberSelection:
         ref = select_reference_member(members)
         assert ref["id"] == 1
 
+    def test_q85_resave_never_beats_higher_quality_original(self, tmp_path: Path):
+        # (a) A q85 re-save with a clean/canonical filename never beats an original saved at higher quality (e.g. q95)
+        # even if the q95 original has a longer or copy-like filename.
+        img = _make_rich_test_image(800, 600)
+        q95_path = tmp_path / "IMG_20261016_copy_raw.jpg"
+        q85_path = tmp_path / "IMG_original.jpg"
+
+        img.save(q95_path, format="JPEG", quality=95)
+        img.save(q85_path, format="JPEG", quality=85)
+
+        # Using real files so extract_jpeg_quality_estimate runs
+        members = [
+            {"id": 1, "width": 800, "height": 600, "file_size": q85_path.stat().st_size, "file_path": str(q85_path)},
+            {"id": 2, "width": 800, "height": 600, "file_size": q95_path.stat().st_size, "file_path": str(q95_path)},
+        ]
+        ref = select_reference_member(members)
+        assert ref["id"] == 2
+        assert ref["file_path"] == str(q95_path)
+
+    def test_cluster_picks_highest_quality_regardless_of_filename(self, tmp_path: Path):
+        # (b) A cluster of IMG_0001.jpg, IMG_0001 (1).jpg, and IMG_0001-edited.jpg picks the highest-quality one
+        img = _make_rich_test_image(800, 600)
+        p_orig = tmp_path / "IMG_0001.jpg"
+        p_copy = tmp_path / "IMG_0001 (1).jpg"
+        p_edit = tmp_path / "IMG_0001-edited.jpg"
+
+        # Case 1: IMG_0001 (1).jpg has highest quality (q95 vs q75 and q60)
+        img.save(p_orig, format="JPEG", quality=75)
+        img.save(p_copy, format="JPEG", quality=95)
+        img.save(p_edit, format="JPEG", quality=60)
+
+        members = [
+            {"id": 1, "width": 800, "height": 600, "file_size": p_orig.stat().st_size, "file_path": str(p_orig)},
+            {"id": 2, "width": 800, "height": 600, "file_size": p_copy.stat().st_size, "file_path": str(p_copy)},
+            {"id": 3, "width": 800, "height": 600, "file_size": p_edit.stat().st_size, "file_path": str(p_edit)},
+        ]
+        ref = select_reference_member(members)
+        assert ref["id"] == 2
+        assert ref["file_path"] == str(p_copy)
+
+        # Case 2: IMG_0001-edited.jpg has highest quality (q95 vs q80 and q70)
+        img.save(p_orig, format="JPEG", quality=80)
+        img.save(p_copy, format="JPEG", quality=70)
+        img.save(p_edit, format="JPEG", quality=95)
+
+        members = [
+            {"id": 1, "width": 800, "height": 600, "file_size": p_orig.stat().st_size, "file_path": str(p_orig)},
+            {"id": 2, "width": 800, "height": 600, "file_size": p_copy.stat().st_size, "file_path": str(p_copy)},
+            {"id": 3, "width": 800, "height": 600, "file_size": p_edit.stat().st_size, "file_path": str(p_edit)},
+        ]
+        ref2 = select_reference_member(members)
+        assert ref2["id"] == 3
+        assert ref2["file_path"] == str(p_edit)
+
+    def test_shuffled_filenames_give_same_reference(self, tmp_path: Path):
+        # (c) Shuffled filenames give the same reference
+        import random
+        img = _make_rich_test_image(800, 600)
+        files = []
+        qualities = [95, 85, 75, 60, 40]
+        # Create files with various qualities
+        for q in qualities:
+            p = tmp_path / f"temp_{q}.jpg"
+            img.save(p, format="JPEG", quality=q)
+            files.append((q, p))
+
+        # Assign arbitrary names across multiple trials
+        for trial in range(5):
+            trial_members = []
+            shuffled_names = [f"random_name_{trial}_{i}_{random.randint(1000, 9999)}.jpg" for i in range(len(files))]
+            random.shuffle(shuffled_names)
+            for (q, p), name in zip(files, shuffled_names):
+                target = tmp_path / name
+                target.write_bytes(p.read_bytes())
+                trial_members.append({
+                    "id": q,
+                    "width": 800,
+                    "height": 600,
+                    "file_size": target.stat().st_size,
+                    "file_path": str(target),
+                })
+            # Shuffle member list order
+            random.shuffle(trial_members)
+            ref = select_reference_member(trial_members)
+            # The q95 image must ALWAYS be selected as reference regardless of name or list order
+            assert ref["id"] == 95
+
+    def test_same_quality_estimate_exact_copy_deterministic(self, tmp_path: Path):
+        # (4) Same-quality-estimate case (exact copy and original) remains deterministic
+        import random
+        img = _make_rich_test_image(800, 600)
+        p1 = tmp_path / "photo_a.jpg"
+        p2 = tmp_path / "photo_b.jpg"
+        img.save(p1, format="JPEG", quality=85)
+        p2.write_bytes(p1.read_bytes())  # Exact copy
+
+        # Set identical timestamps
+        import os
+        now = 1700000000.0
+        os.utime(p1, (now, now))
+        os.utime(p2, (now, now))
+
+        members = [
+            {"id": 1, "width": 800, "height": 600, "file_size": p1.stat().st_size, "file_path": str(p1), "modified_time": now},
+            {"id": 2, "width": 800, "height": 600, "file_size": p2.stat().st_size, "file_path": str(p2), "modified_time": now},
+        ]
+
+        # Order must be deterministic regardless of input list permutation
+        first_pick = select_reference_member(members)["id"]
+        for _ in range(10):
+            shuffled = list(members)
+            random.shuffle(shuffled)
+            assert select_reference_member(shuffled)["id"] == first_pick
+
+
 
 @pytest.fixture(scope="module")
 def base_image() -> Image.Image:

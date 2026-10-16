@@ -95,16 +95,110 @@ def _is_lossless_member(m: sqlite3.Row | dict[str, Any]) -> bool:
     return fmt.upper() in LOSSLESS_FORMATS
 
 
+# Standard IJG 50% luminance quantization table (8x8)
+IJG_LUMINANCE_TABLE = np.array([
+    16, 11, 10, 16, 24, 40, 51, 61,
+    12, 12, 14, 19, 26, 58, 60, 55,
+    14, 13, 16, 24, 40, 57, 69, 56,
+    14, 17, 22, 29, 51, 87, 80, 62,
+    18, 22, 37, 56, 68, 109, 103, 77,
+    24, 35, 55, 64, 81, 104, 113, 92,
+    49, 64, 78, 87, 103, 121, 120, 101,
+    72, 92, 95, 98, 112, 100, 103, 99
+], dtype=np.float32)
+
+
+def _generate_ijg_table(q: int) -> np.ndarray:
+    s = 5000.0 / q if q < 50 else 200.0 - 2.0 * q
+    t = np.floor((IJG_LUMINANCE_TABLE * s + 50.0) / 100.0)
+    return np.clip(t, 1.0, 255.0)
+
+
+# Precomputed (100, 64) matrix for instant vector comparison across quality levels 1-100
+_IJG_TABLES_MATRIX = np.stack([_generate_ijg_table(q) for q in range(1, 101)], axis=0)
+
+
+def estimate_jpeg_quality_from_table(q_table: list[int] | np.ndarray) -> int:
+    """Estimate JPEG quality factor (1-100) from luminance quantization table."""
+    arr = np.array(q_table[:64], dtype=np.float32)
+    diffs = np.mean(np.abs(_IJG_TABLES_MATRIX - arr), axis=1)
+    return int(np.argmin(diffs) + 1)
+
+
+def extract_jpeg_quality_estimate(image_path: str | Path | None = None, im: Image.Image | None = None) -> int | None:
+    """
+    Extract estimated JPEG quality from image quantization tables.
+    Returns integer 1-100 for JPEG, or None for non-JPEG/unreadable images.
+    """
+    try:
+        if im is not None:
+            if getattr(im, "format", None) not in ("JPEG", "MPO"):
+                return None
+            if hasattr(im, "quantization") and im.quantization and 0 in im.quantization:
+                return estimate_jpeg_quality_from_table(im.quantization[0])
+            return None
+
+        if image_path is not None and os.path.exists(str(image_path)):
+            with Image.open(str(image_path)) as opened_im:
+                if opened_im.format not in ("JPEG", "MPO"):
+                    return None
+                if hasattr(opened_im, "quantization") and opened_im.quantization and 0 in opened_im.quantization:
+                    return estimate_jpeg_quality_from_table(opened_im.quantization[0])
+        return None
+    except Exception:
+        return None
+
+
+def check_exif_metadata(image_path: str | Path | None = None, im: Image.Image | None = None) -> tuple[bool, bool]:
+    """
+    Check for presence of EXIF capture time and camera make.
+    Returns (has_capture_time, has_camera_make).
+    """
+    try:
+        exif = None
+        if im is not None:
+            exif = im.getexif()
+        elif image_path is not None and os.path.exists(str(image_path)):
+            with Image.open(str(image_path)) as opened_im:
+                exif = opened_im.getexif()
+
+        if not exif:
+            return False, False
+
+        # Primary IFD tags:
+        # DateTimeOriginal (36867), DateTimeDigitized (36868), DateTime (306)
+        # Make (271), Model (272)
+        has_time = any(k in exif for k in (36867, 36868, 306))
+        has_make = any(k in exif for k in (271, 272))
+
+        # Check ExifOffset sub-IFD (34665)
+        if hasattr(exif, "get_ifd"):
+            try:
+                sub_exif = exif.get_ifd(34665)
+                if sub_exif:
+                    if not has_time:
+                        has_time = any(k in sub_exif for k in (36867, 36868, 306))
+                    if not has_make:
+                        has_make = any(k in sub_exif for k in (271, 272))
+            except Exception:
+                pass
+
+        return bool(has_time), bool(has_make)
+    except Exception:
+        return False, False
+
+
 def select_reference_member(members: list[sqlite3.Row | dict[str, Any]]) -> sqlite3.Row | dict[str, Any]:
     """
     Select the reference member for a duplicate cluster:
     1. Highest pixel count (width * height, descending)
-    2. Among equal pixels: prefer a lossless format (PNG/TIFF/BMP) ONLY if it has
-       no lossy twin already in the cluster of the same resolution; otherwise prefer
-       the SMALLEST file size (never select a copy because it has more bytes per pixel).
-    3. Shortest file path length (len(file_path), ascending)
-    4. Deterministic tie-breaker (file_path, ascending)
-    5. ID ascending
+    2. Lossless format only if no lossy twin in cluster of same resolution
+    3. Highest jpeg_quality_est (descending)
+    4. Presence of EXIF capture time and camera make (descending)
+    5. Earliest modified time (ascending)
+    6. Filename rule: canonical non-derived before copy suffixes, then shortest path
+    7. Smallest file size (ascending)
+    8. Deterministic tie-breakers: file_path ascending, ID ascending
     """
     if not members:
         raise ValueError("Cannot select reference from empty member list")
@@ -121,25 +215,45 @@ def select_reference_member(members: list[sqlite3.Row | dict[str, Any]]) -> sqli
         h = m["height"] or 0
         px = w * h
         sz = m["file_size"] or 0
-        p = str(m["file_path"])
+        p = str(m["file_path"] if "file_path" in m.keys() else "")
         m_id = m["id"] if "id" in m.keys() else 0
 
+        # 1. Highest pixel count: -px
+        # 2. Prefer lossless only if no lossy twin
         lossless = _is_lossless_member(m)
         has_lossy_twin = pixel_has_lossy.get(px, False)
         prefer_lossless = (lossless and not has_lossy_twin)
-
         lossless_rank = 0 if prefer_lossless else 1
+
+        # 3. Highest jpeg_quality_est (1-100 for JPEG, 0 for non-JPEG/missing)
+        q_est = m.get("jpeg_quality_est") if "jpeg_quality_est" in m.keys() else None
+        if q_est is None and not lossless and p and os.path.exists(p):
+            q_est = extract_jpeg_quality_estimate(p)
+        q_val = int(q_est) if q_est is not None else 0
+
+        # 4. Presence of EXIF capture time and camera make
+        has_time = m.get("has_exif_time") if "has_exif_time" in m.keys() else None
+        has_make = m.get("has_exif_make") if "has_exif_make" in m.keys() else None
+        if (has_time is None or has_make is None) and p and os.path.exists(p):
+            has_time, has_make = check_exif_metadata(p)
+        exif_score = int(bool(has_time)) + int(bool(has_make))
+
+        # 5. Earliest modified time
+        mtime = float(m["modified_time"]) if ("modified_time" in m.keys() and m["modified_time"]) else 0.0
+        if mtime == 0.0 and p and os.path.exists(p):
+            try:
+                mtime = float(os.path.getmtime(p))
+            except Exception:
+                mtime = 0.0
+
+        # 6. Filename rule: canonical non-derived before copy suffixes, then shortest path
         stem = Path(p).stem
         is_derived = 1 if re.search(r"(__|_copy|\bcopy\b|\s\(\d+\)|_resave)", stem, re.IGNORECASE) else 0
+        path_len = len(p)
 
-        # Sort:
-        # 1. Highest pixel count (-px)
-        # 2. Prefer lossless only if no lossy twin (lossless_rank)
-        # 3. Prefer canonical non-derived original over derived copies (is_derived)
-        # 4. Smallest file size (sz)
-        # 5. Shortest path length (len(p))
-        # 6. Tie-breakers (p, m_id)
-        return (-px, lossless_rank, is_derived, sz, len(p), p, m_id)
+        # 7. Smallest file size: sz ascending
+        # 8. Deterministic tie-breaker: path ascending, m_id ascending
+        return (-px, lossless_rank, -q_val, -exif_score, mtime, is_derived, path_len, sz, p, m_id)
 
     return min(members, key=key_fn)
 
@@ -494,6 +608,26 @@ def align_and_compute_metrics(
     )
 
 
+def ensure_quality_columns(conn: sqlite3.Connection) -> None:
+    """Ensure images table has all Stage 4 quality columns including jpeg_quality_est."""
+    existing_cols = {col[1] for col in conn.execute("PRAGMA table_info(images)").fetchall()}
+    cols_to_add = [
+        ("ssim", "REAL"),
+        ("ssim_color", "REAL"),
+        ("sharpness_ratio", "REAL"),
+        ("pixel_ratio", "REAL"),
+        ("bytes_ratio", "REAL"),
+        ("quality_status", "TEXT"),
+        ("jpeg_quality_est", "INTEGER"),
+    ]
+    for col_name, col_def in cols_to_add:
+        if col_name not in existing_cols:
+            try:
+                conn.execute(f"ALTER TABLE images ADD COLUMN {col_name} {col_def};")
+            except sqlite3.OperationalError:
+                pass
+
+
 def run_quality_pipeline(
     conn: sqlite3.Connection,
     config: dict | None = None,
@@ -503,6 +637,7 @@ def run_quality_pipeline(
     Run quality scoring and geometric alignment across all clusters in SQLite.
     Stores per-member metrics in images table.
     """
+    ensure_quality_columns(conn)
     t0 = time.perf_counter()
     res = QualityResult()
 
@@ -513,7 +648,7 @@ def run_quality_pipeline(
         cid = c["id"]
         members = conn.execute(
             """
-            SELECT id, cluster_id, file_path, width, height, file_size
+            SELECT id, cluster_id, file_path, width, height, file_size, format, modified_time, jpeg_quality_est
             FROM images
             WHERE cluster_id = ?
             ORDER BY id
@@ -526,12 +661,12 @@ def run_quality_pipeline(
 
         res.clusters_evaluated += 1
 
-        # Fill missing dimensions if necessary
+        # Fill missing dimensions, modified_time, and jpeg_quality_est
         member_rows: list[dict[str, Any]] = []
         for m in members:
             d = dict(m)
+            p = d["file_path"]
             if not d["width"] or not d["height"] or not d["file_size"]:
-                p = d["file_path"]
                 try:
                     if source is not None:
                         meta = source.get_metadata(p)
@@ -548,6 +683,32 @@ def run_quality_pipeline(
                     )
                 except Exception:
                     pass
+
+            if not d.get("modified_time") and os.path.exists(p):
+                try:
+                    d["modified_time"] = os.path.getmtime(p)
+                    conn.execute(
+                        "UPDATE images SET modified_time = ? WHERE id = ?",
+                        (d["modified_time"], d["id"]),
+                    )
+                except Exception:
+                    pass
+
+            # Estimate and persist jpeg_quality_est in SQLite
+            if d.get("jpeg_quality_est") is None and os.path.exists(p):
+                q_est = extract_jpeg_quality_estimate(p)
+                d["jpeg_quality_est"] = q_est
+                if q_est is not None:
+                    conn.execute(
+                        "UPDATE images SET jpeg_quality_est = ? WHERE id = ?",
+                        (q_est, d["id"]),
+                    )
+
+            # Extract EXIF presence for reference selection
+            has_time, has_make = check_exif_metadata(p)
+            d["has_exif_time"] = has_time
+            d["has_exif_make"] = has_make
+
             member_rows.append(d)
 
         ref_member = select_reference_member(member_rows)
