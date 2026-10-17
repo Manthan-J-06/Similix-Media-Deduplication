@@ -253,6 +253,53 @@ def _get_jpeg_quality(m: dict[str, Any] | sqlite3.Row) -> int:
     return int(q_est) if q_est is not None else 0
 
 
+def _calc_proxy_ssim(g1: np.ndarray, g2: np.ndarray) -> float:
+    """Calculate SSIM between two proxy gray images, handling rotation and aspect ratio."""
+    if g1.shape == g2.shape:
+        return float(ssim(g1, g2, data_range=255))
+    if g1.shape == g2.shape[::-1]:
+        rot_90 = cv2.rotate(g2, cv2.ROTATE_90_CLOCKWISE)
+        rot_270 = cv2.rotate(g2, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        return max(
+            float(ssim(g1, rot_90, data_range=255)),
+            float(ssim(g1, rot_270, data_range=255)),
+        )
+    cw = min(g1.shape[1], g2.shape[1])
+    ch = min(g1.shape[0], g2.shape[0])
+    gi_r = cv2.resize(g1, (cw, ch), interpolation=cv2.INTER_AREA)
+    gj_r = cv2.resize(g2, (cw, ch), interpolation=cv2.INTER_AREA)
+    return float(ssim(gi_r, gj_r, data_range=255))
+
+
+def _get_proxy_gray(
+    m: sqlite3.Row | dict[str, Any],
+    source: ImageSource | None = None,
+    proxy_size: int = 1024,
+    cache: dict[Any, np.ndarray | None] | None = None,
+) -> np.ndarray | None:
+    """Load and return gray proxy for an image member, caching result if cache dict is provided."""
+    mid = m["id"] if ("id" in m.keys() and m["id"] is not None) else m.get("file_path")
+    if cache is not None and mid in cache:
+        return cache[mid]
+    p = m.get("file_path")
+    if not p:
+        if cache is not None:
+            cache[mid] = None
+        return None
+    try:
+        if source is not None or os.path.exists(str(p)):
+            arr, _, _ = load_proxy_rgb(p, proxy_size=proxy_size, source=source)
+            gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+            if cache is not None:
+                cache[mid] = gray
+            return gray
+    except Exception:
+        pass
+    if cache is not None:
+        cache[mid] = None
+    return None
+
+
 def compute_source_likelihood_scores(
     members: list[sqlite3.Row | dict[str, Any]],
     source: ImageSource | None = None,
@@ -290,24 +337,6 @@ def compute_source_likelihood_scores(
     gray_cache: dict[Any, np.ndarray | None] = {}
     ssim_cache: dict[tuple[Any, Any], float] = {}
 
-    def get_gray(m: sqlite3.Row | dict[str, Any], mid: Any) -> np.ndarray | None:
-        if mid in gray_cache:
-            return gray_cache[mid]
-        p = m.get("file_path")
-        if not p:
-            gray_cache[mid] = None
-            return None
-        try:
-            if source is not None or os.path.exists(str(p)):
-                arr, _, _ = load_proxy_rgb(p, proxy_size=proxy_size, source=source)
-                gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-                gray_cache[mid] = gray
-                return gray
-        except Exception:
-            pass
-        gray_cache[mid] = None
-        return None
-
     for (w, h), group in by_res.items():
         lossy_members = [m for m in group if not _is_lossless_member(m)]
 
@@ -319,10 +348,10 @@ def compute_source_likelihood_scores(
 
         def candidate_rep_key(m: sqlite3.Row | dict[str, Any]) -> tuple:
             p = str(m["file_path"] if "file_path" in m.keys() else "")
-            stem = Path(p).stem
-            is_derived = 1 if re.search(r"(__|_copy|\bcopy\b|\s\(\d+\)|_resave)", stem, re.IGNORECASE) else 0
+            mtime_val = _get_mtime(m)
+            mtime_sort = mtime_val if mtime_val > 0.0 else float("inf")
             mid = m["id"] if ("id" in m.keys() and m["id"] is not None) else 0
-            return (is_derived, len(p), p, mid)
+            return (mtime_sort, len(p), p, mid)
 
         group_rep_map: dict[Any, sqlite3.Row | dict[str, Any]] = {}
         distinct_lossy: list[sqlite3.Row | dict[str, Any]] = []
@@ -337,18 +366,18 @@ def compute_source_likelihood_scores(
                 if m.get("source_likelihood") is not None:
                     scores[mid] = float(m["source_likelihood"])
                 else:
-                    scores[mid] = 1.0 if not _is_lossless_member(m) else None
+                    scores[mid] = None
             continue
 
         valid_lossy: list[tuple[Any, np.ndarray]] = []
         for m in distinct_lossy:
             mid = m["id"] if ("id" in m.keys() and m["id"] is not None) else m.get("file_path")
-            g = get_gray(m, mid)
+            g = _get_proxy_gray(m, source=source, proxy_size=proxy_size, cache=gray_cache)
             if g is not None:
                 valid_lossy.append((mid, g))
             else:
                 existing = m.get("source_likelihood")
-                scores[mid] = float(existing) if existing is not None else 0.0
+                scores[mid] = float(existing) if existing is not None else None
 
         if len(valid_lossy) >= 2:
             for i in range(len(valid_lossy)):
@@ -357,37 +386,23 @@ def compute_source_likelihood_scores(
                     id_j, g_j = valid_lossy[j]
                     cache_key = (id_i, id_j)
                     if cache_key not in ssim_cache:
-                        if g_i.shape == g_j.shape:
-                            sim = float(ssim(g_i, g_j, data_range=255))
-                        elif g_i.shape == g_j.shape[::-1]:
-                            rot_90 = cv2.rotate(g_j, cv2.ROTATE_90_CLOCKWISE)
-                            rot_270 = cv2.rotate(g_j, cv2.ROTATE_90_COUNTERCLOCKWISE)
-                            sim = max(
-                                float(ssim(g_i, rot_90, data_range=255)),
-                                float(ssim(g_i, rot_270, data_range=255)),
-                            )
-                        else:
-                            cw = min(g_i.shape[1], g_j.shape[1])
-                            ch = min(g_i.shape[0], g_j.shape[0])
-                            gi_r = cv2.resize(g_i, (cw, ch), interpolation=cv2.INTER_AREA)
-                            gj_r = cv2.resize(g_j, (cw, ch), interpolation=cv2.INTER_AREA)
-                            sim = float(ssim(gi_r, gj_r, data_range=255))
+                        sim = _calc_proxy_ssim(g_i, g_j)
                         ssim_cache[(id_i, id_j)] = sim
                         ssim_cache[(id_j, id_i)] = sim
 
-            rep_scores: dict[Any, float] = {}
+            rep_scores: dict[Any, float | None] = {}
             for id_i, _ in valid_lossy:
                 peer_sims = [ssim_cache[(id_i, id_j)] for id_j, _ in valid_lossy if id_j != id_i]
                 if peer_sims:
                     rep_scores[id_i] = round(float(np.mean(peer_sims)), 6)
                 else:
-                    rep_scores[id_i] = 1.0
+                    rep_scores[id_i] = None
 
             # Distribute scores to all members in each content group
             for ck, grp in content_groups.items():
                 rep = group_rep_map[ck]
                 rep_id = rep["id"] if ("id" in rep.keys() and rep["id"] is not None) else rep.get("file_path")
-                grp_score = rep_scores.get(rep_id, 1.0)
+                grp_score = rep_scores.get(rep_id)
                 for m in grp:
                     mid = m["id"] if ("id" in m.keys() and m["id"] is not None) else m.get("file_path")
                     scores[mid] = grp_score
@@ -395,7 +410,7 @@ def compute_source_likelihood_scores(
             for ck, grp in content_groups.items():
                 for m in grp:
                     mid = m["id"] if ("id" in m.keys() and m["id"] is not None) else m.get("file_path")
-                    scores[mid] = 1.0
+                    scores[mid] = None
 
         for m in group:
             if _is_lossless_member(m):
@@ -504,19 +519,71 @@ def select_reference_member(
 
     # 5. Check reference_uncertain on distinct candidates
     reference_uncertain = 0
+    top_candidate_gap: float | None = None
+    head_to_head_result: str | None = None
+    is_pairwise_consistent: bool | None = None
+
     if len(distinct_top_cands) >= 2:
         top_by_ssim = sorted(
             distinct_top_cands,
-            key=lambda m: float(m.get("source_likelihood") or 0.0),
+            key=lambda m: float(m.get("source_likelihood")) if m.get("source_likelihood") is not None else -1.0,
             reverse=True,
         )
         c1 = top_by_ssim[0]
         c2 = top_by_ssim[1]
-        s1 = float(c1.get("source_likelihood") or 0.0)
-        s2 = float(c2.get("source_likelihood") or 0.0)
+        s1 = c1.get("source_likelihood")
+        s2 = c2.get("source_likelihood")
 
-        # Condition 1: SSIM difference < 0.002
-        is_close_score = (s1 - s2) < 0.002
+        if s1 is not None and s2 is not None:
+            gap = round(float(s1) - float(s2), 6)
+            top_candidate_gap = gap
+            is_close_score = gap < 0.002
+        else:
+            gap = None
+            is_close_score = False
+
+        # Head-to-head pairwise ordering consistency against other distinct cluster members
+        # A candidate beats the other if it has higher SSIM against the majority of other members
+        ck1 = _member_content_key(c1)
+        ck2 = _member_content_key(c2)
+
+        other_groups: dict[Any, list[dict[str, Any]]] = {}
+        for m in member_dicts:
+            ck = _member_content_key(m)
+            if ck != ck1 and ck != ck2:
+                other_groups.setdefault(ck, []).append(m)
+
+        other_peers = [min(grp, key=key_fn) for grp in other_groups.values()]
+
+        c1_wins = 0
+        c2_wins = 0
+        peer_count = 0
+
+        ref_gray_cache: dict[Any, np.ndarray | None] = {}
+        g1 = _get_proxy_gray(c1, source=source, cache=ref_gray_cache)
+        g2 = _get_proxy_gray(c2, source=source, cache=ref_gray_cache)
+
+        if g1 is not None and g2 is not None and other_peers:
+            for peer in other_peers:
+                gp = _get_proxy_gray(peer, source=source, cache=ref_gray_cache)
+                if gp is not None:
+                    sim1 = _calc_proxy_ssim(g1, gp)
+                    sim2 = _calc_proxy_ssim(g2, gp)
+                    peer_count += 1
+                    if sim1 > sim2 + 1e-6:
+                        c1_wins += 1
+                    elif sim2 > sim1 + 1e-6:
+                        c2_wins += 1
+
+        c1_name = Path(str(c1.get("file_path") or "")).name or f"id_{c1.get('id')}"
+        c2_name = Path(str(c2.get("file_path") or "")).name or f"id_{c2.get('id')}"
+
+        if peer_count > 0:
+            is_pairwise_consistent = (c1_wins > c2_wins)
+            head_to_head_result = f"{c1_name} vs {c2_name}: {c1_wins} vs {c2_wins} ({peer_count} peers)"
+        else:
+            is_pairwise_consistent = False
+            head_to_head_result = f"{c1_name} vs {c2_name}: no peers to compare"
 
         # Condition 2: EXIF contradiction (c2 has EXIF while c1 lacks it)
         exif1 = _get_exif_score(c1)
@@ -528,17 +595,27 @@ def select_reference_member(
         mtime2 = _get_mtime(c2)
         is_mtime_contradiction = (mtime1 > 0.0 and mtime2 > 0.0 and mtime2 < mtime1)
 
-        if is_close_score or is_exif_contradiction or is_mtime_contradiction:
+        # Refined uncertainty rule:
+        # A cluster is uncertain only if:
+        # (top two distinct candidates within 0.002 AND pairwise ordering not consistent)
+        # OR EXIF contradiction OR mtime contradiction
+        if (is_close_score and not is_pairwise_consistent) or is_exif_contradiction or is_mtime_contradiction:
             reference_uncertain = 1
 
     ref = min(member_dicts, key=key_fn)
     ref["reference_uncertain"] = reference_uncertain
+    ref["top_candidate_gap"] = top_candidate_gap
+    ref["head_to_head_result"] = head_to_head_result
+    ref["is_pairwise_consistent"] = is_pairwise_consistent
 
     # Update input dicts in-place if callers passed dict objects
     for orig_m, d in zip(members, member_dicts):
         if isinstance(orig_m, dict):
             orig_m["source_likelihood"] = d.get("source_likelihood")
             orig_m["reference_uncertain"] = reference_uncertain
+            orig_m["top_candidate_gap"] = top_candidate_gap
+            orig_m["head_to_head_result"] = head_to_head_result
+            orig_m["is_pairwise_consistent"] = is_pairwise_consistent
 
     return ref
 

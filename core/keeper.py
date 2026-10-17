@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import os
 from pathlib import Path
 import sqlite3
 from typing import Any
@@ -261,22 +262,35 @@ def choose_keeper(
         reasons[keeper_id] = f"Recommended keeper (smallest candidate in {mode} mode, {k_pct}% quality retained)"
         quality_retained[keeper_id] = k_pct
 
-    # In conservative mode, if the reference is uncertain, get no delete_safe members; everything goes to review
+    # In conservative mode, if the reference is uncertain, non-identical members go to review,
+    # but byte-identical copies of the keeper remain delete_safe (zero loss regardless of which copy is source).
     if mode == "conservative" and is_uncertain:
+        keeper_md5 = keeper.get("md5")
+        keeper_sz = keeper.get("file_size") or 0
+        del_safe_ids: list[int] = []
+        rev_ids: list[int] = []
         for m in members:
             mid = m.get("id")
-            if mid != keeper_id:
-                m_ssim = m.get("ssim")
-                quality_retained[mid] = round(float(m_ssim) * 100.0, 1) if m_ssim is not None else 0.0
+            if mid == keeper_id:
+                continue
+            m_ssim = m.get("ssim")
+            is_exact_copy = bool(keeper_md5 and m.get("md5") == keeper_md5 and (m.get("file_size") or 0) == keeper_sz)
+            if is_exact_copy:
+                del_safe_ids.append(mid)
+                reasons[mid] = "Byte-identical copy of recommended keeper"
+                quality_retained[mid] = 100.0
+            else:
+                rev_ids.append(mid)
                 reasons[mid] = "Cluster reference is uncertain; manual review required in conservative mode"
+                quality_retained[mid] = round(float(m_ssim) * 100.0, 1) if m_ssim is not None else 0.0
 
-        review_ids = [m.get("id") for m in members if m.get("id") != keeper_id]
+        savings = sum(m.get("file_size") or 0 for m in members if m.get("id") in del_safe_ids)
         return {
             "keeper_id": keeper_id,
-            "delete_safe_ids": [],
-            "review_ids": review_ids,
+            "delete_safe_ids": del_safe_ids,
+            "review_ids": rev_ids,
             "reasons": reasons,
-            "total_savings_bytes": 0,
+            "total_savings_bytes": savings,
             "quality_retained": quality_retained,
             "reference_uncertain": 1,
             "allow_resolution_loss": res_loss_allowed,
@@ -305,10 +319,17 @@ def choose_keeper(
                 if mid != keeper_id:
                     secondary_duplicate_map[mid] = keeper
         else:
-            # Pick canonical anchor representative (shortest path length, then path, then id)
+            # Pick canonical anchor representative (earliest mtime, then shortest path length, then path, then id)
             def anchor_sort_key(m: dict[str, Any]):
                 p = str(m.get("file_path") or "")
-                return (len(p), p, m.get("id") or 0)
+                mtime_val = float(m.get("modified_time") or 0.0)
+                if mtime_val == 0.0 and p and os.path.exists(p):
+                    try:
+                        mtime_val = float(os.path.getmtime(p))
+                    except Exception:
+                        mtime_val = 0.0
+                mtime_sort = mtime_val if mtime_val > 0.0 else float("inf")
+                return (mtime_sort, len(p), p, m.get("id") or 0)
             anchor = min(grp_members, key=anchor_sort_key)
             anchor_id = anchor.get("id")
             for m in grp_members:

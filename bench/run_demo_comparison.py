@@ -17,7 +17,7 @@ from core.cluster import run_stage2_clustering
 from core.config import load_config
 from core.embeddings import run_embeddings
 from core.keeper import choose_keeper
-from core.quality import run_quality_pipeline
+from core.quality import run_quality_pipeline, select_reference_member
 from core.stage0 import run_stage0
 from core.stage1 import run_stage1
 from core.verify import run_stage3_verification
@@ -75,10 +75,16 @@ def execute_pipeline(demo_dir: Path) -> dict:
         ref_m = ref_members[0] if ref_members else None
 
         ref_unc = c["reference_uncertain"] if "reference_uncertain" in c.keys() else None
+        ref_details = select_reference_member([dict(m) for m in members], source=source)
+        gap = ref_details.get("top_candidate_gap")
+        h2h = ref_details.get("head_to_head_result")
+
         cluster_res = {
             "members": members,
             "ref_member": ref_m,
             "reference_uncertain": ref_unc,
+            "top_candidate_gap": gap,
+            "head_to_head_result": h2h,
             "modes": {},
         }
 
@@ -194,6 +200,17 @@ def run_comparison():
         unc2 = c2.get("reference_uncertain", 0)
         unc_match = (unc1 == unc2)
         print(f"{'':<14} | {'Ref Uncertain':<15} | {str(unc1):<30} | {str(unc2):<30} | {'YES' if unc_match else 'MISMATCH'}")
+
+        gap1 = c1.get("top_candidate_gap")
+        gap2 = c2.get("top_candidate_gap")
+        gap1_str = f"{gap1:.6f}" if gap1 is not None else "N/A"
+        gap2_str = f"{gap2:.6f}" if gap2 is not None else "N/A"
+        gap_match = (gap1 == gap2)
+        print(f"{'':<14} | {'Top Cand Gap':<15} | {gap1_str:<30} | {gap2_str:<30} | {'YES' if gap_match else 'MISMATCH'}")
+
+        h2h1 = c1.get("head_to_head_result") or "N/A"
+        h2h2 = c2.get("head_to_head_result") or "N/A"
+        print(f"{'':<14} | {'Head-to-Head':<15} | {h2h1:<30} | {h2h2:<30} |")
 
         # Print Source-Likelihood Scores
         print(f"{'':<14} | {'Source Scores':<15} | {'(Run 1 member scores below)':<30} | {'(Run 2 member scores below)':<30} |")

@@ -21,8 +21,10 @@ Tests:
 from __future__ import annotations
 
 import io
+import os
 from pathlib import Path
 import sqlite3
+import time
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
@@ -32,6 +34,7 @@ from core.keeper import choose_keeper
 from core.quality import (
     align_and_compute_metrics,
     compute_laplacian_sharpness,
+    compute_source_likelihood_scores,
     run_quality_pipeline,
     select_reference_member,
 )
@@ -366,6 +369,71 @@ class TestReferenceMemberSelection:
             ref = select_reference_member(trial_members)
             # The true original must ALWAYS be chosen as the reference
             assert ref["id"] == "orig"
+
+    def test_source_likelihood_null_when_no_peers(self, tmp_path: Path):
+        """source_likelihood for a member with no same-resolution peers must be NULL (None), never 1.0."""
+        im1 = _make_rich_test_image(800, 600)
+        im2 = _make_rich_test_image(400, 300)
+        p1 = tmp_path / "img_800x600_a.jpg"
+        p2 = tmp_path / "img_800x600_b.jpg"
+        p3 = tmp_path / "img_400x300_lone.jpg"
+
+        im1.save(p1, format="JPEG", quality=85)
+        im1.save(p2, format="JPEG", quality=75)
+        im2.save(p3, format="JPEG", quality=85)
+
+        members = [
+            {"id": 1, "width": 800, "height": 600, "file_size": p1.stat().st_size, "file_path": str(p1)},
+            {"id": 2, "width": 800, "height": 600, "file_size": p2.stat().st_size, "file_path": str(p2)},
+            {"id": 3, "width": 400, "height": 300, "file_size": p3.stat().st_size, "file_path": str(p3)},
+        ]
+
+        scores = compute_source_likelihood_scores(members)
+        assert scores[1] is not None
+        assert scores[2] is not None
+        assert scores[3] is None, f"Expected None for lone member, got {scores[3]}"
+
+        # Ensure select_reference_member handles None without crashing or reading None as score
+        ref = select_reference_member(members)
+        assert ref["id"] == 1
+        assert members[2]["source_likelihood"] is None
+
+    def test_refined_uncertainty_rule_head_to_head_majority(self, tmp_path: Path):
+        """
+        A cluster is uncertain only if top two distinct candidates are within 0.002
+        AND their pairwise ordering is not consistent OR EXIF/mtime contradict.
+        If the original beats the re-save in head-to-head comparison and in mtime,
+        the cluster is confident even with a gap under 0.002.
+        """
+        im = _make_rich_test_image(800, 600)
+        p_orig = tmp_path / "orig.jpg"
+        p_q85 = tmp_path / "resave_q85.jpg"
+        p_q60 = tmp_path / "resave_q60.jpg"
+        p_q30 = tmp_path / "resave_q30.jpg"
+
+        im.save(p_orig, format="JPEG", quality=75)
+        with Image.open(p_orig) as orig_loaded:
+            orig_loaded.save(p_q85, format="JPEG", quality=85)
+            orig_loaded.save(p_q60, format="JPEG", quality=60)
+            orig_loaded.save(p_q30, format="JPEG", quality=30)
+
+        # Set earlier mtime on original
+        now = time.time()
+        os.utime(p_orig, (now - 1000, now - 1000))
+        os.utime(p_q85, (now - 500, now - 500))
+
+        members = [
+            {"id": 1, "width": 800, "height": 600, "file_size": p_orig.stat().st_size, "file_path": str(p_orig)},
+            {"id": 2, "width": 800, "height": 600, "file_size": p_q85.stat().st_size, "file_path": str(p_q85)},
+            {"id": 3, "width": 800, "height": 600, "file_size": p_q60.stat().st_size, "file_path": str(p_q60)},
+            {"id": 4, "width": 800, "height": 600, "file_size": p_q30.stat().st_size, "file_path": str(p_q30)},
+        ]
+
+        ref = select_reference_member(members)
+        assert ref["id"] == 1
+        assert ref["reference_uncertain"] == 0
+        assert ref.get("head_to_head_result") is not None
+
 
 
 

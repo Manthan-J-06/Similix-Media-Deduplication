@@ -798,3 +798,121 @@ class TestFusedDuplicateConfidence:
             md5_match=False,
         )
         assert conf <= 5.0
+
+
+class TestConservativeUncertaintyPreservesByteIdentical:
+    def test_conservative_mode_uncertain_preserves_byte_identical_as_delete_safe(self):
+        """
+        In conservative mode with reference_uncertain = 1, byte-identical copies
+        of the keeper must still be delete_safe (they lose nothing whichever copy is the source).
+        Only non-identical members go to review.
+        """
+        members = [
+            {
+                "id": 1,
+                "file_path": "/photos/original.jpg",
+                "file_size": 100_000,
+                "width": 1000,
+                "height": 1000,
+                "md5": "md5_original",
+                "quality_status": "reference",
+                "ssim": 1.0,
+                "ssim_color": 1.0,
+                "pixel_ratio": 1.0,
+                "is_low_confidence": 0,
+            },
+            {
+                "id": 2,
+                "file_path": "/photos/original_exact_copy.jpg",
+                "file_size": 100_000,
+                "width": 1000,
+                "height": 1000,
+                "md5": "md5_original",
+                "quality_status": "aligned",
+                "ssim": 1.0,
+                "ssim_color": 1.0,
+                "pixel_ratio": 1.0,
+                "is_low_confidence": 0,
+            },
+            {
+                "id": 3,
+                "file_path": "/photos/q85_resave.jpg",
+                "file_size": 90_000,
+                "width": 1000,
+                "height": 1000,
+                "md5": "md5_q85",
+                "quality_status": "aligned",
+                "ssim": 0.985,
+                "ssim_color": 0.98,
+                "pixel_ratio": 1.0,
+                "is_low_confidence": 0,
+            },
+        ]
+
+        res = choose_keeper(members, mode="conservative", reference_uncertain=1)
+        assert res["keeper_id"] == 1
+        assert res["reference_uncertain"] == 1
+        assert res["delete_safe_ids"] == [2]
+        assert res["review_ids"] == [3]
+        assert res["total_savings_bytes"] == 100_000
+        assert res["reasons"][2] == "Byte-identical copy of recommended keeper"
+        assert "uncertain" in res["reasons"][3].lower()
+
+
+class TestByteIdenticalAnchorPrefersEarliestMtime:
+    def test_anchor_prefers_earliest_mtime_over_path_and_renaming(self):
+        """
+        Anchor of a byte-identical group is chosen by:
+        earliest mtime, then shortest path, then path, then id.
+        Renaming files (or shorter path) does not change anchor when mtimes differ.
+        """
+        members = [
+            {
+                "id": 1,
+                "file_path": "/photos/reference.jpg",
+                "file_size": 200_000,
+                "width": 1200,
+                "height": 900,
+                "quality_status": "reference",
+                "ssim": 1.0,
+                "ssim_color": 1.0,
+                "pixel_ratio": 1.0,
+                "is_low_confidence": 0,
+            },
+            # Non-keeper byte-identical duplicates with different mtimes:
+            # id 2 has earlier mtime but very long path
+            {
+                "id": 2,
+                "file_path": "/photos/deep/nested/subfolder/very_long_original_filename_2015.jpg",
+                "file_size": 50_000,
+                "width": 800,
+                "height": 600,
+                "md5": "md5_subgroup",
+                "modified_time": 1400000000.0,  # Earlier mtime
+                "quality_status": "aligned",
+                "ssim": 0.95,
+                "ssim_color": 0.95,
+                "pixel_ratio": 0.8,
+                "is_low_confidence": 0,
+            },
+            # id 3 has later mtime but very short path
+            {
+                "id": 3,
+                "file_path": "/a.jpg",
+                "file_size": 50_000,
+                "width": 800,
+                "height": 600,
+                "md5": "md5_subgroup",
+                "modified_time": 1700000000.0,  # Later mtime
+                "quality_status": "aligned",
+                "ssim": 0.95,
+                "ssim_color": 0.95,
+                "pixel_ratio": 0.8,
+                "is_low_confidence": 0,
+            },
+        ]
+
+        res = choose_keeper(members, mode="conservative")
+        assert 3 in res["delete_safe_ids"] or 3 in res["review_ids"]
+        assert "very_long_original_filename_2015.jpg" in res["reasons"][3]
+
