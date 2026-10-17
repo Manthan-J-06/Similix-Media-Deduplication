@@ -501,3 +501,38 @@ class TestLedgerCLI:
         undo_out = capsys.readouterr().out
         assert "Files restored   : 2" in undo_out
         assert p_copy.exists()
+
+    def test_cli_unknown_batch_id_error_handling(self, test_setup, capsys):
+        """execute, undo, and purge print one-line error and exit non-zero for unknown batch id."""
+        from core.cli import main
+        tmp_path = test_setup["tmp_path"]
+        db_file = tmp_path / "test_argus.db"
+        fake_id = "batch_nonexistent_12345"
+
+        # 1. apply
+        with pytest.raises(SystemExit) as exc:
+            main(["apply", fake_id, "--confirm", "--db", str(db_file)])
+        assert exc.value.code != 0
+        err = capsys.readouterr().err
+        assert f"Batch '{fake_id}' not found; run `argus history`" in err
+
+        # 2. apply --dry-run
+        with pytest.raises(SystemExit) as exc:
+            main(["apply", fake_id, "--dry-run", "--db", str(db_file)])
+        assert exc.value.code != 0
+        err = capsys.readouterr().err
+        assert f"Batch '{fake_id}' not found; run `argus history`" in err
+
+        # 3. undo
+        with pytest.raises(SystemExit) as exc:
+            main(["undo", fake_id, "--db", str(db_file)])
+        assert exc.value.code != 0
+        err = capsys.readouterr().err
+        assert f"Batch '{fake_id}' not found; run `argus history`" in err
+
+        # 4. purge
+        with pytest.raises(SystemExit) as exc:
+            main(["purge", fake_id, "--confirm", "--db", str(db_file)])
+        assert exc.value.code != 0
+        err = capsys.readouterr().err
+        assert f"Batch '{fake_id}' not found; run `argus history`" in err

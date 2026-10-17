@@ -335,7 +335,13 @@ def cmd_apply(args: argparse.Namespace) -> None:
     if args.dry_run:
         from core.ledger import dry_run
         print(f"Running dry-run simulation for batch '{args.batch_id}'...")
-        d_res = dry_run(conn, args.batch_id)
+        try:
+            d_res = dry_run(conn, args.batch_id)
+        except ValueError as e:
+            if f"Batch '{args.batch_id}' not found" in str(e):
+                print(f"Batch '{args.batch_id}' not found; run `argus history`", file=sys.stderr)
+                sys.exit(1)
+            raise
         print(f"Batch ID       : {d_res.batch_id}")
         print(f"Total planned  : {d_res.total_planned}")
         print(f"Ready to move  : {d_res.ready_count}")
@@ -357,7 +363,13 @@ def cmd_apply(args: argparse.Namespace) -> None:
     print()
 
     from core.ledger import execute
-    res = execute(conn, batch_id=args.batch_id, confirm=True)
+    try:
+        res = execute(conn, batch_id=args.batch_id, confirm=True)
+    except ValueError as e:
+        if f"Batch '{args.batch_id}' not found" in str(e):
+            print(f"Batch '{args.batch_id}' not found; run `argus history`", file=sys.stderr)
+            sys.exit(1)
+        raise
 
     print("--------------------------------------------------")
     print(f"Total planned    : {res.total_planned}")
@@ -402,10 +414,21 @@ def cmd_undo(args: argparse.Namespace) -> None:
             sys.exit(1)
         return
 
+    if not args.batch_id:
+        print("Error: Specify a batch_id or --file <path> to undo.", file=sys.stderr)
+        sys.exit(1)
+
     print(f"Batch ID         : {args.batch_id}")
     print()
 
-    res = undo(conn, batch_id=args.batch_id)
+    try:
+        res = undo(conn, batch_id=args.batch_id)
+    except ValueError as e:
+        if f"Batch '{args.batch_id}' not found" in str(e):
+            print(f"Batch '{args.batch_id}' not found; run `argus history`", file=sys.stderr)
+            sys.exit(1)
+        raise
+
     print("--------------------------------------------------")
     print(f"Files restored   : {res.restored_count}")
     print(f"Conflicts        : {res.conflict_count}")
@@ -414,6 +437,36 @@ def cmd_undo(args: argparse.Namespace) -> None:
         print("Restore Conflicts (files were left in trash):")
         for p, reason in res.conflicts:
             print(f"  - {p}: {reason}")
+
+
+def cmd_purge(args: argparse.Namespace) -> None:
+    cfg = load_config(args.config)
+    db_path = args.db or cfg.get("general", {}).get("db_path", "argus.db")
+    conn = init_db(db_path)
+    min_age = args.min_age_days if args.min_age_days is not None else cfg.get("ledger", {}).get("purge_min_age_days", 30)
+
+    if not args.confirm:
+        print("Error: The 'purge' command permanently removes files from trash and requires the --confirm flag.", file=sys.stderr)
+        print(f"Run: argus purge {args.batch_id} --confirm", file=sys.stderr)
+        sys.exit(1)
+
+    from core.ledger import purge
+    try:
+        res = purge(conn, batch_id=args.batch_id, confirm=True, max_age_days=min_age)
+    except ValueError as e:
+        if f"Batch '{args.batch_id}' not found" in str(e):
+            print(f"Batch '{args.batch_id}' not found; run `argus history`", file=sys.stderr)
+            sys.exit(1)
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print("==================================================")
+    print("  ARGUS Purge Trashed Files")
+    print("==================================================")
+    print(f"Batch ID         : {res.batch_id}")
+    print(f"Purged files     : {res.purged_count}")
+    print(f"Bytes purged     : {res.bytes_purged:,}")
+    print("--------------------------------------------------")
 
 
 def cmd_history(args: argparse.Namespace) -> None:
@@ -500,6 +553,13 @@ def main(argv: list[str] | None = None) -> None:
     hist_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
     hist_parser.add_argument("--db", default=None, help="Path to SQLite database file")
 
+    purge_parser = subparsers.add_parser("purge", help="Permanently delete trashed files older than threshold")
+    purge_parser.add_argument("batch_id", help="Batch ID to purge")
+    purge_parser.add_argument("--confirm", action="store_true", help="Explicit confirmation required to permanently delete")
+    purge_parser.add_argument("--min-age-days", type=int, default=None, help="Minimum age in days of batch to allow purging")
+    purge_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
+    purge_parser.add_argument("--db", default=None, help="Path to SQLite database file")
+
     args = parser.parse_args(argv)
     if args.subcommand == "scan":
         cmd_scan(args)
@@ -519,6 +579,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_apply(args)
     elif args.subcommand == "undo":
         cmd_undo(args)
+    elif args.subcommand == "purge":
+        cmd_purge(args)
     elif args.subcommand == "history":
         cmd_history(args)
 
