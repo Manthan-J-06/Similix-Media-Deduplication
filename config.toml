@@ -109,6 +109,13 @@ min_saving_ratio = 0.30
 allow_blur_flag = true
 allow_resolution_loss = false
 
+# ── Deletion ledger & trash (core/ledger.py) ──────────────────────────────────
+[ledger]
+# Default trash folder. Batches are stored in trash_dir/<batch_id>/.
+trash_dir = "~/.argus/trash"
+# Number of days before a trashed batch can be permanently purged.
+purge_min_age_days = 30
+
 # ── Confidence score model ───────────────────────────────────────────────────
 [confidence]
 model_path = "models/duplicate_confidence.json"

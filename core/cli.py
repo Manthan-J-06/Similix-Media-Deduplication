@@ -296,6 +296,147 @@ def cmd_keeper(args: argparse.Namespace) -> None:
     print("--------------------------------------------------")
 
 
+def cmd_plan(args: argparse.Namespace) -> None:
+    cfg = load_config(args.config)
+    db_path = args.db or cfg.get("general", {}).get("db_path", "argus.db")
+    conn = init_db(db_path)
+
+    mode = args.mode or cfg.get("keeper", {}).get("default_mode", "balanced")
+
+    print("==================================================")
+    print("  ARGUS Deletion Planning (core/ledger)")
+    print("==================================================")
+    print(f"Database         : {db_path}")
+    print(f"Mode             : {mode.upper()}")
+    print()
+
+    from core.ledger import plan
+    summary = plan(conn, mode=mode, config=cfg, trash_dir=args.trash_dir)
+
+    print("--------------------------------------------------")
+    print(f"Batch ID                 : {summary.batch_id}")
+    print(f"Files planned for trash  : {summary.file_count}")
+    print(f"Total space to reclaim   : {summary.bytes_freed:,} bytes ({summary.bytes_freed / (1024*1024):.2f} MB)")
+    print(f"Clusters with deletions  : {len(summary.per_cluster_keeper)}")
+    print(f"Trash target             : {summary.trash_dir}/{summary.batch_id}/")
+    print("--------------------------------------------------")
+    if summary.file_count > 0:
+        print(f"To execute this batch and move files to trash, run:")
+        print(f"  argus apply {summary.batch_id} --confirm")
+    else:
+        print("No files eligible for deletion in this mode.")
+
+
+def cmd_apply(args: argparse.Namespace) -> None:
+    cfg = load_config(args.config)
+    db_path = args.db or cfg.get("general", {}).get("db_path", "argus.db")
+    conn = init_db(db_path)
+
+    if args.dry_run:
+        from core.ledger import dry_run
+        print(f"Running dry-run simulation for batch '{args.batch_id}'...")
+        d_res = dry_run(conn, args.batch_id)
+        print(f"Batch ID       : {d_res.batch_id}")
+        print(f"Total planned  : {d_res.total_planned}")
+        print(f"Ready to move  : {d_res.ready_count}")
+        print(f"Refused / skip : {d_res.refused_count}")
+        for ref in d_res.refusals:
+            print(f"  - Refused {ref['path']}: {ref['reason']}")
+        return
+
+    if not args.confirm:
+        print("Error: The 'apply' command moves files to trash and requires the --confirm flag.", file=sys.stderr)
+        print(f"Run: argus apply {args.batch_id} --confirm", file=sys.stderr)
+        sys.exit(1)
+
+    print("==================================================")
+    print("  ARGUS Applying Deletion Batch (core/ledger)")
+    print("==================================================")
+    print(f"Batch ID         : {args.batch_id}")
+    print(f"Database         : {db_path}")
+    print()
+
+    from core.ledger import execute
+    res = execute(conn, batch_id=args.batch_id, confirm=True)
+
+    print("--------------------------------------------------")
+    print(f"Total planned    : {res.total_planned}")
+    print(f"Successfully moved: {res.moved_count}")
+    print(f"Refused (safety) : {res.refused_count}")
+    print(f"Failed moves     : {res.failed_count}")
+    print(f"Space reclaimed  : {res.bytes_moved:,} bytes ({res.bytes_moved / (1024*1024):.2f} MB)")
+    print("--------------------------------------------------")
+    if res.refusals:
+        print(f"Refusals ({len(res.refusals)}):")
+        for r in res.refusals[:10]:
+            print(f"  - {r['path']}: {r['reason']}")
+        if len(res.refusals) > 10:
+            print(f"  ... and {len(res.refusals) - 10} more")
+    if res.failures:
+        print(f"Failures ({len(res.failures)}):")
+        for f in res.failures:
+            print(f"  - {f['path']}: {f['error']}")
+    if res.moved_count > 0:
+        print(f"\nTo rollback this batch, run:\n  argus undo {args.batch_id}")
+
+
+def cmd_undo(args: argparse.Namespace) -> None:
+    cfg = load_config(args.config)
+    db_path = args.db or cfg.get("general", {}).get("db_path", "argus.db")
+    conn = init_db(db_path)
+
+    print("==================================================")
+    print("  ARGUS Undo / Restore Trashed Files")
+    print("==================================================")
+    print(f"Database         : {db_path}")
+
+    from core.ledger import undo, undo_file
+
+    if args.file:
+        print(f"Restoring file   : {args.file}")
+        ok, msg = undo_file(conn, original_path=args.file)
+        if ok:
+            print(f"Success: {msg}")
+        else:
+            print(f"Error: {msg}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    print(f"Batch ID         : {args.batch_id}")
+    print()
+
+    res = undo(conn, batch_id=args.batch_id)
+    print("--------------------------------------------------")
+    print(f"Files restored   : {res.restored_count}")
+    print(f"Conflicts        : {res.conflict_count}")
+    print("--------------------------------------------------")
+    if res.conflicts:
+        print("Restore Conflicts (files were left in trash):")
+        for p, reason in res.conflicts:
+            print(f"  - {p}: {reason}")
+
+
+def cmd_history(args: argparse.Namespace) -> None:
+    cfg = load_config(args.config)
+    db_path = args.db or cfg.get("general", {}).get("db_path", "argus.db")
+    conn = init_db(db_path)
+
+    from core.ledger import get_history
+    batches = get_history(conn, limit=args.limit)
+
+    print("====================================================================================================")
+    print(f"  ARGUS Deletion Ledger History ({len(batches)} batches)")
+    print("====================================================================================================")
+    header = f"{'Batch ID':<36} | {'Created At':<20} | {'Mode':<12} | {'Status':<10} | {'Files':<6} | {'Freed (MB)'}"
+    print(header)
+    print("-" * 100)
+    for b in batches:
+        created = (b.get("created_at") or "")[:19]
+        freed_mb = (b.get("bytes_freed") or 0) / (1024 * 1024)
+        print(f"{b['batch_id']:<36} | {created:<20} | {b.get('mode',''):<12} | {b.get('status',''):<10} | {b.get('file_count',0):<6} | {freed_mb:>9.2f}")
+    print("=" * 100)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="argus",
@@ -335,6 +476,30 @@ def main(argv: list[str] | None = None) -> None:
     keeper_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
     keeper_parser.add_argument("--db", default=None, help="Path to SQLite database file")
 
+    plan_parser = subparsers.add_parser("plan", help="Plan a safe deletion batch into trash (Stage 4)")
+    plan_parser.add_argument("--mode", choices=["conservative", "balanced", "aggressive"], default=None, help="Keeper policy mode")
+    plan_parser.add_argument("--trash-dir", default=None, help="Custom trash directory path")
+    plan_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
+    plan_parser.add_argument("--db", default=None, help="Path to SQLite database file")
+
+    apply_parser = subparsers.add_parser("apply", help="Execute a planned deletion batch (moves files to trash)")
+    apply_parser.add_argument("batch_id", help="Batch ID to execute")
+    apply_parser.add_argument("--confirm", action="store_true", help="Explicit confirmation required to move files")
+    apply_parser.add_argument("--dry-run", action="store_true", help="Simulate execution without moving any files")
+    apply_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
+    apply_parser.add_argument("--db", default=None, help="Path to SQLite database file")
+
+    undo_parser = subparsers.add_parser("undo", help="Restore files moved to trash")
+    undo_parser.add_argument("batch_id", nargs="?", default=None, help="Batch ID to undo")
+    undo_parser.add_argument("--file", default=None, help="Restore an individual file path")
+    undo_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
+    undo_parser.add_argument("--db", default=None, help="Path to SQLite database file")
+
+    hist_parser = subparsers.add_parser("history", help="Show deletion batch history from ledger")
+    hist_parser.add_argument("--limit", type=int, default=50, help="Maximum number of batches to display")
+    hist_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
+    hist_parser.add_argument("--db", default=None, help="Path to SQLite database file")
+
     args = parser.parse_args(argv)
     if args.subcommand == "scan":
         cmd_scan(args)
@@ -348,6 +513,14 @@ def main(argv: list[str] | None = None) -> None:
         cmd_quality(args)
     elif args.subcommand == "keeper":
         cmd_keeper(args)
+    elif args.subcommand == "plan":
+        cmd_plan(args)
+    elif args.subcommand == "apply":
+        cmd_apply(args)
+    elif args.subcommand == "undo":
+        cmd_undo(args)
+    elif args.subcommand == "history":
+        cmd_history(args)
 
 
 if __name__ == "__main__":

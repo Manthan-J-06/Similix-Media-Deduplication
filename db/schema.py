@@ -97,6 +97,41 @@ CREATE TABLE IF NOT EXISTS actions (
 """
 
 # ---------------------------------------------------------------------------
+# Tables: ledger_batches & deletion_journal (core/ledger.py)
+# ---------------------------------------------------------------------------
+CREATE_LEDGER_BATCHES = """
+CREATE TABLE IF NOT EXISTS ledger_batches (
+    batch_id     TEXT PRIMARY KEY,
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    executed_at  TEXT,
+    mode         TEXT NOT NULL DEFAULT 'balanced',
+    status       TEXT NOT NULL DEFAULT 'planned', -- 'planned' | 'executed' | 'undone' | 'purged'
+    file_count   INTEGER NOT NULL DEFAULT 0,
+    bytes_freed  INTEGER NOT NULL DEFAULT 0,
+    trash_dir    TEXT NOT NULL
+);
+"""
+
+CREATE_DELETION_JOURNAL = """
+CREATE TABLE IF NOT EXISTS deletion_journal (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id      TEXT NOT NULL REFERENCES ledger_batches(batch_id) ON DELETE CASCADE,
+    timestamp     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    original_path TEXT NOT NULL,
+    trash_path    TEXT,
+    md5           TEXT,
+    size          INTEGER,
+    cluster_id    INTEGER REFERENCES clusters(id) ON DELETE SET NULL,
+    keeper_id     INTEGER REFERENCES images(id) ON DELETE SET NULL,
+    mode          TEXT,
+    reason        TEXT,
+    status        TEXT NOT NULL DEFAULT 'planned', -- 'planned' | 'moved' | 'restored' | 'failed' | 'refused' | 'purged'
+    is_manual     INTEGER NOT NULL DEFAULT 0,
+    image_id      INTEGER REFERENCES images(id) ON DELETE SET NULL
+);
+"""
+
+# ---------------------------------------------------------------------------
 # Indexes
 # ---------------------------------------------------------------------------
 CREATE_INDEXES = """
@@ -108,6 +143,9 @@ CREATE INDEX IF NOT EXISTS idx_images_status    ON images(status);
 CREATE INDEX IF NOT EXISTS idx_images_cluster   ON images(cluster_id);
 CREATE INDEX IF NOT EXISTS idx_actions_image    ON actions(image_id);
 CREATE INDEX IF NOT EXISTS idx_pair_transforms_target ON pair_transforms(target_id);
+CREATE INDEX IF NOT EXISTS idx_journal_batch    ON deletion_journal(batch_id);
+CREATE INDEX IF NOT EXISTS idx_journal_status   ON deletion_journal(status);
+CREATE INDEX IF NOT EXISTS idx_journal_path     ON deletion_journal(original_path);
 """
 
 ALL_DDL = "\n".join([
@@ -115,5 +153,7 @@ ALL_DDL = "\n".join([
     CREATE_CLUSTERS,
     CREATE_PAIR_TRANSFORMS,
     CREATE_ACTIONS,
+    CREATE_LEDGER_BATCHES,
+    CREATE_DELETION_JOURNAL,
     CREATE_INDEXES,
 ])
