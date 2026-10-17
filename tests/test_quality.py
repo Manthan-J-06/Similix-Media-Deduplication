@@ -434,6 +434,65 @@ class TestReferenceMemberSelection:
         assert ref["reference_uncertain"] == 0
         assert ref.get("head_to_head_result") is not None
 
+    def test_two_member_cluster_with_higher_source_likelihood_is_confident(self, tmp_path: Path):
+        """A two-member cluster where one member's source_likelihood is clearly higher must be confident."""
+        p1 = tmp_path / "img_high_src.jpg"
+        p2 = tmp_path / "img_low_src.jpg"
+        p1.write_bytes(b"data1")
+        p2.write_bytes(b"data2")
+
+        members = [
+            {"id": 1, "width": 800, "height": 600, "file_size": 1000, "file_path": str(p1), "source_likelihood": 0.950, "modified_time": 1000.0},
+            {"id": 2, "width": 800, "height": 600, "file_size": 900, "file_path": str(p2), "source_likelihood": 0.900, "modified_time": 1100.0},
+        ]
+
+        ref = select_reference_member(members)
+        assert ref["id"] == 1
+        assert ref["reference_uncertain"] == 0
+        assert ref["top_candidate_gap"] == 0.050
+
+    def test_two_member_cluster_original_and_lowq_resave_is_confident(self, tmp_path: Path):
+        """
+        In a 2-member cluster of an original and low-quality re-save, pairwise SSIM is symmetric
+        (gap = 0.0), but original has earlier mtime and higher JPEG quality. It must be confident (reference_uncertain = 0).
+        """
+        im = _make_rich_test_image(800, 600)
+        p_orig = tmp_path / "picsum_0032.jpg"
+        p_lowq = tmp_path / "picsum_0032_lowq.jpg"
+
+        im.save(p_orig, format="JPEG", quality=75)
+        with Image.open(p_orig) as orig_loaded:
+            orig_loaded.save(p_lowq, format="JPEG", quality=56)
+
+        now = time.time()
+        os.utime(p_orig, (now - 100, now - 100))
+        os.utime(p_lowq, (now - 50, now - 50))
+
+        members = [
+            {"id": 1, "width": 800, "height": 600, "file_size": p_orig.stat().st_size, "file_path": str(p_orig), "jpeg_quality_est": 75, "modified_time": now - 100},
+            {"id": 2, "width": 800, "height": 600, "file_size": p_lowq.stat().st_size, "file_path": str(p_lowq), "jpeg_quality_est": 56, "modified_time": now - 50},
+        ]
+
+        ref = select_reference_member(members)
+        assert ref["id"] == 1
+        assert ref["reference_uncertain"] == 0
+        assert ref["is_pairwise_consistent"] is True
+
+    def test_two_member_cluster_with_contradicting_mtime_is_uncertain(self, tmp_path: Path):
+        """If source_likelihood favors member 1 but member 2 has an earlier mtime, reference_uncertain must be 1."""
+        p1 = tmp_path / "img_high_src_newer.jpg"
+        p2 = tmp_path / "img_low_src_older.jpg"
+        p1.write_bytes(b"data1")
+        p2.write_bytes(b"data2")
+
+        members = [
+            {"id": 1, "width": 800, "height": 600, "file_size": 1000, "file_path": str(p1), "source_likelihood": 0.950, "modified_time": 2000.0},
+            {"id": 2, "width": 800, "height": 600, "file_size": 900, "file_path": str(p2), "source_likelihood": 0.900, "modified_time": 1000.0},
+        ]
+
+        ref = select_reference_member(members)
+        assert ref["reference_uncertain"] == 1
+
 
 
 

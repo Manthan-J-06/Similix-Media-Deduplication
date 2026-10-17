@@ -524,18 +524,14 @@ def select_reference_member(
     is_pairwise_consistent: bool | None = None
 
     if len(distinct_top_cands) >= 2:
-        top_by_ssim = sorted(
-            distinct_top_cands,
-            key=lambda m: float(m.get("source_likelihood")) if m.get("source_likelihood") is not None else -1.0,
-            reverse=True,
-        )
-        c1 = top_by_ssim[0]
-        c2 = top_by_ssim[1]
+        top_candidates = sorted(distinct_top_cands, key=key_fn)
+        c1 = top_candidates[0]
+        c2 = top_candidates[1]
         s1 = c1.get("source_likelihood")
         s2 = c2.get("source_likelihood")
 
         if s1 is not None and s2 is not None:
-            gap = round(float(s1) - float(s2), 6)
+            gap = round(abs(float(s1) - float(s2)), 6)
             top_candidate_gap = gap
             is_close_score = gap < 0.002
         else:
@@ -582,8 +578,27 @@ def select_reference_member(
             is_pairwise_consistent = (c1_wins > c2_wins)
             head_to_head_result = f"{c1_name} vs {c2_name}: {c1_wins} vs {c2_wins} ({peer_count} peers)"
         else:
-            is_pairwise_consistent = False
-            head_to_head_result = f"{c1_name} vs {c2_name}: no peers to compare"
+            # 2-member cluster (no third-party peers to vote)
+            # If source-likelihood gap >= 0.002, is_close_score is False so it is confident.
+            # When gap < 0.002, check if c1 is supported by substantive physical metadata
+            # (earlier modified time, higher JPEG quality estimate, or presence of EXIF).
+            exif1_c = _get_exif_score(c1)
+            exif2_c = _get_exif_score(c2)
+            mtime1_c = _get_mtime(c1)
+            mtime2_c = _get_mtime(c2)
+            q1_c = _get_jpeg_quality(c1)
+            q2_c = _get_jpeg_quality(c2)
+
+            has_earlier_mtime = (mtime1_c > 0.0 and mtime2_c > 0.0 and (mtime2_c - mtime1_c) >= 0.01)
+            has_higher_quality = (q1_c > q2_c)
+            has_better_exif = (exif1_c > exif2_c)
+
+            if has_earlier_mtime or has_higher_quality or has_better_exif:
+                is_pairwise_consistent = True
+                head_to_head_result = f"{c1_name} vs {c2_name}: confident (source metadata supported)"
+            else:
+                is_pairwise_consistent = False
+                head_to_head_result = f"{c1_name} vs {c2_name}: no peers to compare (tied metadata)"
 
         # Condition 2: EXIF contradiction (c2 has EXIF while c1 lacks it)
         exif1 = _get_exif_score(c1)
