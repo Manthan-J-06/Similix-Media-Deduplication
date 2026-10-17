@@ -43,9 +43,27 @@ def db(tmp_path: Path) -> sqlite3.Connection:
     return init_db(tmp_path / "test.db")
 
 
-def _write(path: Path, content: bytes = b"fake image data") -> Path:
+def _make_dummy_image(label: bytes, fmt: str = "JPEG", target_size: int | None = None) -> bytes:
+    import io
+    from PIL import Image
+    buf = io.BytesIO()
+    h = hashlib.md5(label).digest()
+    img = Image.new("RGB", (16, 16), color=(h[0], h[1], h[2]))
+    img.save(buf, format=fmt)
+    if target_size is not None and target_size >= len(buf.getvalue()):
+        data = buf.getvalue() + b"0" * (target_size - len(buf.getvalue()))
+    else:
+        data = buf.getvalue() + b"__TAG__:" + label
+    return data
+
+
+def _write(path: Path, content: bytes = b"fake image data", raw: bool = False) -> Path:
     """Helper: create a file with given content."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    if not raw and path.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff", ".tif", ".heic", ".heif"):
+        target_len = len(content) if len(content) >= 700 else None
+        fmt = "PNG" if path.suffix.lower() == ".png" else "JPEG"
+        content = _make_dummy_image(content, fmt=fmt, target_size=target_len)
     path.write_bytes(content)
     return path
 
@@ -57,19 +75,19 @@ def _write(path: Path, content: bytes = b"fake image data") -> Path:
 class TestMd5:
     def test_known_digest(self, tmp_path: Path):
         data = b"hello argus"
-        f = _write(tmp_path / "a.jpg", data)
+        f = _write(tmp_path / "a.jpg", data, raw=True)
         expected = hashlib.md5(data).hexdigest()
         assert _md5(f) == expected
 
     def test_different_content_different_digest(self, tmp_path: Path):
-        f1 = _write(tmp_path / "a.jpg", b"aaa")
-        f2 = _write(tmp_path / "b.jpg", b"bbb")
+        f1 = _write(tmp_path / "a.jpg", b"aaa", raw=True)
+        f2 = _write(tmp_path / "b.jpg", b"bbb", raw=True)
         assert _md5(f1) != _md5(f2)
 
     def test_identical_content_same_digest(self, tmp_path: Path):
         data = b"same bytes"
-        f1 = _write(tmp_path / "a.jpg", data)
-        f2 = _write(tmp_path / "b.jpg", data)
+        f1 = _write(tmp_path / "a.jpg", data, raw=True)
+        f2 = _write(tmp_path / "b.jpg", data, raw=True)
         assert _md5(f1) == _md5(f2)
 
 
@@ -261,3 +279,115 @@ class TestResumability:
         run_stage0(tmp_path, db, cfg)
         count = db.execute("SELECT COUNT(*) FROM clusters").fetchone()[0]
         assert count == 1
+
+
+# ---------------------------------------------------------------------------
+# run_stage0 — format support and corrupt/skipped file tracking
+# ---------------------------------------------------------------------------
+
+class TestScanRobustnessAndFormats:
+    def test_scan_heic_file(self, tmp_path: Path, db: sqlite3.Connection, cfg: dict):
+        """Confirm pillow-heif is registered and scanning a HEIC file succeeds."""
+        import pillow_heif
+        from PIL import Image
+        pillow_heif.register_heif_opener()
+
+        heic_path = tmp_path / "sample.heic"
+        img = Image.new("RGB", (32, 32), color=(70, 130, 180))
+        img.save(heic_path, format="HEIF")
+
+        res = run_stage0(tmp_path, db, cfg)
+        assert res.files_discovered == 1
+        assert res.files_skipped == 0
+
+        row = db.execute("SELECT file_path, format, width, height, status, md5 FROM images").fetchone()
+        assert row is not None
+        assert row["status"] in ("hashed", "stage0_done")
+        assert row["format"] in ("HEIF", "HEIC")
+        assert row["width"] == 32
+        assert row["height"] == 32
+        assert row["md5"] is not None
+
+    def test_folder_with_mixed_formats_and_one_corrupt(
+        self, tmp_path: Path, db: sqlite3.Connection, cfg: dict
+    ):
+        """
+        A folder with .JPG, .jpeg, .PNG, .webp, .heic and one corrupt file
+        reports 5 discovered and 1 skipped with a reason.
+        """
+        import pillow_heif
+        from PIL import Image
+        pillow_heif.register_heif_opener()
+
+        # 1. .JPG
+        img_jpg = Image.new("RGB", (20, 20), color=(100, 20, 30))
+        img_jpg.save(tmp_path / "img1.JPG", format="JPEG")
+
+        # 2. .jpeg
+        img_jpeg = Image.new("RGB", (20, 20), color=(20, 100, 30))
+        img_jpeg.save(tmp_path / "img2.jpeg", format="JPEG")
+
+        # 3. .PNG
+        img_png = Image.new("RGB", (20, 20), color=(20, 30, 100))
+        img_png.save(tmp_path / "img3.PNG", format="PNG")
+
+        # 4. .webp
+        img_webp = Image.new("RGB", (20, 20), color=(50, 50, 50))
+        img_webp.save(tmp_path / "img4.webp", format="WEBP")
+
+        # 5. .heic
+        img_heic = Image.new("RGB", (20, 20), color=(80, 80, 80))
+        img_heic.save(tmp_path / "img5.heic", format="HEIF")
+
+        # 6. corrupt file
+        corrupt_path = tmp_path / "corrupt.jpg"
+        corrupt_path.write_bytes(b"NOT_A_VALID_IMAGE_HEADER_CORRUPT")
+
+        # Run Stage 0
+        res = run_stage0(tmp_path, db, cfg)
+        assert res.files_discovered == 5
+        assert res.files_skipped == 1
+        assert len(res.skipped_reasons) == 1
+
+        skipped_file, reason = res.skipped_reasons[0]
+        assert Path(skipped_file).name == "corrupt.jpg"
+        assert "cannot identify image file" in reason.lower()
+
+    def test_cli_scan_summary_skipped_and_accepted_extensions(
+        self, tmp_path: Path, capsys
+    ):
+        """CLI scan reports accepted formats and 'Skipped: N' with reasons."""
+        from core.cli import main
+        import pillow_heif
+        from PIL import Image
+        pillow_heif.register_heif_opener()
+
+        img_dir = tmp_path / "images"
+        img_dir.mkdir()
+        db_file = tmp_path / "test.db"
+
+        # Create valid images and one corrupt
+        Image.new("RGB", (16, 16), color="red").save(img_dir / "a.JPG", format="JPEG")
+        Image.new("RGB", (16, 16), color="green").save(img_dir / "b.jpeg", format="JPEG")
+        Image.new("RGB", (16, 16), color="blue").save(img_dir / "c.PNG", format="PNG")
+        Image.new("RGB", (16, 16), color="yellow").save(img_dir / "d.webp", format="WEBP")
+        Image.new("RGB", (16, 16), color="cyan").save(img_dir / "e.heic", format="HEIF")
+        (img_dir / "broken.jpg").write_bytes(b"garbage content")
+
+        main(["scan", str(img_dir), "--db", str(db_file)])
+        captured = capsys.readouterr().out
+
+        # 1. Accepted extensions check
+        assert "Accepted exts" in captured
+        assert "case-insensitive" in captured
+        assert ".JPG" in captured
+        assert ".HEIC" in captured
+        assert ".jpeg" in captured
+        assert ".webp" in captured
+        assert ".tiff" in captured
+
+        # 2. Discovered and skipped check
+        assert "Discovered / updated : 5" in captured
+        assert "Skipped: 1" in captured
+        assert "broken.jpg" in captured
+        assert "cannot identify image file" in captured.lower()

@@ -57,14 +57,23 @@ def cmd_scan(args: argparse.Namespace) -> None:
 
     start_time = time.time()
     source = LocalFolderSource(folder)
+    exts_display = ", ".join(sorted(source.extensions))
+    print(f"Accepted exts : {exts_display} (case-insensitive: .JPG, .HEIC, .jpeg, .webp, .tiff)")
+    print()
 
     # ── Phase 1 & 2: Stage 0 (Scan, MD5, RAW pairs, Exact duplicates) ──
     print("[1/2] Running Stage 0: File discovery, MD5 hashing & exact matching...")
     stage0_res = run_stage0(source, conn, cfg)
     print(f"      Discovered / updated : {stage0_res.files_discovered}")
+    if stage0_res.files_unchanged > 0:
+        print(f"      Unchanged (in DB)    : {stage0_res.files_unchanged}")
     print(f"      MD5 hashes computed  : {stage0_res.files_hashed}")
     print(f"      RAW+JPEG pairs marked: {stage0_res.raw_pairs_marked}")
     print(f"      Exact clusters found : {stage0_res.clusters_created} ({stage0_res.files_clustered} files)")
+    if stage0_res.files_skipped > 0:
+        print(f"      Skipped / unreadable : {stage0_res.files_skipped}")
+        for path_str, reason in stage0_res.skipped_reasons:
+            print(f"        - {Path(path_str).name}: {reason}")
     print()
 
     # ── Phase 3 & 4: Stage 1 (pHash on thumbnails, Near-duplicate clustering) ──
@@ -74,6 +83,10 @@ def cmd_scan(args: argparse.Namespace) -> None:
     print(f"      Near clusters created: {stage1_res.clusters_created}")
     print(f"      Added to clusters    : {stage1_res.members_added_to_existing}")
     print(f"      Total near-clustered : {stage1_res.files_clustered}")
+    if stage1_res.files_skipped > 0:
+        print(f"      Skipped in Stage 1   : {stage1_res.files_skipped}")
+        for path_str, reason in stage1_res.skipped_reasons:
+            print(f"        - {Path(path_str).name}: {reason}")
     print()
 
     # ── Summary ──
@@ -83,6 +96,8 @@ def cmd_scan(args: argparse.Namespace) -> None:
     clustered_images = conn.execute("SELECT COUNT(*) FROM images WHERE cluster_id IS NOT NULL").fetchone()[0]
     keepers = conn.execute("SELECT COUNT(*) FROM images WHERE is_keeper = 1").fetchone()[0]
     duplicates_to_review = clustered_images - keepers
+    total_skipped = stage0_res.files_skipped + stage1_res.files_skipped
+    all_skipped = stage0_res.skipped_reasons + stage1_res.skipped_reasons
 
     print("--------------------------------------------------")
     print(f"Scan complete in {elapsed:.2f}s")
@@ -91,6 +106,10 @@ def cmd_scan(args: argparse.Namespace) -> None:
     print(f"Files in clusters      : {clustered_images}")
     print(f"Recommended keepers    : {keepers}")
     print(f"Redundant copies found : {duplicates_to_review}")
+    print(f"Skipped: {total_skipped}")
+    if total_skipped > 0:
+        for path_str, reason in all_skipped:
+            print(f"  - {Path(path_str).name}: {reason}")
     print("--------------------------------------------------")
 
 

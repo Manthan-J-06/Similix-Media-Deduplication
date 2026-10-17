@@ -17,12 +17,15 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
+import pillow_heif
+pillow_heif.register_heif_opener()
+
 from sources.base import ImageSource, ImageMetadata
-from sources.local_folder import LocalFolderSource
+from sources.local_folder import LocalFolderSource, RAW_EXTENSIONS
 
 _MD5_CHUNK = 65_536  # 64 KB read chunks for MD5 hashing
 
@@ -34,6 +37,9 @@ class Stage0Result:
     raw_pairs_marked: int = 0        # files flagged as RAW+JPEG siblings
     clusters_created: int = 0        # new exact-duplicate clusters
     files_clustered: int = 0         # total files assigned to clusters
+    files_unchanged: int = 0         # files already in DB and unchanged
+    files_skipped: int = 0           # files skipped / failed to decode
+    skipped_reasons: list[tuple[str, str]] = field(default_factory=list) # (file_path, reason)
 
 
 def _md5_file(path: Path) -> str:
@@ -78,14 +84,16 @@ def _raw_extensions(config: dict) -> frozenset[str]:
 def _scan_and_sync_files(
     source: ImageSource,
     conn: sqlite3.Connection,
-) -> int:
+    raw_exts: frozenset[str] = RAW_EXTENSIONS,
+) -> tuple[int, int, list[tuple[str, str]]]:
     """
     Sync source files with the database.
     - If file not in DB: inserts with status = 'discovered'
-    - If file in DB and unchanged (size & mtime match): skips
+    - If file in DB and unchanged (size & mtime match): skips and counts as unchanged
     - If file in DB but modified: updates metadata and resets status = 'discovered'
+    - If file fails to decode or has invalid header: records as skipped with reason
 
-    Returns number of files set to 'discovered'.
+    Returns (discovered_count, unchanged_count, skipped_files).
     """
     existing_rows = conn.execute(
         "SELECT id, file_path, file_size, modified_time FROM images"
@@ -96,19 +104,32 @@ def _scan_and_sync_files(
     }
 
     discovered_count = 0
+    unchanged_count = 0
+    skipped_files: list[tuple[str, str]] = []
     inserts: list[tuple[str, int, float, int | None, int | None, str | None]] = []
     updates: list[tuple[int, float, int | None, int | None, str | None, int]] = []
 
     for file_id in source.list_files():
         try:
             meta = source.get_metadata(file_id)
-        except OSError:
+        except Exception as exc:
+            skipped_files.append((file_id, str(exc)))
+            continue
+
+        if meta.file_size == 0:
+            skipped_files.append((file_id, "Empty file (0 bytes)"))
+            continue
+
+        p_ext = Path(file_id).suffix.lower()
+        if (meta.width is None or meta.height is None) and p_ext not in raw_exts:
+            skipped_files.append((file_id, "Cannot identify image dimensions (corrupt or unreadable)"))
             continue
 
         if file_id in existing_map:
             img_id, cur_size, cur_mtime = existing_map[file_id]
             # Check if unchanged
             if cur_size == meta.file_size and cur_mtime is not None and abs(cur_mtime - meta.modified_time) < 1e-4:
+                unchanged_count += 1
                 continue
 
             # Modified file — reset for re-processing
@@ -165,7 +186,7 @@ def _scan_and_sync_files(
         )
 
     conn.commit()
-    return discovered_count
+    return discovered_count, unchanged_count, skipped_files
 
 
 def _detect_raw_pairs(conn: sqlite3.Connection, raw_exts: frozenset[str]) -> int:
@@ -296,7 +317,11 @@ def run_stage0(
         source = LocalFolderSource(source_or_root)
 
     # Step 1: Scan and sync files (skipping unchanged files)
-    result.files_discovered = _scan_and_sync_files(source, conn)
+    discovered, unchanged, skipped = _scan_and_sync_files(source, conn, raw_exts)
+    result.files_discovered = discovered
+    result.files_unchanged = unchanged
+    result.files_skipped = len(skipped)
+    result.skipped_reasons.extend(skipped)
 
     # Step 2: Compute MD5 for discovered files in batches
     while True:
@@ -317,7 +342,9 @@ def run_stage0(
                 else:
                     digest = _md5_bytes(source.get_bytes(path_str))
                 updates.append((digest, row["id"]))
-            except Exception:
+            except Exception as exc:
+                result.files_skipped += 1
+                result.skipped_reasons.append((path_str, f"MD5 read failed: {exc}"))
                 continue
 
         if updates:

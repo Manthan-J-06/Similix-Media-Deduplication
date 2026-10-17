@@ -16,7 +16,7 @@ Principles applied:
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import imagehash
@@ -32,6 +32,8 @@ class Stage1Result:
     clusters_created: int = 0
     members_added_to_existing: int = 0
     files_clustered: int = 0
+    files_skipped: int = 0
+    skipped_reasons: list[tuple[str, str]] = field(default_factory=list)
 
 
 def _compute_hash(
@@ -62,6 +64,7 @@ def compute_stage1_hashes(
     source: ImageSource,
     conn: sqlite3.Connection,
     config: dict,
+    result: Stage1Result | None = None,
 ) -> int:
     """
     Compute perceptual hashes for all images that don't have one yet.
@@ -96,8 +99,10 @@ def compute_stage1_hashes(
                 thumb = source.get_thumbnail(file_id, size=(thumb_size, thumb_size))
                 phash_val = str(_compute_hash(thumb, algo=hash_algo, hash_size=hash_size))
                 updates.append((phash_val, row["id"]))
-            except Exception:
-                # Corrupt image or unopenable format
+            except Exception as exc:
+                if result is not None:
+                    result.files_skipped += 1
+                    result.skipped_reasons.append((file_id, f"Thumbnail/pHash generation failed: {exc}"))
                 continue
 
         if updates:
@@ -308,7 +313,7 @@ def run_stage1(
         source = LocalFolderSource(source_or_root)
 
     # Step 1: Compute pHash on thumbnails using draft mode
-    result.hashes_computed = compute_stage1_hashes(source, conn, config)
+    result.hashes_computed = compute_stage1_hashes(source, conn, config, result=result)
 
     # Step 2: Form near-duplicate clusters
     new_clusters, members_added, total_clustered = cluster_stage1_candidates(conn, config)

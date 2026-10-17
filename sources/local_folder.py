@@ -20,12 +20,15 @@ from sources.base import ImageMetadata, ImageSource
 # Register HEIC/HEIF opener
 pillow_heif.register_heif_opener()
 
-DEFAULT_EXTENSIONS = frozenset({
-    ".jpg", ".jpeg", ".png", ".webp", ".gif",
-    ".bmp", ".tiff", ".tif", ".heic", ".heif",
+RAW_EXTENSIONS = frozenset({
     ".arw", ".cr2", ".cr3", ".nef", ".orf",
     ".rw2", ".dng", ".raf", ".pef",
 })
+
+DEFAULT_EXTENSIONS = frozenset({
+    ".jpg", ".jpeg", ".png", ".webp", ".gif",
+    ".bmp", ".tiff", ".tif", ".heic", ".heif",
+}) | RAW_EXTENSIONS
 
 
 class LocalFolderSource(ImageSource):
@@ -52,6 +55,9 @@ class LocalFolderSource(ImageSource):
         file_size = stat.st_size
         modified_time = stat.st_mtime
 
+        if file_size == 0:
+            raise OSError(f"Empty file (0 bytes): {path.name}")
+
         width = None
         height = None
         fmt = None
@@ -60,9 +66,12 @@ class LocalFolderSource(ImageSource):
             with Image.open(path) as img:
                 width, height = img.size
                 fmt = img.format
-        except Exception:
-            # For RAW files or unidentifiable formats, format falls back to file suffix
-            fmt = path.suffix.lstrip(".").upper()
+        except Exception as exc:
+            # For RAW files, format falls back to file suffix
+            if path.suffix.lower() in RAW_EXTENSIONS:
+                fmt = path.suffix.lstrip(".").upper()
+            else:
+                raise OSError(f"Cannot identify or decode image: {exc}") from exc
 
         return ImageMetadata(
             file_id=str(path.resolve()),

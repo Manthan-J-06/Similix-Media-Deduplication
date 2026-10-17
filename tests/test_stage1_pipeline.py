@@ -102,9 +102,9 @@ class TestRescanningSkipsUnchanged:
 
         run_stage0(source, db, cfg)
 
-        # Modify file and change timestamp
+        # Modify file with new valid image data and change timestamp
         time.sleep(0.05)
-        p.write_bytes(b"new modified content that is different")
+        _create_sample_jpeg(p, color=(10, 20, 30))
         os.utime(p, None)
 
         res2 = run_stage0(source, db, cfg)
