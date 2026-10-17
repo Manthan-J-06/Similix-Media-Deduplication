@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
+import io
 import os
 from pathlib import Path
 import pickle
@@ -269,6 +270,107 @@ def _calc_proxy_ssim(g1: np.ndarray, g2: np.ndarray) -> float:
     gi_r = cv2.resize(g1, (cw, ch), interpolation=cv2.INTER_AREA)
     gj_r = cv2.resize(g2, (cw, ch), interpolation=cv2.INTER_AREA)
     return float(ssim(gi_r, gj_r, data_range=255))
+
+
+def _load_image_and_qtables(
+    m: dict[str, Any] | sqlite3.Row,
+    source: ImageSource | None = None,
+) -> tuple[Image.Image | None, dict[int, list[int]] | None]:
+    """Load Pillow Image and its quantization tables for an image member."""
+    d = dict(m) if not isinstance(m, dict) else m
+
+    qtables = d.get("qtables") or d.get("quantization")
+    custom_im = d.get("image")
+    if isinstance(custom_im, Image.Image):
+        return custom_im.convert("RGB"), qtables or getattr(custom_im, "quantization", None)
+
+    p = str(d.get("file_path") or "")
+    if not p:
+        return None, None
+
+    raw_im = None
+    if source is not None:
+        try:
+            raw_bytes = source.get_bytes(p)
+            raw_im = Image.open(io.BytesIO(raw_bytes))
+        except Exception:
+            raw_im = None
+
+    if raw_im is None and os.path.exists(p):
+        try:
+            raw_im = Image.open(p)
+        except Exception:
+            raw_im = None
+
+    if raw_im is None:
+        return None, None
+
+    if qtables is None:
+        qtables = getattr(raw_im, "quantization", None)
+
+    if not qtables:
+        return None, None
+
+    im_rgb = raw_im.convert("RGB")
+    return im_rgb, qtables
+
+
+def run_jpeg_derivation_test(
+    m_a: dict[str, Any] | sqlite3.Row,
+    m_b: dict[str, Any] | sqlite3.Row,
+    source: ImageSource | None = None,
+) -> tuple[float | None, float | None, str | None]:
+    """
+    Run JPEG derivation test between two same-resolution lossy candidates A and B:
+    1. Re-encode A using B's quantization tables (via Pillow's qtables parameter) -> A_to_B.
+    2. Re-encode B using A's quantization tables -> B_to_A.
+    3. Measure SSIM of each re-encode against the other original file:
+       score_a_to_b = SSIM(A_to_B, B)
+       score_b_to_a = SSIM(B_to_A, A)
+    4. If one direction reproduces the target markedly better (gap >= 0.005), that
+       direction indicates "B derives from A"; A is the source.
+    Returns:
+       (score_a_to_b, score_b_to_a, winner) where winner is 'A', 'B', or None.
+    """
+    im_a, q_a = _load_image_and_qtables(m_a, source=source)
+    im_b, q_b = _load_image_and_qtables(m_b, source=source)
+
+    if im_a is None or im_b is None or not q_a or not q_b:
+        return None, None, None
+
+    if im_a.size != im_b.size:
+        return None, None, None
+
+    try:
+        buf_a_to_b = io.BytesIO()
+        im_a.save(buf_a_to_b, format="JPEG", qtables=q_b)
+        buf_a_to_b.seek(0)
+        im_a_to_b = Image.open(buf_a_to_b).convert("L")
+
+        buf_b_to_a = io.BytesIO()
+        im_b.save(buf_b_to_a, format="JPEG", qtables=q_a)
+        buf_b_to_a.seek(0)
+        im_b_to_a = Image.open(buf_b_to_a).convert("L")
+
+        arr_a = np.array(im_a.convert("L"))
+        arr_b = np.array(im_b.convert("L"))
+        arr_a_to_b = np.array(im_a_to_b)
+        arr_b_to_a = np.array(im_b_to_a)
+
+        score_a_to_b = round(float(ssim(arr_a_to_b, arr_b, data_range=255)), 6)
+        score_b_to_a = round(float(ssim(arr_b_to_a, arr_a, data_range=255)), 6)
+
+        gap = round(score_a_to_b - score_b_to_a, 6)
+        if gap >= 0.005:
+            winner = "A"
+        elif -gap >= 0.005:
+            winner = "B"
+        else:
+            winner = None
+
+        return score_a_to_b, score_b_to_a, winner
+    except Exception:
+        return None, None, None
 
 
 def _get_proxy_gray(
@@ -574,31 +676,54 @@ def select_reference_member(
         c1_name = Path(str(c1.get("file_path") or "")).name or f"id_{c1.get('id')}"
         c2_name = Path(str(c2.get("file_path") or "")).name or f"id_{c2.get('id')}"
 
+        # Always run derivation test between top two distinct candidates (available for reporting)
+        score_a_to_b, score_b_to_a, deriv_winner = run_jpeg_derivation_test(c1, c2, source=source)
+        deriv_gap = round(score_a_to_b - score_b_to_a, 6) if (score_a_to_b is not None and score_b_to_a is not None) else None
+
         if peer_count > 0:
             is_pairwise_consistent = (c1_wins > c2_wins)
             head_to_head_result = f"{c1_name} vs {c2_name}: {c1_wins} vs {c2_wins} ({peer_count} peers)"
         else:
             # 2-member cluster (no third-party peers to vote)
-            # If source-likelihood gap >= 0.002, is_close_score is False so it is confident.
-            # When gap < 0.002, check if c1 is supported by substantive physical metadata
-            # (earlier modified time, higher JPEG quality estimate, or presence of EXIF).
+            # Replaced weak evidence (mtime gap >= 10ms, higher JPEG quality, EXIF) with derivation test:
+            # 1. Re-encode A using B's qtables, and B using A's. Measure SSIM against target.
+            #    If gap >= 0.005, indicates derivation: winner is source.
+            # 2. mtime and jpeg_quality_est may only break ties after this test,
+            #    and must never by themselves make a two-member cluster confident.
+            #    EXIF presence on only one file may count as support.
+            # 3. If neither direction wins, reference_uncertain = 1.
             exif1_c = _get_exif_score(c1)
             exif2_c = _get_exif_score(c2)
-            mtime1_c = _get_mtime(c1)
-            mtime2_c = _get_mtime(c2)
-            q1_c = _get_jpeg_quality(c1)
-            q2_c = _get_jpeg_quality(c2)
+            has_single_exif_support = (exif1_c > 0 and exif2_c == 0)
 
-            has_earlier_mtime = (mtime1_c > 0.0 and mtime2_c > 0.0 and (mtime2_c - mtime1_c) >= 0.01)
-            has_higher_quality = (q1_c > q2_c)
-            has_better_exif = (exif1_c > exif2_c)
-
-            if has_earlier_mtime or has_higher_quality or has_better_exif:
+            if deriv_winner == "A":
                 is_pairwise_consistent = True
-                head_to_head_result = f"{c1_name} vs {c2_name}: confident (source metadata supported)"
+                head_to_head_result = (
+                    f"{c1_name} -> {c2_name}: {score_a_to_b:.4f} vs {score_b_to_a:.4f} "
+                    f"(gap: {deriv_gap:+.4f}) [derivation confirmed {c1_name}]"
+                )
+            elif deriv_winner == "B":
+                is_pairwise_consistent = True
+                # Swap c1 and c2 so that the true source c2 becomes c1
+                c1, c2 = c2, c1
+                c1_name = Path(str(c1.get("file_path") or "")).name or f"id_{c1.get('id')}"
+                c2_name = Path(str(c2.get("file_path") or "")).name or f"id_{c2.get('id')}"
+                head_to_head_result = (
+                    f"{c1_name} -> {c2_name}: {score_b_to_a:.4f} vs {score_a_to_b:.4f} "
+                    f"(gap: {-deriv_gap:+.4f}) [derivation confirmed {c1_name}]"
+                )
+            elif has_single_exif_support:
+                is_pairwise_consistent = True
+                head_to_head_result = f"{c1_name} vs {c2_name}: confident (EXIF support on single file)"
             else:
                 is_pairwise_consistent = False
-                head_to_head_result = f"{c1_name} vs {c2_name}: no peers to compare (tied metadata)"
+                if score_a_to_b is not None and score_b_to_a is not None:
+                    head_to_head_result = (
+                        f"{c1_name} -> {c2_name}: {score_a_to_b:.4f} vs {score_b_to_a:.4f} "
+                        f"(gap: {deriv_gap:+.4f}) [no derivation winner, uncertain]"
+                    )
+                else:
+                    head_to_head_result = f"{c1_name} vs {c2_name}: no derivation data (uncertain)"
 
         # Condition 2: EXIF contradiction (c2 has EXIF while c1 lacks it)
         exif1 = _get_exif_score(c1)
@@ -610,18 +735,28 @@ def select_reference_member(
         mtime2 = _get_mtime(c2)
         is_mtime_contradiction = (mtime1 > 0.0 and mtime2 > 0.0 and mtime2 < mtime1)
 
-        # Refined uncertainty rule:
-        # A cluster is uncertain only if:
+        # Uncertainty rule:
+        # A cluster is uncertain if:
         # (top two distinct candidates within 0.002 AND pairwise ordering not consistent)
         # OR EXIF contradiction OR mtime contradiction
+        # In a 2-member cluster, if neither direction wins and no single EXIF support, reference_uncertain = 1.
         if (is_close_score and not is_pairwise_consistent) or is_exif_contradiction or is_mtime_contradiction:
             reference_uncertain = 1
+        elif peer_count == 0 and deriv_winner is None and not has_single_exif_support:
+            reference_uncertain = 1
 
-    ref = min(member_dicts, key=key_fn)
+    if len(distinct_top_cands) >= 2 and deriv_winner in ("A", "B"):
+        ref = c1
+    else:
+        ref = min(member_dicts, key=key_fn)
+
     ref["reference_uncertain"] = reference_uncertain
     ref["top_candidate_gap"] = top_candidate_gap
     ref["head_to_head_result"] = head_to_head_result
     ref["is_pairwise_consistent"] = is_pairwise_consistent
+    ref["derivation_scores"] = (score_a_to_b, score_b_to_a) if len(distinct_top_cands) >= 2 else (None, None)
+    ref["derivation_gap"] = deriv_gap if len(distinct_top_cands) >= 2 else None
+    ref["derivation_winner"] = deriv_winner if len(distinct_top_cands) >= 2 else None
 
     # Update input dicts in-place if callers passed dict objects
     for orig_m, d in zip(members, member_dicts):
@@ -631,6 +766,9 @@ def select_reference_member(
             orig_m["top_candidate_gap"] = top_candidate_gap
             orig_m["head_to_head_result"] = head_to_head_result
             orig_m["is_pairwise_consistent"] = is_pairwise_consistent
+            orig_m["derivation_scores"] = ref.get("derivation_scores")
+            orig_m["derivation_gap"] = ref.get("derivation_gap")
+            orig_m["derivation_winner"] = ref.get("derivation_winner")
 
     return ref
 
