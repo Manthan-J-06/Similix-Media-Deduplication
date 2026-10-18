@@ -104,7 +104,7 @@ def cmd_scan(args: argparse.Namespace) -> None:
     print(f"Total images indexed   : {total_images}")
     print(f"Total duplicate groups : {total_clusters}")
     print(f"Files in clusters      : {clustered_images}")
-    print(f"Recommended keepers    : {keepers}")
+    print(f"Cluster anchors        : {keepers}")
     print(f"Redundant copies found : {duplicates_to_review}")
     print(f"Skipped: {total_skipped}")
     if total_skipped > 0:
@@ -199,7 +199,7 @@ def cmd_cluster(args: argparse.Namespace) -> None:
     print(f"Total images in library     : {total_images}")
     print(f"Total duplicate groups      : {total_clusters}")
     print(f"Files clustered             : {clustered_images}")
-    print(f"Recommended keepers         : {keepers}")
+    print(f"Cluster anchors             : {keepers}")
     print(f"Redundant copies            : {clustered_images - keepers}")
     print(f"Signal breakdown            : {signal_counts}")
     print("--------------------------------------------------")
@@ -618,7 +618,10 @@ def cmd_list(args: argparse.Namespace) -> None:
 
 
 def cmd_show(args: argparse.Namespace) -> None:
-    cfg = load_config(args.config)
+    from core.keeper import choose_keeper
+
+    cfg = load_config(args.config) if getattr(args, "config", None) else load_config()
+    mode = getattr(args, "mode", "balanced") or "balanced"
     db_path = args.db
     if not db_path and getattr(args, "folder", None):
         target = Path(args.folder).expanduser().resolve()
@@ -640,7 +643,7 @@ def cmd_show(args: argparse.Namespace) -> None:
 
     clusters = conn.execute(
         """
-        SELECT c.id, c.representative_id, c.stage_detected, c.member_count,
+        SELECT c.id, c.representative_id, c.reference_uncertain, c.stage_detected, c.member_count,
                r.file_path AS rep_path
         FROM clusters c
         LEFT JOIN images r ON c.representative_id = r.id
@@ -652,31 +655,58 @@ def cmd_show(args: argparse.Namespace) -> None:
         print(f"No clusters found in database: {db_path}")
         return
 
-    print("=" * 105)
-    print(f"  ARGUS Duplicate Clusters Summary: {db_path} ({len(clusters)} clusters)")
-    print("=" * 105)
+    print("=" * 115)
+    print(f"  ARGUS Duplicate Clusters Summary: {db_path} ({len(clusters)} clusters) [Mode: {mode.upper()}]")
+    print("=" * 115)
 
     for c in clusters:
         cid = c["id"]
         members = conn.execute(
             """
-            SELECT id, file_path, file_size, width, height, match_pct, resolution_pct,
-                   confidence, is_keeper, is_recommended_keeper, delete_safe, review_flag, quality_status
+            SELECT id, cluster_id, file_path, file_size, width, height, format, md5,
+                   match_pct, resolution_pct, confidence, quality_status,
+                   ssim, ssim_color, sharpness_ratio, pixel_ratio, bytes_ratio,
+                   source_likelihood, jpeg_quality_est, is_low_confidence
             FROM images
             WHERE cluster_id = ?
-            ORDER BY is_keeper DESC, id ASC
+            ORDER BY id ASC
             """,
             (cid,),
         ).fetchall()
 
-        print(f"\nCluster {cid} ({len(members)} members):")
-        header = f"  {'Keeper':<6} | {'Match %':<8} | {'Res %':<8} | {'Confidence':<10} | {'Size':<10} | {'File'}"
-        print(header)
-        print("  " + "-" * 100)
+        if not members:
+            continue
 
+        ref_unc = c["reference_uncertain"] if "reference_uncertain" in c.keys() else None
+        decision = choose_keeper(
+            members,
+            mode=mode,
+            config=cfg,
+            reference_uncertain=ref_unc,
+        )
+        keeper_id = decision["keeper_id"]
+        del_safe_ids = set(decision["delete_safe_ids"])
+        review_ids = set(decision["review_ids"])
+
+        annotated_members = []
         for m in members:
             d = dict(m)
-            keeper_str = "YES" if (d.get("is_keeper") or d.get("is_recommended_keeper")) else "no"
+            d["is_recommended_keeper"] = 1 if d["id"] == keeper_id else 0
+            d["delete_safe"] = 1 if d["id"] in del_safe_ids else 0
+            d["review"] = 1 if d["id"] in review_ids else 0
+            annotated_members.append(d)
+
+        annotated_members.sort(key=lambda x: (not x["is_recommended_keeper"], not x["delete_safe"], x["id"]))
+
+        print(f"\nCluster {cid} ({len(members)} members):")
+        header = f"  {'Rec Keeper':<10} | {'Del Safe':<8} | {'Review':<6} | {'Match %':<8} | {'Res %':<8} | {'Confidence':<10} | {'Size':<10} | {'File'}"
+        print(header)
+        print("  " + "-" * 110)
+
+        for d in annotated_members:
+            keeper_str = "YES" if d["is_recommended_keeper"] else "no"
+            del_str = "YES" if d["delete_safe"] else "no"
+            rev_str = "YES" if d["review"] else "no"
             match_str = f"{d['match_pct']:.1f}%" if d.get("match_pct") is not None else "N/A"
             res_str = f"{d['resolution_pct']:.1f}%" if d.get("resolution_pct") is not None else "N/A"
             conf = d.get("confidence")
@@ -684,9 +714,9 @@ def cmd_show(args: argparse.Namespace) -> None:
             sz_kb = f"{(d.get('file_size') or 0) / 1024:.1f} KB"
             fname = Path(d["file_path"]).name
 
-            print(f"  {keeper_str:<6} | {match_str:>8} | {res_str:>8} | {conf_str:>10} | {sz_kb:>10} | {fname}")
+            print(f"  {keeper_str:<10} | {del_str:<8} | {rev_str:<6} | {match_str:>8} | {res_str:>8} | {conf_str:>10} | {sz_kb:>10} | {fname}")
 
-    print("\n" + "=" * 105)
+    print("\n" + "=" * 115)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -779,6 +809,12 @@ def main(argv: list[str] | None = None) -> None:
 
     show_parser = subparsers.add_parser("show", help="Show duplicate cluster members with match_pct, resolution_pct, and confidence")
     show_parser.add_argument("folder", nargs="?", default=None, help="Path to image folder or database (optional)")
+    show_parser.add_argument(
+        "--mode",
+        choices=["conservative", "balanced", "aggressive"],
+        default="balanced",
+        help="Keeper selection mode (default: balanced)",
+    )
     show_parser.add_argument("--db", default=None, help="Path to SQLite database file")
     show_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
 

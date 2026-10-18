@@ -916,3 +916,90 @@ class TestByteIdenticalAnchorPrefersEarliestMtime:
         assert 3 in res["delete_safe_ids"] or 3 in res["review_ids"]
         assert "very_long_original_filename_2015.jpg" in res["reasons"][3]
 
+
+class TestDownscaledAnchorShowsFullresAsKeeper:
+    def test_downscaled_anchor_shows_fullres_as_keeper_in_conservative_mode(self, tmp_path, capsys):
+        """
+        A cluster whose clustering-time anchor is a downscaled copy (is_keeper=1)
+        still shows the full-resolution file as keeper in conservative mode,
+        and argus show computes this live rather than reading clustering-time is_keeper.
+        """
+        # 1. choose_keeper unit test
+        members = [
+            {
+                "id": 1,
+                "file_path": "/photos/downscaled_50pct.jpg",
+                "file_size": 20_000,
+                "width": 512,
+                "height": 384,
+                "md5": "thumb_md5",
+                "is_keeper": 1,  # Clustering-time anchor!
+                "quality_status": "aligned",
+                "ssim": 0.95,
+                "ssim_color": 0.95,
+                "pixel_ratio": 0.25,
+                "sharpness_ratio": 1.0,
+                "is_low_confidence": 0,
+            },
+            {
+                "id": 2,
+                "file_path": "/photos/original_1024.jpg",
+                "file_size": 60_000,
+                "width": 1024,
+                "height": 768,
+                "md5": "orig_md5",
+                "is_keeper": 0,
+                "quality_status": "reference",
+                "ssim": 1.0,
+                "ssim_color": 1.0,
+                "pixel_ratio": 1.0,
+                "sharpness_ratio": 1.0,
+                "is_low_confidence": 0,
+            },
+        ]
+
+        res = choose_keeper(members, mode="conservative")
+        assert res["keeper_id"] == 2, f"Expected full-resolution file (id 2) as keeper, got {res['keeper_id']}"
+        assert 1 in res["delete_safe_ids"] or 1 in res["review_ids"]
+
+        # 2. Integration test with argus show CLI command
+        from db.connection import init_db
+        from core.cli import cmd_show
+        import argparse
+
+        db_file = tmp_path / "test_anchor.db"
+        conn = init_db(db_file)
+        # Circular foreign key safe insertion:
+        conn.execute("INSERT INTO clusters (id, representative_id, stage_detected) VALUES (1, NULL, 3)")
+        conn.execute(
+            """
+            INSERT INTO images (
+                id, cluster_id, file_path, file_size, width, height, format, md5,
+                is_keeper, is_recommended_keeper, quality_status, ssim, ssim_color,
+                match_pct, resolution_pct, confidence
+            ) VALUES
+            (1, 1, '/photos/downscaled_50pct.jpg', 20000, 512, 384, 'JPEG', 'thumb_md5', 1, 0, 'aligned', 0.95, 0.95, 95.0, 25.0, 0.9999),
+            (2, 1, '/photos/original_1024.jpg', 60000, 1024, 768, 'JPEG', 'orig_md5', 0, 0, 'reference', 1.0, 1.0, 100.0, 100.0, 1.0)
+            """
+        )
+        conn.execute("UPDATE clusters SET representative_id = 2 WHERE id = 1")
+        conn.commit()
+        conn.close()
+
+        # Run cmd_show in conservative mode
+        args = argparse.Namespace(db=str(db_file), folder=None, config=None, mode="conservative")
+        cmd_show(args)
+
+        captured = capsys.readouterr().out
+        assert "original_1024.jpg" in captured
+        assert "downscaled_50pct.jpg" in captured
+
+        # Find line for original_1024.jpg and downscaled_50pct.jpg
+        orig_line = [l for l in captured.splitlines() if "original_1024.jpg" in l][0]
+        thumb_line = [l for l in captured.splitlines() if "downscaled_50pct.jpg" in l][0]
+
+        # The full-resolution file must be YES for Rec Keeper
+        assert orig_line.strip().startswith("YES")
+        # The downscaled anchor must be no for Rec Keeper
+        assert thumb_line.strip().startswith("no")
+
