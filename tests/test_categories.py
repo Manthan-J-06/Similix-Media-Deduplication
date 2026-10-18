@@ -424,3 +424,33 @@ class TestCategoryEvaluationAndCLI:
         captured = capsys.readouterr().out
         assert "receipt.jpg" in captured
 
+    def test_generate_contact_sheet_html(self, tmp_path: Path):
+        """Verify contact sheet HTML generation with base64 embedded thumbnails."""
+        from bench.category_contact_sheet import generate_contact_sheet_html
+        from PIL import Image
+
+        db_path = tmp_path / "test_sheet.db"
+        conn = init_db(db_path)
+
+        # Create dummy image on disk
+        img_file = tmp_path / "sample.jpg"
+        Image.new("RGB", (100, 100), color=(100, 150, 200)).save(img_file, format="JPEG")
+
+        conn.execute(
+            """
+            INSERT INTO images (file_path, category_top1, category_top1_prob, category_top3)
+            VALUES (?, 'landscape', 0.92, '[{"label": "landscape", "prob": 0.92}, {"label": "outdoor", "prob": 0.05}]')
+            """,
+            (str(img_file),),
+        )
+        conn.commit()
+
+        out_html = tmp_path / "contact_sheet.html"
+        generated = generate_contact_sheet_html(conn, out_html, per_category=12)
+        assert generated.exists()
+        content = generated.read_text(encoding="utf-8")
+        assert "Argus — Category Contact Sheet" in content
+        assert "landscape (1)" in content
+        assert "data:image/jpeg;base64," in content
+        assert "sample.jpg" in content
+

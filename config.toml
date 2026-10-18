@@ -162,6 +162,16 @@ vehicle = [
     "a photograph of transportation like a car, bicycle, train, or plane",
     "a photo of a vehicle on a road or street",
 ]
+artifact = [
+    "a photo of an artifact, work of art, or museum object",
+    "a photograph of a sculpture, statue, antique, or craft",
+    "a picture of an artistic artifact, historical relic, or pottery",
+]
+indoor = [
+    "a photo of an indoor room or home interior",
+    "a photograph of an indoor space, living room, or bedroom",
+    "an interior view of a room, hallway, or furnished space",
+]
 
 # ── Deletion ledger & trash (core/ledger.py) ──────────────────────────────────
 [ledger]

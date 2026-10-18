@@ -511,7 +511,21 @@ def cmd_history(args: argparse.Namespace) -> None:
 
 def cmd_categorize(args: argparse.Namespace) -> None:
     cfg = load_config(args.config)
-    db_path = args.db or cfg.get("general", {}).get("db_path", "argus.db")
+    db_path = args.db
+    if not db_path and getattr(args, "folder", None):
+        target = Path(args.folder).expanduser().resolve()
+        if target.is_file() and target.suffix == ".db":
+            db_path = str(target)
+        elif target.with_suffix(".db").is_file():
+            db_path = str(target.with_suffix(".db"))
+        elif (target / "argus.db").is_file():
+            db_path = str(target / "argus.db")
+        elif (target.parent / f"{target.name}.db").is_file():
+            db_path = str(target.parent / f"{target.name}.db")
+        else:
+            db_path = str(target)
+    if not db_path:
+        db_path = cfg.get("general", {}).get("db_path", "argus.db")
     conn = init_db(db_path)
 
     from core.categories import run_categorization
@@ -674,6 +688,7 @@ def main(argv: list[str] | None = None) -> None:
     purge_parser.add_argument("--db", default=None, help="Path to SQLite database file")
 
     cat_parser = subparsers.add_parser("categorize", help="Categorize images into zero-shot semantic categories")
+    cat_parser.add_argument("folder", nargs="?", default=None, help="Path to image folder or database (optional)")
     cat_parser.add_argument("--db", default=None, help="Path to SQLite database file")
     cat_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
     cat_parser.add_argument("--force", action="store_true", help="Re-categorize images already labeled")
