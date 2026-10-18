@@ -737,18 +737,39 @@ def cmd_serve(args: argparse.Namespace) -> None:
     import uvicorn
     from api.server import create_app
 
-    db_path = resolve_db_path(args.folder if hasattr(args, "folder") else None, args.db)
+    cfg = load_config(args.config) if getattr(args, "config", None) else load_config()
+    db_path = getattr(args, "db", None)
+    if not db_path and getattr(args, "folder", None):
+        target = Path(args.folder).expanduser().resolve()
+        if target.is_file() and target.suffix == ".db":
+            db_path = str(target)
+        elif target.with_suffix(".db").is_file():
+            db_path = str(target.with_suffix(".db"))
+        elif (target / "argus.db").is_file():
+            db_path = str(target / "argus.db")
+        elif (target / "demo.db").is_file():
+            db_path = str(target / "demo.db")
+        elif (target.parent / f"{target.name}.db").is_file():
+            db_path = str(target.parent / f"{target.name}.db")
+        else:
+            db_path = str(target)
+    if not db_path:
+        db_path = cfg.get("general", {}).get("db_path", "argus.db")
+
+    resolved_db = str(Path(db_path).expanduser().resolve())
+
     app = create_app(
-        db_path=db_path,
+        db_path=resolved_db,
         trash_dir=getattr(args, "trash_dir", None),
         thumb_cache_dir=getattr(args, "thumb_cache_dir", None),
-        config_path=args.config,
+        config=cfg,
     )
     # Strictly bind to 127.0.0.1 only
     host = "127.0.0.1"
-    port = getattr(args, "port", 8000)
-    print(f"Starting Argus API server on http://{host}:{port} (db: {db_path})")
+    port = getattr(args, "port", 8000) or 8000
+    print(f"Starting Argus API server on http://{host}:{port} (db: {resolved_db})")
     uvicorn.run(app, host=host, port=port)
+
 
 
 

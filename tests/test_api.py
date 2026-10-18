@@ -453,3 +453,26 @@ class TestAPIServer:
         assert apply_res.status_code == 200
         post_apply_state = snapshot_files()
         assert post_apply_state != initial_state  # Files are moved!
+
+    def test_cmd_serve_cli_main_mocked(self, api_test_env, monkeypatch):
+        """Test cmd_serve through main() with uvicorn.run mocked.
+        Assert host is 127.0.0.1 and app was created with the right db path."""
+        import uvicorn
+        from core.cli import main
+
+        run_called = {}
+
+        def mock_run(app, host, port):
+            run_called["app"] = app
+            run_called["host"] = host
+            run_called["port"] = port
+
+        monkeypatch.setattr(uvicorn, "run", mock_run)
+
+        db_file = api_test_env["db_file"]
+        main(["serve", "--db", str(db_file), "--port", "8001"])
+
+        assert run_called["host"] == "127.0.0.1"
+        assert run_called["port"] == 8001
+        assert run_called["app"].state.db_path == db_file.resolve()
+
