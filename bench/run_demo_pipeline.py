@@ -44,9 +44,11 @@ from sources.local_folder import LocalFolderSource
 
 def setup_demo_folder(demo_dir: Path) -> list[str]:
     demo_dir.mkdir(parents=True, exist_ok=True)
-    for p in demo_dir.glob("*"):
-        if p.is_file():
+    for p in list(demo_dir.iterdir()):
+        if p.is_file() or p.is_symlink():
             p.unlink()
+        elif p.is_dir():
+            shutil.rmtree(p)
 
     originals = [
         "picsum_0001.jpg",

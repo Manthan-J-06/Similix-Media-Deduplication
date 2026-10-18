@@ -379,7 +379,8 @@ class TestReferenceMemberSelection:
         p3 = tmp_path / "img_400x300_lone.jpg"
 
         im1.save(p1, format="JPEG", quality=85)
-        im1.save(p2, format="JPEG", quality=75)
+        with Image.open(p1) as loaded:
+            loaded.save(p2, format="JPEG", quality=75)
         im2.save(p3, format="JPEG", quality=85)
 
         members = [
@@ -400,10 +401,9 @@ class TestReferenceMemberSelection:
 
     def test_refined_uncertainty_rule_head_to_head_majority(self, tmp_path: Path):
         """
-        A cluster is uncertain only if top two distinct candidates are within 0.002
-        AND their pairwise ordering is not consistent OR EXIF/mtime contradict.
-        If the original beats the re-save in head-to-head comparison and in mtime,
-        the cluster is confident even with a gap under 0.002.
+        When derivation test has no winner for the top two candidates (gap < 0.005),
+        reference_uncertain = 1. Majority vote still picks the reference (orig id=1),
+        but must not clear the flag.
         """
         im = _make_rich_test_image(800, 600)
         p_orig = tmp_path / "orig.jpg"
@@ -431,7 +431,7 @@ class TestReferenceMemberSelection:
 
         ref = select_reference_member(members)
         assert ref["id"] == 1
-        assert ref["reference_uncertain"] == 0
+        assert ref["reference_uncertain"] == 1
         assert ref.get("head_to_head_result") is not None
 
     def test_derivation_original_and_q60_resave_confident(self, tmp_path: Path):
@@ -480,7 +480,10 @@ class TestReferenceMemberSelection:
         assert ref.get("derivation_winner") is None
 
     def test_derivation_q85_resave_of_q75_original_picks_original_as_source(self, tmp_path: Path):
-        """A q85 re-save of a q75 original -> original is the source."""
+        """
+        A q85 re-save of a q75 original with default mtimes: derivation gap is < 0.005
+        so cluster is uncertain (reference_uncertain = 1), but reference is still the original.
+        """
         im = _make_rich_test_image(800, 600)
         p_q75 = tmp_path / "original_q75.jpg"
         p_q85 = tmp_path / "resave_q85.jpg"
@@ -489,17 +492,14 @@ class TestReferenceMemberSelection:
         with Image.open(p_q75) as orig_loaded:
             orig_loaded.save(p_q85, format="JPEG", quality=85)
 
-        now = time.time()
-        os.utime(p_q75, (now - 100, now - 100))
-        os.utime(p_q85, (now - 50, now - 50))
-
         members = [
-            {"id": "orig_q75", "width": 800, "height": 600, "file_size": p_q75.stat().st_size, "file_path": str(p_q75), "modified_time": now - 100},
-            {"id": "resave_q85", "width": 800, "height": 600, "file_size": p_q85.stat().st_size, "file_path": str(p_q85), "modified_time": now - 50},
+            {"id": "orig_q75", "width": 800, "height": 600, "file_size": p_q75.stat().st_size, "file_path": str(p_q75)},
+            {"id": "resave_q85", "width": 800, "height": 600, "file_size": p_q85.stat().st_size, "file_path": str(p_q85)},
         ]
 
         ref = select_reference_member(members)
         assert ref["id"] == "orig_q75", f"Expected orig_q75 to be source, got {ref['id']}"
+        assert ref["reference_uncertain"] == 1
 
 
 

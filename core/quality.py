@@ -680,70 +680,96 @@ def select_reference_member(
         score_a_to_b, score_b_to_a, deriv_winner = run_jpeg_derivation_test(c1, c2, source=source)
         deriv_gap = round(score_a_to_b - score_b_to_a, 6) if (score_a_to_b is not None and score_b_to_a is not None) else None
 
-        if peer_count > 0:
-            is_pairwise_consistent = (c1_wins > c2_wins)
-            head_to_head_result = f"{c1_name} vs {c2_name}: {c1_wins} vs {c2_wins} ({peer_count} peers)"
-        else:
-            # 2-member cluster (no third-party peers to vote)
-            # Replaced weak evidence (mtime gap >= 10ms, higher JPEG quality, EXIF) with derivation test:
-            # 1. Re-encode A using B's qtables, and B using A's. Measure SSIM against target.
-            #    If gap >= 0.005, indicates derivation: winner is source.
-            # 2. mtime and jpeg_quality_est may only break ties after this test,
-            #    and must never by themselves make a two-member cluster confident.
-            #    EXIF presence on only one file may count as support.
-            # 3. If neither direction wins, reference_uncertain = 1.
-            exif1_c = _get_exif_score(c1)
-            exif2_c = _get_exif_score(c2)
-            has_single_exif_support = (exif1_c > 0 and exif2_c == 0)
+        # Check structural / hardware differentiation
+        res1 = ((c1.get("width") or 0), (c1.get("height") or 0))
+        res2 = ((c2.get("width") or 0), (c2.get("height") or 0))
+        has_diff_res = (res1 != res2)
+        fmt1 = str(c1.get("format") or "").upper()
+        fmt2 = str(c2.get("format") or "").upper()
+        has_diff_fmt = bool(fmt1 and fmt2 and fmt1 != fmt2)
+        exif1_c = _get_exif_score(c1)
+        exif2_c = _get_exif_score(c2)
+        has_single_exif_support = (exif1_c > 0 and exif2_c == 0)
 
-            if deriv_winner == "A":
-                is_pairwise_consistent = True
-                head_to_head_result = (
-                    f"{c1_name} -> {c2_name}: {score_a_to_b:.4f} vs {score_b_to_a:.4f} "
-                    f"(gap: {deriv_gap:+.4f}) [derivation confirmed {c1_name}]"
-                )
-            elif deriv_winner == "B":
-                is_pairwise_consistent = True
+        if deriv_winner in ("A", "B"):
+            if deriv_winner == "B":
                 # Swap c1 and c2 so that the true source c2 becomes c1
                 c1, c2 = c2, c1
                 c1_name = Path(str(c1.get("file_path") or "")).name or f"id_{c1.get('id')}"
                 c2_name = Path(str(c2.get("file_path") or "")).name or f"id_{c2.get('id')}"
-                head_to_head_result = (
-                    f"{c1_name} -> {c2_name}: {score_b_to_a:.4f} vs {score_a_to_b:.4f} "
-                    f"(gap: {-deriv_gap:+.4f}) [derivation confirmed {c1_name}]"
-                )
-            elif has_single_exif_support:
-                is_pairwise_consistent = True
-                head_to_head_result = f"{c1_name} vs {c2_name}: confident (EXIF support on single file)"
+
+            # Condition 2: EXIF contradiction (c2 has EXIF while c1 lacks it)
+            exif1 = _get_exif_score(c1)
+            exif2 = _get_exif_score(c2)
+            is_exif_contradiction = (exif2 > exif1)
+
+            # Condition 3: mtime contradiction (c2 has earlier modified time than c1)
+            mtime1 = _get_mtime(c1)
+            mtime2 = _get_mtime(c2)
+            is_mtime_contradiction = (mtime1 > 0.0 and mtime2 > 0.0 and mtime2 < mtime1)
+
+            if peer_count > 0:
+                is_pairwise_consistent = (c1_wins > c2_wins)
             else:
-                is_pairwise_consistent = False
+                is_pairwise_consistent = True
+
+            if (is_close_score and not is_pairwise_consistent) or is_exif_contradiction or is_mtime_contradiction:
+                reference_uncertain = 1
+            else:
+                reference_uncertain = 0
+
+            head_to_head_result = (
+                f"{c1_name} -> {c2_name}: "
+                f"{(score_a_to_b if deriv_winner == 'A' else score_b_to_a):.4f} vs "
+                f"{(score_b_to_a if deriv_winner == 'A' else score_a_to_b):.4f} "
+                f"(gap: {abs(deriv_gap):+.4f}) [derivation confirmed {c1_name}]"
+            )
+        else:
+            # Derivation test has no winner (gap < 0.005 or test unavailable)
+            # Clusters where derivation gap is below 0.005 must not become confident from mtime or majority vote alone.
+            if has_diff_res or has_diff_fmt or has_single_exif_support:
+                exif1 = _get_exif_score(c1)
+                exif2 = _get_exif_score(c2)
+                is_exif_contradiction = (exif2 > exif1)
+
+                mtime1 = _get_mtime(c1)
+                mtime2 = _get_mtime(c2)
+                is_mtime_contradiction = (mtime1 > 0.0 and mtime2 > 0.0 and mtime2 < mtime1)
+
+                if peer_count > 0:
+                    is_pairwise_consistent = (c1_wins > c2_wins)
+                else:
+                    is_pairwise_consistent = True
+
+                if (is_close_score and not is_pairwise_consistent) or is_exif_contradiction or is_mtime_contradiction:
+                    reference_uncertain = 1
+                else:
+                    reference_uncertain = 0
+            else:
+                # Same resolution, same format, no single EXIF support
+                # Set reference_uncertain = 1.
+                # Majority vote may still pick the reference (ref = min(member_dicts, key=key_fn)),
+                # but must NOT clear the flag.
+                reference_uncertain = 1
+                if peer_count > 0:
+                    is_pairwise_consistent = (c1_wins > c2_wins)
+                else:
+                    is_pairwise_consistent = False
+
+            if peer_count > 0:
+                head_to_head_result = f"{c1_name} vs {c2_name}: {c1_wins} vs {c2_wins} ({peer_count} peers)"
                 if score_a_to_b is not None and score_b_to_a is not None:
+                    head_to_head_result += f" [derivation gap: {deriv_gap:+.4f}, uncertain]"
+            else:
+                if has_single_exif_support:
+                    head_to_head_result = f"{c1_name} vs {c2_name}: confident (EXIF support on single file)"
+                elif score_a_to_b is not None and score_b_to_a is not None:
                     head_to_head_result = (
                         f"{c1_name} -> {c2_name}: {score_a_to_b:.4f} vs {score_b_to_a:.4f} "
                         f"(gap: {deriv_gap:+.4f}) [no derivation winner, uncertain]"
                     )
                 else:
                     head_to_head_result = f"{c1_name} vs {c2_name}: no derivation data (uncertain)"
-
-        # Condition 2: EXIF contradiction (c2 has EXIF while c1 lacks it)
-        exif1 = _get_exif_score(c1)
-        exif2 = _get_exif_score(c2)
-        is_exif_contradiction = (exif2 > exif1)
-
-        # Condition 3: mtime contradiction (c2 has earlier modified time than c1)
-        mtime1 = _get_mtime(c1)
-        mtime2 = _get_mtime(c2)
-        is_mtime_contradiction = (mtime1 > 0.0 and mtime2 > 0.0 and mtime2 < mtime1)
-
-        # Uncertainty rule:
-        # A cluster is uncertain if:
-        # (top two distinct candidates within 0.002 AND pairwise ordering not consistent)
-        # OR EXIF contradiction OR mtime contradiction
-        # In a 2-member cluster, if neither direction wins and no single EXIF support, reference_uncertain = 1.
-        if (is_close_score and not is_pairwise_consistent) or is_exif_contradiction or is_mtime_contradiction:
-            reference_uncertain = 1
-        elif peer_count == 0 and deriv_winner is None and not has_single_exif_support:
-            reference_uncertain = 1
 
     if len(distinct_top_cands) >= 2 and deriv_winner in ("A", "B"):
         ref = c1

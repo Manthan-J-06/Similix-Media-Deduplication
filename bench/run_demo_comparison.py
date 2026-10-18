@@ -78,6 +78,9 @@ def execute_pipeline(demo_dir: Path) -> dict:
         ref_details = select_reference_member([dict(m) for m in members], source=source)
         gap = ref_details.get("top_candidate_gap")
         h2h = ref_details.get("head_to_head_result")
+        d_gap = ref_details.get("derivation_gap")
+        d_winner = ref_details.get("derivation_winner")
+        d_scores = ref_details.get("derivation_scores")
 
         cluster_res = {
             "members": members,
@@ -85,6 +88,9 @@ def execute_pipeline(demo_dir: Path) -> dict:
             "reference_uncertain": ref_unc,
             "top_candidate_gap": gap,
             "head_to_head_result": h2h,
+            "derivation_gap": d_gap,
+            "derivation_winner": d_winner,
+            "derivation_scores": d_scores,
             "modes": {},
         }
 
@@ -207,6 +213,16 @@ def run_comparison():
         gap2_str = f"{gap2:.6f}" if gap2 is not None else "N/A"
         gap_match = (gap1 == gap2)
         print(f"{'':<14} | {'Top Cand Gap':<15} | {gap1_str:<30} | {gap2_str:<30} | {'YES' if gap_match else 'MISMATCH'}")
+
+        d_gap1 = c1.get("derivation_gap")
+        d_gap2 = c2.get("derivation_gap")
+        d_gap1_str = f"{d_gap1:+.6f}" if d_gap1 is not None else "N/A"
+        d_gap2_str = f"{d_gap2:+.6f}" if d_gap2 is not None else "N/A"
+        print(f"{'':<14} | {'Deriv Gap':<15} | {d_gap1_str:<30} | {d_gap2_str:<30} | {'YES' if d_gap1 == d_gap2 else 'MISMATCH'}")
+
+        d_win1 = str(c1.get("derivation_winner"))
+        d_win2 = str(c2.get("derivation_winner"))
+        print(f"{'':<14} | {'Deriv Winner':<15} | {d_win1:<30} | {d_win2:<30} | {'YES' if d_win1 == d_win2 else 'MISMATCH'}")
 
         h2h1 = c1.get("head_to_head_result") or "N/A"
         h2h2 = c2.get("head_to_head_result") or "N/A"
