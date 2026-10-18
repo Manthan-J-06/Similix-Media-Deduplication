@@ -359,31 +359,20 @@ def create_app(
         conn: sqlite3.Connection = Depends(get_db),
     ):
         """Serve a cached JPEG thumbnail for the given image ID. Never accepts file paths."""
-        row = conn.execute("SELECT id, file_path FROM images WHERE id = ?", (image_id,)).fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail=f"Image {image_id} not found")
+        try:
+            row = conn.execute("SELECT id, file_path FROM images WHERE id = ?", (image_id,)).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail=f"Image {image_id} not found")
 
-        orig_path = Path(row["file_path"])
-        if not orig_path.exists():
-            logger.warning(f"Image {image_id} source file not found on disk: {orig_path}")
-            return Response(content=PLACEHOLDER_JPEG_BYTES, media_type="image/jpeg", status_code=200)
+            orig_path = Path(row["file_path"])
+            if not orig_path.exists():
+                logger.warning(f"Image {image_id} source file not found on disk: {orig_path}")
+                return Response(content=PLACEHOLDER_JPEG_BYTES, media_type="image/jpeg", status_code=200)
 
-        cache_dir = request.app.state.thumb_cache_dir
-        cache_path = cache_dir / f"{image_id}_{size}.jpg"
+            cache_dir = request.app.state.thumb_cache_dir
+            cache_path = cache_dir / f"{image_id}_{size}.jpg"
 
-        # Check existing valid cache
-        if cache_path.is_file():
-            try:
-                st = cache_path.stat()
-                if st.st_size > 0 and st.st_mtime >= orig_path.stat().st_mtime:
-                    return FileResponse(str(cache_path), media_type="image/jpeg")
-            except OSError:
-                pass
-
-        # Concurrency synchronization per (image_id, size)
-        lock = _get_thumb_lock(image_id, size)
-        with lock:
-            # Re-check inside lock in case another thread just completed generation
+            # Check existing valid cache
             if cache_path.is_file():
                 try:
                     st = cache_path.stat()
@@ -392,25 +381,42 @@ def create_app(
                 except OSError:
                     pass
 
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            tmp_path = cache_dir / f".tmp_{image_id}_{size}_{uuid.uuid4().hex}.jpg"
-            try:
-                with Image.open(orig_path) as img:
-                    if img.mode != "RGB":
-                        img = img.convert("RGB")
-                    img.thumbnail((size, size), Image.Resampling.LANCZOS)
-                    img.save(str(tmp_path), format="JPEG", quality=85)
-                os.replace(str(tmp_path), str(cache_path))
-            except Exception as exc:
-                if tmp_path.exists():
+            # Concurrency synchronization per (image_id, size)
+            lock = _get_thumb_lock(image_id, size)
+            with lock:
+                # Re-check inside lock in case another thread just completed generation
+                if cache_path.is_file():
                     try:
-                        tmp_path.unlink()
+                        st = cache_path.stat()
+                        if st.st_size > 0 and st.st_mtime >= orig_path.stat().st_mtime:
+                            return FileResponse(str(cache_path), media_type="image/jpeg")
                     except OSError:
                         pass
-                logger.error(f"Thumbnail generation failed for image {image_id} ({orig_path}): {exc}")
-                return Response(content=PLACEHOLDER_JPEG_BYTES, media_type="image/jpeg", status_code=200)
 
-            return FileResponse(str(cache_path), media_type="image/jpeg")
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                tmp_path = cache_dir / f".tmp_{image_id}_{size}_{uuid.uuid4().hex}.jpg"
+                try:
+                    with Image.open(orig_path) as img:
+                        if img.mode != "RGB":
+                            img = img.convert("RGB")
+                        img.thumbnail((size, size), Image.Resampling.LANCZOS)
+                        img.save(str(tmp_path), format="JPEG", quality=85)
+                    os.replace(str(tmp_path), str(cache_path))
+                except Exception as exc:
+                    if tmp_path.exists():
+                        try:
+                            tmp_path.unlink()
+                        except OSError:
+                            pass
+                    logger.exception(f"Thumbnail generation failed for image {image_id} ({orig_path}): {exc}")
+                    return Response(content=PLACEHOLDER_JPEG_BYTES, media_type="image/jpeg", status_code=200)
+
+                return FileResponse(str(cache_path), media_type="image/jpeg")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception(f"Unhandled error in get_thumbnail for image {image_id}: {exc}")
+            return Response(content=PLACEHOLDER_JPEG_BYTES, media_type="image/jpeg", status_code=200)
 
     @app.get("/search")
     def search_images(

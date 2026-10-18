@@ -519,64 +519,30 @@ class TestAPIServer:
         assert thumb_res.status_code == 200
         assert thumb_res.headers.get("content-type") == "image/jpeg"
 
-    def test_concurrent_thumbnail_requests_all_demo_images(self, tmp_path):
-        """Requests thumbnails for all demo images concurrently (ThreadPoolExecutor, 20 workers)
-        and asserts every response is 200 image/jpeg."""
+    def test_concurrent_thumbnail_requests_real_demo_images(self, tmp_path):
+        """Requests thumbnails for all images in the real ~/dedupe_test/demo/demo.db copy
+        concurrently with 20 workers, asserting every response is 200 image/jpeg."""
         from concurrent.futures import ThreadPoolExecutor
+        import shutil
 
-        demo_db_path = Path("~/dedupe_test/demo/demo.db").expanduser().resolve()
-        can_access_demo = False
-        try:
-            if demo_db_path.exists():
-                with open(demo_db_path, "rb") as f:
-                    f.read(16)
-                can_access_demo = True
-        except (OSError, PermissionError):
-            can_access_demo = False
+        demo_db_orig = Path("~/dedupe_test/demo/demo.db").expanduser().resolve()
+        assert demo_db_orig.exists(), f"Real demo DB not found at {demo_db_orig}"
 
-        thumb_dir = tmp_path / "thumbs_demo"
-        if can_access_demo:
-            # Test directly against the demo dataset
-            app = create_app(db_path=demo_db_path, thumb_cache_dir=thumb_dir)
-            client = TestClient(app)
-            conn = sqlite3.connect(f"file:{demo_db_path}?mode=ro", uri=True)
-            image_ids = [row[0] for row in conn.execute("SELECT id FROM images").fetchall()]
-            conn.close()
-        else:
-            # Fallback for sandboxed runners where ~/dedupe_test is isolated
-            db_file = tmp_path / "demo_synthetic.db"
-            conn = init_db(db_file)
-            ensure_ledger_tables(conn)
-            photos_dir = tmp_path / "photos_demo"
-            photos_dir.mkdir(parents=True, exist_ok=True)
-            image_ids = []
-            img_id = 1
-            for c_id in range(1, 7):
-                conn.execute(
-                    "INSERT INTO clusters (id, stage_detected, member_count, category) VALUES (?, 0, 6, 'test')",
-                    (c_id,),
-                )
-                for m_idx in range(6):
-                    img_path = photos_dir / f"demo_img_{img_id}.jpg"
-                    _create_test_image(img_path, color=((img_id * 20) % 255, (img_id * 40) % 255, 120), size=(400, 300))
-                    conn.execute(
-                        """
-                        INSERT INTO images (id, cluster_id, file_path, file_size, width, height, format, md5,
-                                            is_keeper, match_pct, resolution_pct, confidence)
-                        VALUES (?, ?, ?, ?, 400, 300, 'JPEG', 'md5', ?, 100.0, 100.0, 1.0)
-                        """,
-                        (img_id, c_id, str(img_path), img_path.stat().st_size, 1 if m_idx == 0 else 0),
-                    )
-                    image_ids.append(img_id)
-                    img_id += 1
-            conn.commit()
-            conn.close()
-            app = create_app(db_path=db_file, thumb_cache_dir=thumb_dir)
-            client = TestClient(app)
+        # Copy demo.db into tmp_path
+        demo_db_copy = tmp_path / "demo_real_copy.db"
+        shutil.copy2(demo_db_orig, demo_db_copy)
 
-        assert len(image_ids) > 0
+        thumb_dir = tmp_path / "thumbs_demo_real"
+        app = create_app(db_path=demo_db_copy, thumb_cache_dir=thumb_dir)
+        client = TestClient(app)
 
-        # Concurrently request size 96 and size 320 for each image (like the UI does simultaneously)
+        conn = sqlite3.connect(demo_db_copy)
+        image_ids = [row[0] for row in conn.execute("SELECT id FROM images").fetchall()]
+        conn.close()
+
+        assert len(image_ids) == 36, f"Expected 36 demo images, found {len(image_ids)}"
+
+        # 20 concurrent workers requesting thumbnails
         tasks = []
         for img_id in image_ids:
             tasks.append((img_id, 96))
@@ -590,6 +556,7 @@ class TestAPIServer:
         with ThreadPoolExecutor(max_workers=20) as executor:
             results = list(executor.map(fetch_thumb, tasks))
 
+        assert len(results) == 72
         for status_code, content_type in results:
             assert status_code == 200
             assert content_type == "image/jpeg"
