@@ -109,6 +109,60 @@ min_saving_ratio = 0.30
 allow_blur_flag = true
 allow_resolution_loss = false
 
+# ── Semantic categorization & zero-shot classification (core/categories.py) ──
+[categories]
+# Temperature for softmax over cosine similarities (lower = peakier distribution).
+temperature = 0.05
+# Minimum probability difference between top-1 and top-2 required for confident label.
+# If top1_prob - top2_prob < uncertain_margin, categorized as 'uncertain'.
+uncertain_margin = 0.05
+# Minimum absolute probability required for top-1 category.
+# If top1_prob < min_top_prob, categorized as 'uncertain'.
+min_top_prob = 0.20
+
+# Category labels with 3-5 prompt templates each
+[categories.templates]
+landscape = [
+    "a photo of a natural landscape or scenery",
+    "a scenic photograph of nature, mountains, ocean, or countryside",
+    "a photo of outdoor scenery and environment",
+]
+portrait = [
+    "a portrait photo of a person or people",
+    "a close-up photograph of a human face",
+    "a picture of people or a selfie",
+]
+animal = [
+    "a photo of an animal, pet, or wildlife",
+    "a photograph of a dog, cat, bird, or animal",
+    "a close-up picture of an animal in nature",
+]
+architecture = [
+    "a photo of a building, architecture, or city structure",
+    "an exterior or interior photograph of architecture",
+    "a photo of urban buildings, monuments, or streets",
+]
+food = [
+    "a photo of food, a meal, or a dish",
+    "a photograph of delicious food on a plate or table",
+    "a picture of cuisine, cooking, or dining",
+]
+document = [
+    "a photo of a document, invoice, or receipt",
+    "a photo of printed text on paper, book page, or sign",
+    "a scanned document or paper note",
+]
+screenshot = [
+    "a screenshot of a computer screen or mobile phone display",
+    "a digital screen capture of an application or website",
+    "a screenshot of software or user interface",
+]
+vehicle = [
+    "a photo of a car, automobile, or vehicle",
+    "a photograph of transportation like a car, bicycle, train, or plane",
+    "a photo of a vehicle on a road or street",
+]
+
 # ── Deletion ledger & trash (core/ledger.py) ──────────────────────────────────
 [ledger]
 # Default trash folder. Batches are stored in trash_dir/<batch_id>/.

@@ -509,6 +509,100 @@ def cmd_history(args: argparse.Namespace) -> None:
     print("=" * 100)
 
 
+def cmd_categorize(args: argparse.Namespace) -> None:
+    cfg = load_config(args.config)
+    db_path = args.db or cfg.get("general", {}).get("db_path", "argus.db")
+    conn = init_db(db_path)
+
+    from core.categories import run_categorization
+
+    print("==================================================")
+    print("  ARGUS Zero-Shot Semantic Categorization")
+    print("==================================================")
+    print(f"Database : {db_path}")
+    print(f"Mode     : {'Force re-categorize' if args.force else 'Resumable (skip labeled)'}")
+    print()
+
+    res = run_categorization(
+        conn,
+        cfg,
+        force=args.force,
+        progress_callback=lambda c, t: _render_progress_bar(c, t, "Categorizing"),
+    )
+
+    print("\n--------------------------------------------------")
+    print(f"Images categorized : {res.images_categorized}")
+    print(f"Images skipped     : {res.images_skipped}")
+    print(f"Clusters updated   : {res.clusters_updated}")
+    print(f"Flagged uncertain  : {res.uncertain_count}")
+    print("--------------------------------------------------")
+    if res.category_counts:
+        print("Category Distribution:")
+        for cat, count in sorted(res.category_counts.items(), key=lambda x: x[1], reverse=True):
+            pct = (count / (res.images_categorized or 1)) * 100
+            print(f"  {cat:<18} : {count:>5} ({pct:>5.1f}%)")
+    print("==================================================")
+
+
+def cmd_search(args: argparse.Namespace) -> None:
+    cfg = load_config(args.config)
+    db_path = args.db or cfg.get("general", {}).get("db_path", "argus.db")
+    conn = init_db(db_path)
+
+    from core.categories import search_images_by_text
+
+    results = search_images_by_text(args.query, conn, cfg, limit=args.limit)
+
+    print("====================================================================================================")
+    print(f"  ARGUS Semantic Text Search: \"{args.query}\" ({len(results)} results)")
+    print("====================================================================================================")
+    header = f"{'Rank':<4} | {'Score':<7} | {'Category':<14} | {'Prob':<6} | {'Resolution':<11} | {'File Path'}"
+    print(header)
+    print("-" * 100)
+    for i, r in enumerate(results, 1):
+        res_str = f"{r.get('width') or 0}x{r.get('height') or 0}"
+        cat = r.get("category_top1") or "unlabeled"
+        prob = f"{r.get('category_top1_prob'):.2f}" if r.get("category_top1_prob") is not None else "N/A"
+        print(f"{i:<4} | {r['score']:>6.4f} | {cat:<14} | {prob:<6} | {res_str:<11} | {r['file_path']}")
+    print("=" * 100)
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    cfg = load_config(args.config)
+    db_path = args.db or cfg.get("general", {}).get("db_path", "argus.db")
+    conn = init_db(db_path)
+
+    params: list[Any] = []
+    sql = """
+        SELECT id, file_path, file_size, width, height, format,
+               category_top1, category_top1_prob, cluster_id, is_keeper
+        FROM images
+    """
+    if args.category:
+        sql += " WHERE LOWER(category_top1) = LOWER(?)"
+        params.append(args.category)
+    sql += " ORDER BY id LIMIT ?"
+    params.append(args.limit)
+
+    rows = conn.execute(sql, params).fetchall()
+
+    print("====================================================================================================")
+    cat_title = f" [Category: {args.category}]" if args.category else ""
+    print(f"  ARGUS Image List{cat_title} ({len(rows)} images displayed, limit {args.limit})")
+    print("====================================================================================================")
+    header = f"{'ID':<6} | {'Category':<14} | {'Prob':<6} | {'Resolution':<11} | {'Size (KB)':<10} | {'File Path'}"
+    print(header)
+    print("-" * 100)
+    for r in rows:
+        d = dict(r)
+        res_str = f"{d.get('width') or 0}x{d.get('height') or 0}"
+        cat = d.get("category_top1") or "unlabeled"
+        prob = f"{d.get('category_top1_prob'):.2f}" if d.get('category_top1_prob') is not None else "N/A"
+        sz_kb = f"{(d.get('file_size') or 0) / 1024:.1f}"
+        print(f"{d['id']:<6} | {cat:<14} | {prob:<6} | {res_str:<11} | {sz_kb:<10} | {d['file_path']}")
+    print("=" * 100)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="argus",
@@ -579,6 +673,23 @@ def main(argv: list[str] | None = None) -> None:
     purge_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
     purge_parser.add_argument("--db", default=None, help="Path to SQLite database file")
 
+    cat_parser = subparsers.add_parser("categorize", help="Categorize images into zero-shot semantic categories")
+    cat_parser.add_argument("--db", default=None, help="Path to SQLite database file")
+    cat_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
+    cat_parser.add_argument("--force", action="store_true", help="Re-categorize images already labeled")
+
+    search_parser = subparsers.add_parser("search", help="Search images by natural language text query")
+    search_parser.add_argument("query", help="Text search query")
+    search_parser.add_argument("--limit", type=int, default=10, help="Maximum number of results to display")
+    search_parser.add_argument("--db", default=None, help="Path to SQLite database file")
+    search_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
+
+    list_parser = subparsers.add_parser("list", help="List images filtered by category")
+    list_parser.add_argument("--category", "-c", default=None, help="Filter images by category (e.g. landscape, document, uncertain)")
+    list_parser.add_argument("--limit", type=int, default=100, help="Maximum number of results to display")
+    list_parser.add_argument("--db", default=None, help="Path to SQLite database file")
+    list_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
+
     args = parser.parse_args(argv)
     if args.subcommand == "scan":
         cmd_scan(args)
@@ -602,6 +713,12 @@ def main(argv: list[str] | None = None) -> None:
         cmd_purge(args)
     elif args.subcommand == "history":
         cmd_history(args)
+    elif args.subcommand == "categorize":
+        cmd_categorize(args)
+    elif args.subcommand == "search":
+        cmd_search(args)
+    elif args.subcommand == "list":
+        cmd_list(args)
 
 
 if __name__ == "__main__":

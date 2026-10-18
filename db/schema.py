@@ -45,6 +45,9 @@ CREATE TABLE IF NOT EXISTS images (
     quality_retained_pct REAL,                   -- % quality retained vs reference
     bytes_saved_if_deleted INTEGER DEFAULT 0,    -- bytes reclaimed if this member is deleted
     reason        TEXT,                          -- explanation for keeper / delete / review verdict
+    category_top1 TEXT,                          -- top-1 predicted category or 'uncertain'
+    category_top1_prob REAL,                     -- probability of top-1 category (0.0 - 1.0)
+    category_top3 TEXT,                          -- JSON array of [{"label": ..., "prob": ...}, ...]
     created_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
     updated_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
@@ -61,6 +64,7 @@ CREATE TABLE IF NOT EXISTS clusters (
     stage_detected    INTEGER NOT NULL,           -- pipeline stage that found this cluster (0, 1, 2...)
     member_count      INTEGER NOT NULL DEFAULT 0,
     reference_uncertain INTEGER NOT NULL DEFAULT 0, -- 1 = reference uncertain (SSIM tie <0.002 or EXIF/mtime conflict)
+    category          TEXT,                          -- cluster-level category (from keeper or majority vote)
     created_at        TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 """

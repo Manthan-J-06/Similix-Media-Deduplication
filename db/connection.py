@@ -55,6 +55,9 @@ def init_db(db_path: str | Path) -> sqlite3.Connection:
         ("jpeg_quality_est", "INTEGER"),
         ("source_likelihood", "REAL"),
         ("quality_status", "TEXT"),
+        ("category_top1", "TEXT"),
+        ("category_top1_prob", "REAL"),
+        ("category_top3", "TEXT"),
     ):
         if col not in existing_cols:
             conn.execute(f"ALTER TABLE images ADD COLUMN {col} {col_type};")
@@ -64,6 +67,12 @@ def init_db(db_path: str | Path) -> sqlite3.Connection:
     }
     if "reference_uncertain" not in existing_cluster_cols:
         conn.execute("ALTER TABLE clusters ADD COLUMN reference_uncertain INTEGER NOT NULL DEFAULT 0;")
+    if "category" not in existing_cluster_cols:
+        conn.execute("ALTER TABLE clusters ADD COLUMN category TEXT;")
+
+    # Ensure category indexes exist
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_images_category ON images(category_top1);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_clusters_category ON clusters(category);")
 
     # Backfill link_signal for previously clustered rows if unset
     conn.execute(
