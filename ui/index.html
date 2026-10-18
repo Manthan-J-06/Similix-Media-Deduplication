@@ -926,6 +926,9 @@
     let approvedSwapClusterIds = new Set();
     let currentPlannedBatchId = null;
 
+    // Neutral SVG placeholder for thumbnail errors
+    const PLACEHOLDER_THUMB = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' width='64' height='64'%3E%3Crect width='64' height='64' fill='%23334155'/%3E%3Cpath d='M16 46l9-12 7 8 11-14 11 18H10z' fill='%2364748b'/%3E%3Ccircle cx='24' cy='22' r='4' fill='%2364748b'/%3E%3C/svg%3E";
+
     // Helper: format bytes
     function formatBytes(bytes) {
       if (!bytes || bytes <= 0) return "0 KB";
@@ -1019,7 +1022,7 @@
 
         item.innerHTML = `
           <div class="cluster-thumb-box">
-            ${thumbUrl ? `<img src="${thumbUrl}" alt="Keeper thumb" loading="lazy">` : ""}
+            ${thumbUrl ? `<img src="${thumbUrl}" alt="" loading="lazy" onerror="this.onerror=null;this.src=PLACEHOLDER_THUMB;">` : ""}
           </div>
           <div class="cluster-info">
             <div class="cluster-title-row">
@@ -1163,7 +1166,7 @@
 
         card.innerHTML = `
           <div class="member-thumb-wrap">
-            <img src="/thumb/${m.id}?size=320" alt="${fname}" loading="lazy">
+            <img src="/thumb/${m.id}?size=320" alt="" loading="lazy" onerror="this.onerror=null;this.src=PLACEHOLDER_THUMB;">
             <div class="card-top-badges">
               ${recHtml}
               ${verifiedHtml}

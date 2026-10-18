@@ -519,4 +519,121 @@ class TestAPIServer:
         assert thumb_res.status_code == 200
         assert thumb_res.headers.get("content-type") == "image/jpeg"
 
+    def test_concurrent_thumbnail_requests_all_demo_images(self, tmp_path):
+        """Requests thumbnails for all demo images concurrently (ThreadPoolExecutor, 20 workers)
+        and asserts every response is 200 image/jpeg."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        demo_db_path = Path("~/dedupe_test/demo/demo.db").expanduser().resolve()
+        can_access_demo = False
+        try:
+            if demo_db_path.exists():
+                with open(demo_db_path, "rb") as f:
+                    f.read(16)
+                can_access_demo = True
+        except (OSError, PermissionError):
+            can_access_demo = False
+
+        thumb_dir = tmp_path / "thumbs_demo"
+        if can_access_demo:
+            # Test directly against the demo dataset
+            app = create_app(db_path=demo_db_path, thumb_cache_dir=thumb_dir)
+            client = TestClient(app)
+            conn = sqlite3.connect(f"file:{demo_db_path}?mode=ro", uri=True)
+            image_ids = [row[0] for row in conn.execute("SELECT id FROM images").fetchall()]
+            conn.close()
+        else:
+            # Fallback for sandboxed runners where ~/dedupe_test is isolated
+            db_file = tmp_path / "demo_synthetic.db"
+            conn = init_db(db_file)
+            ensure_ledger_tables(conn)
+            photos_dir = tmp_path / "photos_demo"
+            photos_dir.mkdir(parents=True, exist_ok=True)
+            image_ids = []
+            img_id = 1
+            for c_id in range(1, 7):
+                conn.execute(
+                    "INSERT INTO clusters (id, stage_detected, member_count, category) VALUES (?, 0, 6, 'test')",
+                    (c_id,),
+                )
+                for m_idx in range(6):
+                    img_path = photos_dir / f"demo_img_{img_id}.jpg"
+                    _create_test_image(img_path, color=((img_id * 20) % 255, (img_id * 40) % 255, 120), size=(400, 300))
+                    conn.execute(
+                        """
+                        INSERT INTO images (id, cluster_id, file_path, file_size, width, height, format, md5,
+                                            is_keeper, match_pct, resolution_pct, confidence)
+                        VALUES (?, ?, ?, ?, 400, 300, 'JPEG', 'md5', ?, 100.0, 100.0, 1.0)
+                        """,
+                        (img_id, c_id, str(img_path), img_path.stat().st_size, 1 if m_idx == 0 else 0),
+                    )
+                    image_ids.append(img_id)
+                    img_id += 1
+            conn.commit()
+            conn.close()
+            app = create_app(db_path=db_file, thumb_cache_dir=thumb_dir)
+            client = TestClient(app)
+
+        assert len(image_ids) > 0
+
+        # Concurrently request size 96 and size 320 for each image (like the UI does simultaneously)
+        tasks = []
+        for img_id in image_ids:
+            tasks.append((img_id, 96))
+            tasks.append((img_id, 320))
+
+        def fetch_thumb(item):
+            iid, sz = item
+            resp = client.get(f"/thumb/{iid}?size={sz}")
+            return resp.status_code, resp.headers.get("content-type")
+
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            results = list(executor.map(fetch_thumb, tasks))
+
+        for status_code, content_type in results:
+            assert status_code == 200
+            assert content_type == "image/jpeg"
+
+    def test_thumbnail_failure_returns_placeholder_not_500(self, api_test_env, tmp_path):
+        """A thumbnail failure must never return a 500: return a small placeholder image instead and log the reason."""
+        client = api_test_env["client"]
+        app = api_test_env["app"]
+        db_file = api_test_env["db_file"]
+
+        # 1. Image in DB but file missing on disk -> returns 200 image/jpeg placeholder
+        missing_file = tmp_path / "nonexistent.jpg"
+        conn = sqlite3.connect(db_file)
+        conn.execute(
+            """
+            INSERT INTO images (id, cluster_id, file_path, file_size, width, height, format, md5, is_keeper)
+            VALUES (999, 1, ?, 100, 100, 100, 'JPEG', 'fake', 0)
+            """,
+            (str(missing_file),),
+        )
+        # 2. Image in DB but file corrupted on disk -> returns 200 image/jpeg placeholder
+        corrupted_file = tmp_path / "corrupted.jpg"
+        corrupted_file.write_bytes(b"NOT_A_VALID_IMAGE_HEADER_GARBAGE_BYTES")
+        conn.execute(
+            """
+            INSERT INTO images (id, cluster_id, file_path, file_size, width, height, format, md5, is_keeper)
+            VALUES (1000, 1, ?, 100, 100, 100, 'JPEG', 'fake2', 0)
+            """,
+            (str(corrupted_file),),
+        )
+        conn.commit()
+        conn.close()
+
+        res_missing = client.get("/thumb/999?size=96")
+        assert res_missing.status_code == 200
+        assert res_missing.headers.get("content-type") == "image/jpeg"
+
+        res_corrupt = client.get("/thumb/1000?size=96")
+        assert res_corrupt.status_code == 200
+        assert res_corrupt.headers.get("content-type") == "image/jpeg"
+
+        # Unknown ID not in DB -> 404
+        res_unknown = client.get("/thumb/99999?size=96")
+        assert res_unknown.status_code == 404
+
+
 
