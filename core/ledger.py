@@ -198,6 +198,7 @@ def plan(
     cluster_ids: list[int] | None = None,
     mode: str = "balanced",
     manual_member_ids: list[int] | None = None,
+    approved_swap_cluster_ids: list[int] | None = None,
     config: dict | None = None,
     trash_dir: str | Path | None = None,
 ) -> PlanSummary:
@@ -220,6 +221,7 @@ def plan(
     batch_trash = base_trash / batch_id
 
     manual_set = set(manual_member_ids or [])
+    approved_swaps = set(approved_swap_cluster_ids or [])
     requested_member_set = set(member_ids) if member_ids is not None else None
 
     # Determine clusters to inspect
@@ -278,6 +280,10 @@ def plan(
         )
 
         keeper_id = keeper_res["keeper_id"]
+        swap_prop = keeper_res.get("swap_proposal")
+        if swap_prop and cid in approved_swaps:
+            manual_set.add(swap_prop["from_id"])
+
         k_m = id_to_member.get(keeper_id, {})
         per_cluster_keeper[cid] = {
             "keeper_id": keeper_id,
@@ -301,7 +307,10 @@ def plan(
             is_manual = mid in manual_set
 
             if is_manual:
-                entry_reason = f"Manual user selection ({reasons.get(mid, 'Manual choice')})"
+                if swap_prop and mid == swap_prop["from_id"] and cid in approved_swaps:
+                    entry_reason = f"Approved swap proposal (replaced by keeper #{keeper_id})"
+                else:
+                    entry_reason = f"Manual user selection ({reasons.get(mid, 'Manual choice')})"
             else:
                 if mid not in del_safe_ids:
                     # In review or unalignable and not explicitly manual

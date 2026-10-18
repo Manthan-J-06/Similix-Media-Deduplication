@@ -659,6 +659,9 @@ def cmd_show(args: argparse.Namespace) -> None:
     print(f"  ARGUS Duplicate Clusters Summary: {db_path} ({len(clusters)} clusters) [Mode: {mode.upper()}]")
     print("=" * 115)
 
+    total_swap_proposals = 0
+    total_swap_bytes = 0
+
     for c in clusters:
         cid = c["id"]
         members = conn.execute(
@@ -716,7 +719,18 @@ def cmd_show(args: argparse.Namespace) -> None:
 
             print(f"  {keeper_str:<10} | {del_str:<8} | {rev_str:<6} | {match_str:>8} | {res_str:>8} | {conf_str:>10} | {sz_kb:>10} | {fname}")
 
+        if decision.get("swap_proposal"):
+            sp = decision["swap_proposal"]
+            total_swap_proposals += 1
+            total_swap_bytes += sp["bytes_saved"]
+            from_name = Path(next((m["file_path"] for m in members if m["id"] == sp["from_id"]), str(sp["from_id"]))).name
+            to_name = Path(next((m["file_path"] for m in members if m["id"] == sp["to_id"]), str(sp["to_id"]))).name
+            print(f"  ⚡ Swap Proposal: Replace reference ({from_name}) with smaller keeper ({to_name})")
+            print(f"     Saves: {sp['bytes_saved'] / 1024:.1f} KB ({sp['saving_pct']}%) | Match: {sp['match_pct']:.1f}% | Res: {sp['res_pct']:.1f}%")
+
     print("\n" + "=" * 115)
+    print(f"  Summary: {len(clusters)} clusters | Mode: {mode.upper()} | Swap proposals: {total_swap_proposals} ({total_swap_bytes / 1024:.1f} KB at stake / {total_swap_bytes:,} bytes)")
+    print("=" * 115)
 
 
 def main(argv: list[str] | None = None) -> None:

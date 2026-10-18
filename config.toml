@@ -97,7 +97,7 @@ allow_resolution_loss = false
 ssim_gray = 0.98
 ssim_color = 0.97
 pixel_ratio_floor = 0.60
-min_saving_ratio = 0.10
+min_saving_ratio = 0.30
 allow_blur_flag = false
 allow_resolution_loss = false
 

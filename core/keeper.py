@@ -49,7 +49,7 @@ DEFAULT_KEEPER_MODES: dict[str, dict[str, Any]] = {
         "ssim_gray": 0.98,
         "ssim_color": 0.97,
         "pixel_ratio_floor": 0.60,
-        "min_saving_ratio": 0.10,
+        "min_saving_ratio": 0.30,
         "allow_blur_flag": False,
         "allow_resolution_loss": False,
     },
@@ -170,6 +170,7 @@ def choose_keeper(
             "quality_retained": {},
             "reference_uncertain": 0,
             "allow_resolution_loss": False,
+            "swap_proposal": None,
         }
 
     # Normalize rows to dictionaries
@@ -294,6 +295,7 @@ def choose_keeper(
             "quality_retained": quality_retained,
             "reference_uncertain": 1,
             "allow_resolution_loss": res_loss_allowed,
+            "swap_proposal": None,
         }
 
     # Map byte-identical groups by (md5, file_size)
@@ -446,6 +448,51 @@ def choose_keeper(
         (m.get("file_size") or 0) for m in members if m.get("id") in delete_safe_ids
     )
 
+    # 5. Swap Proposal: when recommended keeper is not the reference (the original)
+    swap_proposal = None
+    if keeper_id != ref_id and ref_member is not None:
+        bytes_saved = max(0, ref_sz - keeper_sz)
+        saving_pct = round((bytes_saved / ref_sz) * 100.0, 1) if ref_sz > 0 else 0.0
+
+        if keeper.get("match_pct") is not None:
+            match_pct = float(keeper["match_pct"])
+        elif keeper.get("ssim_color") is not None:
+            match_pct = round(float(keeper["ssim_color"]) * 100.0, 1)
+        elif keeper.get("ssim") is not None:
+            match_pct = round(float(keeper["ssim"]) * 100.0, 1)
+        else:
+            match_pct = 100.0
+
+        if keeper.get("resolution_pct") is not None:
+            res_pct = float(keeper["resolution_pct"])
+        elif keeper.get("pixel_ratio") is not None:
+            res_pct = round(float(keeper["pixel_ratio"]) * 100.0, 1)
+        elif ref_px > 0:
+            res_pct = round((k_px / ref_px) * 100.0, 1)
+        else:
+            res_pct = 100.0
+
+        better_ids = [
+            m.get("id")
+            for m in members
+            if m.get("id") in review_ids
+            and ("better than" in reasons.get(m.get("id"), "").lower() or m.get("id") == ref_id)
+        ]
+
+        swap_proposal = {
+            "from_id": ref_id,
+            "to_id": keeper_id,
+            "bytes_saved": bytes_saved,
+            "saving_pct": saving_pct,
+            "match_pct": match_pct,
+            "res_pct": res_pct,
+            "reason": reasons.get(
+                keeper_id,
+                f"Swap reference with smaller {mode} candidate ({saving_pct}% size reduction, {match_pct}% quality retained)",
+            ),
+            "better_than_keeper_ids": better_ids,
+        }
+
     return {
         "keeper_id": keeper_id,
         "delete_safe_ids": delete_safe_ids,
@@ -455,6 +502,7 @@ def choose_keeper(
         "quality_retained": quality_retained,
         "reference_uncertain": 1 if is_uncertain else 0,
         "allow_resolution_loss": res_loss_allowed,
+        "swap_proposal": swap_proposal,
     }
 
 

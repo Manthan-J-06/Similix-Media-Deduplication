@@ -346,11 +346,11 @@ class TestCraftedFourMemberClusterThreeModes:
                 "blur_flag": False,
                 "is_low_confidence": 0,
             },
-            # 2. q60: 420KB (16% saving >= 10% balanced, ssim 0.985 >= 0.98; fails aggressive 30% saving)
+            # 2. q60: 340KB (32% saving >= 30% balanced, ssim 0.985 >= 0.98)
             {
                 "id": 2,
                 "file_path": "/photos/q60.jpg",
-                "file_size": 420_000,
+                "file_size": 340_000,
                 "width": 1000,
                 "height": 1000,
                 "md5": "md5_q60",
@@ -413,9 +413,9 @@ class TestCraftedFourMemberClusterThreeModes:
         assert res_bal["keeper_id"] != res_agg["keeper_id"]
         assert res_cons["keeper_id"] != res_agg["keeper_id"]
 
-        # When allow_resolution_loss is False (default), aggressive keeps full-res file (id 1)
+        # When allow_resolution_loss is False (default), aggressive keeps full-res file (id 2)
         res_agg_default = choose_keeper(members, mode="aggressive")
-        assert res_agg_default["keeper_id"] == 1
+        assert res_agg_default["keeper_id"] == 2
 
 
 class TestAllowResolutionLoss:
@@ -603,11 +603,11 @@ class TestKeeperNeverLargerThanSameResolutionMemberItReplaces:
         Test: recommended keeper is never larger than the smallest same-resolution member it replaces.
         """
         members = [
-            # Candidate 1: High quality candidate, 1000x1000, 200KB
+            # Candidate 1: High quality candidate, 1000x1000, 300KB
             {
                 "id": 1,
                 "file_path": "/photos/original.jpg",
-                "file_size": 250_000,
+                "file_size": 300_000,
                 "width": 1000,
                 "height": 1000,
                 "md5": "md5_orig",
@@ -717,11 +717,11 @@ class TestByteIdenticalCopiesNeverStrandedInReview:
                 "pixel_ratio": 1.0,
                 "is_low_confidence": 0,
             },
-            # Smaller candidate keeper (q60, 400KB)
+            # Smaller candidate keeper (q60, 320KB, 36% saving >= 30%)
             {
                 "id": 3,
                 "file_path": "/photos/q60.jpg",
-                "file_size": 400_000,
+                "file_size": 320_000,
                 "width": 1000,
                 "height": 1000,
                 "md5": "md5_q60",
@@ -1002,4 +1002,156 @@ class TestDownscaledAnchorShowsFullresAsKeeper:
         assert orig_line.strip().startswith("YES")
         # The downscaled anchor must be no for Rec Keeper
         assert thumb_line.strip().startswith("no")
+
+
+class TestSwapProposals:
+    def test_balanced_no_longer_swaps_when_saving_under_30_pct(self):
+        """Balanced mode requires min_saving_ratio = 0.30; savings < 30% keep the reference."""
+        members = [
+            {
+                "id": 1,
+                "file_path": "/photos/orig.jpg",
+                "file_size": 100_000,
+                "width": 1024,
+                "height": 768,
+                "quality_status": "reference",
+                "ssim": 1.0,
+                "ssim_color": 1.0,
+                "pixel_ratio": 1.0,
+                "is_low_confidence": 0,
+            },
+            {
+                "id": 2,
+                "file_path": "/photos/q80.jpg",
+                "file_size": 80_000,  # 20% saving (< 30%)
+                "width": 1024,
+                "height": 768,
+                "quality_status": "aligned",
+                "ssim": 0.985,
+                "ssim_color": 0.980,
+                "pixel_ratio": 1.0,
+                "is_low_confidence": 0,
+            },
+        ]
+        res = choose_keeper(members, mode="balanced")
+        assert res["keeper_id"] == 1
+        assert res["swap_proposal"] is None
+
+    def test_aggressive_proposes_swap_with_correct_numbers(self):
+        """Aggressive mode proposes a swap when saving >= 30% with accurate numbers."""
+        members = [
+            {
+                "id": 1,
+                "file_path": "/photos/original.jpg",
+                "file_size": 100_000,
+                "width": 1024,
+                "height": 768,
+                "quality_status": "reference",
+                "ssim": 1.0,
+                "ssim_color": 1.0,
+                "pixel_ratio": 1.0,
+                "is_low_confidence": 0,
+            },
+            {
+                "id": 2,
+                "file_path": "/photos/q60.jpg",
+                "file_size": 60_000,  # 40% saving (>= 30%)
+                "width": 1024,
+                "height": 768,
+                "quality_status": "aligned",
+                "ssim": 0.95,
+                "ssim_color": 0.945,
+                "match_pct": 94.5,
+                "resolution_pct": 100.0,
+                "pixel_ratio": 1.0,
+                "is_low_confidence": 0,
+            },
+        ]
+        res = choose_keeper(members, mode="aggressive")
+        assert res["keeper_id"] == 2
+        sp = res["swap_proposal"]
+        assert sp is not None
+        assert sp["from_id"] == 1
+        assert sp["to_id"] == 2
+        assert sp["bytes_saved"] == 40_000
+        assert sp["saving_pct"] == 40.0
+        assert sp["match_pct"] == 94.5
+        assert sp["res_pct"] == 100.0
+        assert "reason" in sp and len(sp["reason"]) > 0
+        assert 1 in res["review_ids"]
+
+    def test_swap_never_exists_in_conservative(self):
+        """Conservative mode always keeps the reference, so swap_proposal is never present."""
+        members = [
+            {
+                "id": 1,
+                "file_path": "/photos/original.jpg",
+                "file_size": 100_000,
+                "width": 1024,
+                "height": 768,
+                "quality_status": "reference",
+                "ssim": 1.0,
+                "ssim_color": 1.0,
+                "pixel_ratio": 1.0,
+                "is_low_confidence": 0,
+            },
+            {
+                "id": 2,
+                "file_path": "/photos/tiny_huge_saving.jpg",
+                "file_size": 10_000,  # 90% saving
+                "width": 1024,
+                "height": 768,
+                "quality_status": "aligned",
+                "ssim": 0.99,
+                "ssim_color": 0.99,
+                "pixel_ratio": 1.0,
+                "is_low_confidence": 0,
+            },
+        ]
+        res = choose_keeper(members, mode="conservative")
+        assert res["keeper_id"] == 1
+        assert res["swap_proposal"] is None
+
+    def test_unapproved_swap_leaves_original_out_of_every_plan(self, tmp_path):
+        """
+        When aggressive mode proposes a swap, the original stays in review
+        and is omitted from the deletion plan unless explicitly approved as manual.
+        """
+        from db.connection import init_db
+        from core.ledger import plan
+
+        db_path = tmp_path / "test_ledger_swap.db"
+        conn = init_db(db_path)
+        conn.execute("INSERT INTO clusters (id, representative_id, stage_detected) VALUES (1, NULL, 3)")
+        conn.execute(
+            """
+            INSERT INTO images (
+                id, cluster_id, file_path, file_size, width, height, format, md5,
+                is_keeper, is_recommended_keeper, quality_status, ssim, ssim_color, pixel_ratio,
+                match_pct, resolution_pct, confidence
+            ) VALUES
+            (1, 1, '/photos/orig.jpg', 100000, 1024, 768, 'JPEG', 'md5_1', 0, 0, 'reference', 1.0, 1.0, 1.0, 100.0, 100.0, 1.0),
+            (2, 1, '/photos/q60.jpg', 60000, 1024, 768, 'JPEG', 'md5_2', 1, 0, 'aligned', 0.95, 0.95, 1.0, 95.0, 100.0, 0.999)
+            """
+        )
+        conn.execute("UPDATE clusters SET representative_id = 1 WHERE id = 1")
+        conn.commit()
+
+        # 1. Unapproved plan in aggressive mode:
+        summary_unapproved = plan(conn, mode="aggressive")
+        planned_ids = [e.image_id for e in summary_unapproved.entries]
+        # Original (id 1) MUST NOT be planned for deletion!
+        assert 1 not in planned_ids
+        # Keeper is 2, so 2 is also not planned for deletion
+        assert 2 not in planned_ids
+        assert summary_unapproved.file_count == 0
+
+        # 2. Approved swap plan (via approved_swap_cluster_ids or manual):
+        summary_approved = plan(conn, mode="aggressive", approved_swap_cluster_ids=[1])
+        planned_approved_ids = [e.image_id for e in summary_approved.entries]
+        assert 1 in planned_approved_ids
+        orig_entry = next(e for e in summary_approved.entries if e.image_id == 1)
+        assert orig_entry.is_manual is True
+        assert orig_entry.keeper_id == 2
+
 
