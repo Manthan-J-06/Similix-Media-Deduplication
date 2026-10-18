@@ -20,6 +20,8 @@ dependencies = [
     "open-clip-torch>=2.24.0",
     "opencv-python-headless>=4.8.0",
     "scikit-image>=0.22.0",
+    "fastapi>=0.110.0",
+    "uvicorn>=0.29.0",
 ]
 
 [project.scripts]

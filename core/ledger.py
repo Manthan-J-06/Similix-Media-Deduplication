@@ -201,6 +201,7 @@ def plan(
     approved_swap_cluster_ids: list[int] | None = None,
     config: dict | None = None,
     trash_dir: str | Path | None = None,
+    excluded_ids: list[int] | None = None,
 ) -> PlanSummary:
     """
     Plan a deletion batch without modifying any files on disk.
@@ -222,6 +223,7 @@ def plan(
 
     manual_set = set(manual_member_ids or [])
     approved_swaps = set(approved_swap_cluster_ids or [])
+    excluded_set = set(excluded_ids or [])
     requested_member_set = set(member_ids) if member_ids is not None else None
 
     # Determine clusters to inspect
@@ -302,6 +304,9 @@ def plan(
                 continue
 
             if requested_member_set is not None and mid not in requested_member_set:
+                continue
+
+            if mid in excluded_set:
                 continue
 
             is_manual = mid in manual_set

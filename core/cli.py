@@ -733,6 +733,25 @@ def cmd_show(args: argparse.Namespace) -> None:
     print("=" * 115)
 
 
+def cmd_serve(args: argparse.Namespace) -> None:
+    import uvicorn
+    from api.server import create_app
+
+    db_path = resolve_db_path(args.folder if hasattr(args, "folder") else None, args.db)
+    app = create_app(
+        db_path=db_path,
+        trash_dir=getattr(args, "trash_dir", None),
+        thumb_cache_dir=getattr(args, "thumb_cache_dir", None),
+        config_path=args.config,
+    )
+    # Strictly bind to 127.0.0.1 only
+    host = "127.0.0.1"
+    port = getattr(args, "port", 8000)
+    print(f"Starting Argus API server on http://{host}:{port} (db: {db_path})")
+    uvicorn.run(app, host=host, port=port)
+
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="argus",
@@ -832,6 +851,14 @@ def main(argv: list[str] | None = None) -> None:
     show_parser.add_argument("--db", default=None, help="Path to SQLite database file")
     show_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
 
+    serve_parser = subparsers.add_parser("serve", help="Start the Argus FastAPI server on 127.0.0.1:8000")
+    serve_parser.add_argument("folder", nargs="?", default=None, help="Path to image folder or database (optional)")
+    serve_parser.add_argument("--db", default=None, help="Path to SQLite database file")
+    serve_parser.add_argument("--port", type=int, default=8000, help="Port to bind (default: 8000)")
+    serve_parser.add_argument("--trash-dir", default=None, help="Path to trash directory")
+    serve_parser.add_argument("--thumb-cache-dir", default=None, help="Path to thumbnail cache directory")
+    serve_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
+
     args = parser.parse_args(argv)
     if args.subcommand == "scan":
         cmd_scan(args)
@@ -863,6 +890,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_list(args)
     elif args.subcommand == "show":
         cmd_show(args)
+    elif args.subcommand == "serve":
+        cmd_serve(args)
 
 
 if __name__ == "__main__":
