@@ -493,7 +493,7 @@ def predict_duplicate_confidence(
     Otherwise uses the logistic regression model trained on the tuning set.
     """
     if md5_match:
-        return 100.0
+        return 1.0
 
     global _CONFIDENCE_MODEL_CACHE
     if _CONFIDENCE_MODEL_CACHE is None:
@@ -523,7 +523,7 @@ def predict_duplicate_confidence(
 
     logit = intercept + sum(w * f for w, f in zip(weights, features))
     prob = 1.0 / (1.0 + np.exp(-logit))
-    return round(float(prob) * 100.0, 1)
+    return float(prob)
 
 
 @dataclass

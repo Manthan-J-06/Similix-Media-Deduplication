@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS images (
     quality_retained_pct REAL,                   -- % quality retained vs reference
     bytes_saved_if_deleted INTEGER DEFAULT 0,    -- bytes reclaimed if this member is deleted
     reason        TEXT,                          -- explanation for keeper / delete / review verdict
+    match_pct     REAL,                          -- color SSIM match % vs reference (100.0 for ref/exact)
+    resolution_pct REAL,                         -- pixel count % vs reference (100.0 for ref/exact)
     category_top1 TEXT,                          -- top-1 predicted category or 'uncertain'
     category_top1_prob REAL,                     -- probability of top-1 category (0.0 - 1.0)
     category_top3 TEXT,                          -- JSON array of [{"label": ..., "prob": ...}, ...]

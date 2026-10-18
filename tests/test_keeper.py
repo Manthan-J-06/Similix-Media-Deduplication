@@ -777,7 +777,7 @@ class TestFusedDuplicateConfidence:
             inlier_count=5,
             md5_match=True,
         )
-        assert conf == 100.0
+        assert conf == 1.0
 
     def test_high_similarity_high_confidence(self):
         conf = predict_duplicate_confidence(
@@ -787,7 +787,7 @@ class TestFusedDuplicateConfidence:
             inlier_count=150,
             md5_match=False,
         )
-        assert conf >= 99.0
+        assert conf >= 0.99
 
     def test_low_similarity_low_confidence(self):
         conf = predict_duplicate_confidence(
@@ -797,7 +797,7 @@ class TestFusedDuplicateConfidence:
             inlier_count=0,
             md5_match=False,
         )
-        assert conf <= 5.0
+        assert conf <= 0.05
 
 
 class TestConservativeUncertaintyPreservesByteIdentical:

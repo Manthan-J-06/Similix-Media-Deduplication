@@ -637,9 +637,73 @@ class TestQualityPipelineIntegration:
         other_id = 2 if ref_id == 1 else 1
         assert rows[ref_id]["quality_status"] == "reference"
         assert rows[ref_id]["ssim"] == 1.0
+        assert rows[ref_id]["match_pct"] == 100.0
+        assert rows[ref_id]["resolution_pct"] == 100.0
 
         assert rows[other_id]["quality_status"] == "aligned"
         assert rows[other_id]["ssim"] >= 0.90
+        assert rows[other_id]["match_pct"] is not None
+        assert rows[other_id]["resolution_pct"] == 100.0
 
         assert rows[3]["quality_status"] == "unalignable"
         assert rows[3]["ssim"] is None
+        assert rows[3]["match_pct"] is None
+
+
+class TestMatchAndResolutionPct:
+    def test_reference_exact_copy_and_rescaled_pct(self, tmp_path: Path):
+        """Verify match_pct and resolution_pct values for reference, exact copy, and rescaled/lossy member."""
+        from core.quality import run_quality_pipeline
+
+        db_path = tmp_path / "test_pct.db"
+        conn = init_db(db_path)
+
+        img_dir = tmp_path / "images"
+        img_dir.mkdir()
+
+        base = _make_rich_test_image(800, 600)
+        p_ref = img_dir / "ref.jpg"
+        base.save(p_ref, format="JPEG", quality=95)
+
+        # Exact byte copy
+        p_exact = img_dir / "exact.jpg"
+        p_exact.write_bytes(p_ref.read_bytes())
+
+        # Scaled down 50%
+        p_scale = img_dir / "scale.jpg"
+        base.resize((400, 300)).save(p_scale, format="JPEG", quality=85)
+
+        conn.execute("INSERT INTO clusters (id, stage_detected, member_count) VALUES (1, 0, 3)")
+        conn.execute(
+            """
+            INSERT INTO images (id, file_path, md5, width, height, file_size, status, cluster_id, is_keeper)
+            VALUES
+              (1, ?, 'md5_ref', 800, 600, ?, 'clustered', 1, 1),
+              (2, ?, 'md5_ref', 800, 600, ?, 'clustered', 1, 0),
+              (3, ?, 'md5_scale', 400, 300, ?, 'clustered', 1, 0)
+            """,
+            (
+                str(p_ref), p_ref.stat().st_size,
+                str(p_exact), p_exact.stat().st_size,
+                str(p_scale), p_scale.stat().st_size,
+            ),
+        )
+        conn.execute("UPDATE clusters SET representative_id = 1 WHERE id = 1")
+        conn.commit()
+
+        run_quality_pipeline(conn)
+
+        rows = {r["id"]: r for r in conn.execute("SELECT * FROM images").fetchall()}
+
+        # Reference
+        assert rows[1]["match_pct"] == 100.0
+        assert rows[1]["resolution_pct"] == 100.0
+
+        # Exact copy
+        assert rows[2]["match_pct"] == 100.0
+        assert rows[2]["resolution_pct"] == 100.0
+
+        # Scaled copy: resolution_pct is pixel_ratio * 100 = (400*300)/(800*600)*100 = 25.0%
+        assert rows[3]["resolution_pct"] == 25.0
+        assert rows[3]["match_pct"] is not None
+        assert 80.0 <= rows[3]["match_pct"] <= 100.0

@@ -903,9 +903,9 @@ def update_cluster_duplicate_confidences(
         if not rep:
             continue
 
-        # Representative is anchor -> 100.0
+        # Representative is anchor -> 1.0
         conn.execute(
-            "UPDATE images SET confidence = 100.0 WHERE id = ?",
+            "UPDATE images SET confidence = 1.0 WHERE id = ?",
             (rep_id,),
         )
 
@@ -925,7 +925,7 @@ def update_cluster_duplicate_confidences(
             mid = m["id"]
             is_md5 = (m["md5"] == rep["md5"]) or (m["link_signal"] == "md5")
             if is_md5:
-                conf = 100.0
+                conf = 1.0
             else:
                 # 1. pHash distance
                 if rep["phash"] and m["phash"]:

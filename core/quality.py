@@ -75,6 +75,8 @@ class MemberQualityRecord:
     height: int
     file_size: int
     source_likelihood: float | None = None
+    match_pct: float | None = None
+    resolution_pct: float | None = None
 
 
 @dataclass
@@ -1161,6 +1163,8 @@ def ensure_quality_columns(conn: sqlite3.Connection) -> None:
         ("quality_status", "TEXT"),
         ("jpeg_quality_est", "INTEGER"),
         ("source_likelihood", "REAL"),
+        ("match_pct", "REAL"),
+        ("resolution_pct", "REAL"),
     ]
     for col_name, col_def in cols_to_add:
         if col_name not in existing_cols:
@@ -1290,6 +1294,8 @@ def run_quality_pipeline(
                 pixel_ratio = 1.0,
                 bytes_ratio = 1.0,
                 quality_status = 'reference',
+                match_pct = 100.0,
+                resolution_pct = 100.0,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
             WHERE id = ?
             """,
@@ -1312,6 +1318,8 @@ def run_quality_pipeline(
                 height=ref_orig[1],
                 file_size=ref_sz,
                 source_likelihood=ref_member.get("source_likelihood"),
+                match_pct=100.0,
+                resolution_pct=100.0,
             )
         )
 
@@ -1339,6 +1347,14 @@ def run_quality_pipeline(
                 source=source,
             )
 
+            is_exact_copy = bool(m.get("md5") and m.get("md5") == ref_member.get("md5"))
+            if is_exact_copy:
+                match_pct = 100.0
+                resolution_pct = 100.0
+            else:
+                match_pct = round(metrics.ssim_color * 100.0, 1) if metrics.ssim_color is not None else None
+                resolution_pct = round(metrics.pixel_ratio * 100.0, 1) if metrics.pixel_ratio is not None else None
+
             conn.execute(
                 """
                 UPDATE images
@@ -1348,6 +1364,8 @@ def run_quality_pipeline(
                     pixel_ratio = ?,
                     bytes_ratio = ?,
                     quality_status = ?,
+                    match_pct = ?,
+                    resolution_pct = ?,
                     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
                 WHERE id = ?
                 """,
@@ -1358,6 +1376,8 @@ def run_quality_pipeline(
                     metrics.pixel_ratio,
                     metrics.bytes_ratio,
                     metrics.quality_status,
+                    match_pct,
+                    resolution_pct,
                     mid,
                 ),
             )
@@ -1384,6 +1404,8 @@ def run_quality_pipeline(
                     height=m_orig[1],
                     file_size=m_sz,
                     source_likelihood=m.get("source_likelihood"),
+                    match_pct=match_pct,
+                    resolution_pct=resolution_pct,
                 )
             )
 

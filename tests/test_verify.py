@@ -441,8 +441,8 @@ class TestFusedDuplicateConfidenceIntegration:
         conf_high = conn.execute("SELECT confidence FROM images WHERE id = 3").fetchone()[0]
         conf_low = conn.execute("SELECT confidence FROM images WHERE id = 4").fetchone()[0]
 
-        assert conf_rep == 100.0
-        assert conf_exact == 100.0
-        assert conf_high >= 99.0
-        assert conf_low <= 15.0
+        assert conf_rep == 1.0
+        assert conf_exact == 1.0
+        assert conf_high >= 0.99
+        assert conf_low <= 0.15
 

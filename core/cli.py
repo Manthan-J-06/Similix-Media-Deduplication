@@ -617,6 +617,78 @@ def cmd_list(args: argparse.Namespace) -> None:
     print("=" * 100)
 
 
+def cmd_show(args: argparse.Namespace) -> None:
+    cfg = load_config(args.config)
+    db_path = args.db
+    if not db_path and getattr(args, "folder", None):
+        target = Path(args.folder).expanduser().resolve()
+        if target.is_file() and target.suffix == ".db":
+            db_path = str(target)
+        elif target.with_suffix(".db").is_file():
+            db_path = str(target.with_suffix(".db"))
+        elif (target / "argus.db").is_file():
+            db_path = str(target / "argus.db")
+        elif (target / "demo.db").is_file():
+            db_path = str(target / "demo.db")
+        elif (target.parent / f"{target.name}.db").is_file():
+            db_path = str(target.parent / f"{target.name}.db")
+        else:
+            db_path = str(target)
+    if not db_path:
+        db_path = cfg.get("general", {}).get("db_path", "argus.db")
+    conn = init_db(db_path)
+
+    clusters = conn.execute(
+        """
+        SELECT c.id, c.representative_id, c.stage_detected, c.member_count,
+               r.file_path AS rep_path
+        FROM clusters c
+        LEFT JOIN images r ON c.representative_id = r.id
+        ORDER BY c.id
+        """
+    ).fetchall()
+
+    if not clusters:
+        print(f"No clusters found in database: {db_path}")
+        return
+
+    print("=" * 105)
+    print(f"  ARGUS Duplicate Clusters Summary: {db_path} ({len(clusters)} clusters)")
+    print("=" * 105)
+
+    for c in clusters:
+        cid = c["id"]
+        members = conn.execute(
+            """
+            SELECT id, file_path, file_size, width, height, match_pct, resolution_pct,
+                   confidence, is_keeper, is_recommended_keeper, delete_safe, review_flag, quality_status
+            FROM images
+            WHERE cluster_id = ?
+            ORDER BY is_keeper DESC, id ASC
+            """,
+            (cid,),
+        ).fetchall()
+
+        print(f"\nCluster {cid} ({len(members)} members):")
+        header = f"  {'Keeper':<6} | {'Match %':<8} | {'Res %':<8} | {'Confidence':<10} | {'Size':<10} | {'File'}"
+        print(header)
+        print("  " + "-" * 100)
+
+        for m in members:
+            d = dict(m)
+            keeper_str = "YES" if (d.get("is_keeper") or d.get("is_recommended_keeper")) else "no"
+            match_str = f"{d['match_pct']:.1f}%" if d.get("match_pct") is not None else "N/A"
+            res_str = f"{d['resolution_pct']:.1f}%" if d.get("resolution_pct") is not None else "N/A"
+            conf = d.get("confidence")
+            conf_str = f"{conf:.4f}" if conf is not None else "N/A"
+            sz_kb = f"{(d.get('file_size') or 0) / 1024:.1f} KB"
+            fname = Path(d["file_path"]).name
+
+            print(f"  {keeper_str:<6} | {match_str:>8} | {res_str:>8} | {conf_str:>10} | {sz_kb:>10} | {fname}")
+
+    print("\n" + "=" * 105)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="argus",
@@ -705,6 +777,11 @@ def main(argv: list[str] | None = None) -> None:
     list_parser.add_argument("--db", default=None, help="Path to SQLite database file")
     list_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
 
+    show_parser = subparsers.add_parser("show", help="Show duplicate cluster members with match_pct, resolution_pct, and confidence")
+    show_parser.add_argument("folder", nargs="?", default=None, help="Path to image folder or database (optional)")
+    show_parser.add_argument("--db", default=None, help="Path to SQLite database file")
+    show_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
+
     args = parser.parse_args(argv)
     if args.subcommand == "scan":
         cmd_scan(args)
@@ -734,6 +811,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_search(args)
     elif args.subcommand == "list":
         cmd_list(args)
+    elif args.subcommand == "show":
+        cmd_show(args)
 
 
 if __name__ == "__main__":
