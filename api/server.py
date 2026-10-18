@@ -116,6 +116,15 @@ def create_app(
     app.state.thumb_cache_dir = resolved_thumb_cache_dir
     app.state.config = config
 
+    ui_file = Path(__file__).resolve().parent.parent / "ui" / "index.html"
+
+    @app.get("/")
+    def serve_ui():
+        """Serve the single-file Argus web UI."""
+        if not ui_file.is_file():
+            raise HTTPException(status_code=404, detail="UI index.html not found")
+        return FileResponse(str(ui_file), media_type="text/html")
+
     @app.get("/clusters")
     def list_clusters(
         mode: str = Query("conservative"),
@@ -199,6 +208,7 @@ def create_app(
                     "format": keeper_m["format"] if keeper_m else "",
                 },
                 "savings_bytes": savings_bytes,
+                "reclaimable_bytes": savings_bytes,
                 "savings_ratio": savings_ratio,
                 "member_count": len(member_dicts),
                 "delete_safe_count": len(del_safe_ids),

@@ -1,0 +1,1498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Argus — Image Deduplication</title>
+  <style>
+    :root {
+      --bg: #f8fafc;
+      --panel-bg: #ffffff;
+      --border: #e2e8f0;
+      --text: #0f172a;
+      --text-muted: #64748b;
+      --primary: #2563eb;
+      --primary-hover: #1d4ed8;
+      --success: #10b981;
+      --success-bg: #ecfdf5;
+      --success-border: #a7f3d0;
+      --warning: #f59e0b;
+      --warning-bg: #fffbeb;
+      --warning-border: #fde68a;
+      --danger: #ef4444;
+      --danger-bg: #fef2f2;
+      --danger-border: #fecaca;
+      --card-shadow: 0 1px 3px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.04);
+      --chip-bg: #f1f5f9;
+      --chip-border: #cbd5e1;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0f172a;
+        --panel-bg: #1e293b;
+        --border: #334155;
+        --text: #f8fafc;
+        --text-muted: #94a3b8;
+        --primary: #3b82f6;
+        --primary-hover: #60a5fa;
+        --success: #34d399;
+        --success-bg: #064e3b;
+        --success-border: #047857;
+        --warning: #fbbf24;
+        --warning-bg: #78350f;
+        --warning-border: #b45309;
+        --danger: #f87171;
+        --danger-bg: #7f1d1d;
+        --danger-border: #b91c1c;
+        --card-shadow: 0 1px 4px rgba(0,0,0,0.4);
+        --chip-bg: #334155;
+        --chip-border: #475569;
+      }
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* Top Bar */
+    header {
+      background: var(--panel-bg);
+      border-bottom: 1px solid var(--border);
+      padding: 10px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-shrink: 0;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 700;
+      font-size: 1.15rem;
+      letter-spacing: -0.5px;
+    }
+    .brand-icon {
+      width: 26px;
+      height: 26px;
+      background: var(--primary);
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #fff;
+      font-size: 14px;
+    }
+
+    /* Mode Slider / Switcher */
+    .mode-slider-wrap {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--chip-bg);
+      border: 1px solid var(--border);
+      padding: 4px;
+      border-radius: 8px;
+    }
+    .mode-slider-label {
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: var(--text-muted);
+      padding-left: 6px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .segmented-control {
+      display: flex;
+      gap: 2px;
+    }
+    .mode-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      font-size: 0.82rem;
+      font-weight: 500;
+      padding: 5px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .mode-btn:hover { color: var(--text); }
+    .mode-btn.active {
+      background: var(--panel-bg);
+      color: var(--primary);
+      font-weight: 600;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+
+    /* Header Actions */
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .btn {
+      background: var(--panel-bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 6px 14px;
+      border-radius: 6px;
+      font-size: 0.85rem;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .btn:hover { background: var(--chip-bg); }
+    .btn-primary {
+      background: var(--primary);
+      color: #ffffff;
+      border-color: var(--primary);
+    }
+    .btn-primary:hover { background: var(--primary-hover); }
+    .btn-danger {
+      background: var(--danger);
+      color: #ffffff;
+      border-color: var(--danger);
+    }
+
+    /* App Layout */
+    .app-main {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    /* Left Sidebar: Cluster List */
+    .sidebar {
+      width: 380px;
+      min-width: 320px;
+      max-width: 440px;
+      background: var(--panel-bg);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      flex-shrink: 0;
+    }
+    .sidebar-controls {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      background: var(--panel-bg);
+    }
+    .search-row {
+      position: relative;
+      display: flex;
+      align-items: center;
+    }
+    .search-input {
+      width: 100%;
+      padding: 7px 30px 7px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--chip-bg);
+      color: var(--text);
+      font-size: 0.85rem;
+      outline: none;
+    }
+    .search-input:focus { border-color: var(--primary); }
+    .search-clear {
+      position: absolute;
+      right: 8px;
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      font-size: 14px;
+      display: none;
+    }
+    .filter-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .filter-select {
+      background: var(--chip-bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-size: 0.8rem;
+      padding: 4px 8px;
+      border-radius: 6px;
+      outline: none;
+      cursor: pointer;
+      flex: 1;
+    }
+    .checkbox-label {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .cluster-list-container {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px;
+    }
+    .cluster-item {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px;
+      border-radius: 8px;
+      border: 1px solid transparent;
+      cursor: pointer;
+      margin-bottom: 6px;
+      transition: background 0.15s ease, border-color 0.15s ease;
+      background: var(--panel-bg);
+    }
+    .cluster-item:hover {
+      background: var(--chip-bg);
+    }
+    .cluster-item.active {
+      background: var(--chip-bg);
+      border-color: var(--primary);
+    }
+    .cluster-thumb-box {
+      width: 64px;
+      height: 64px;
+      border-radius: 6px;
+      background: #000;
+      overflow: hidden;
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .cluster-thumb-box img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+    .cluster-info {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .cluster-title-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+    }
+    .cluster-title {
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .cluster-copies {
+      font-size: 0.78rem;
+      color: var(--text-muted);
+      font-weight: 500;
+    }
+    .cluster-reclaimable {
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: var(--success);
+    }
+    .cluster-badges {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .chip {
+      font-size: 0.7rem;
+      font-weight: 500;
+      padding: 2px 6px;
+      border-radius: 4px;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .chip-review {
+      background: var(--warning-bg);
+      color: var(--warning);
+      border: 1px solid var(--warning-border);
+    }
+    .chip-category {
+      background: var(--chip-bg);
+      color: var(--text-muted);
+      border: 1px solid var(--chip-border);
+    }
+    .chip-swap {
+      background: #eff6ff;
+      color: #3b82f6;
+      border: 1px solid #bfdbfe;
+    }
+    @media (prefers-color-scheme: dark) {
+      .chip-swap {
+        background: #1e3a8a;
+        color: #93c5fd;
+        border-color: #2563eb;
+      }
+    }
+
+    /* Right Main Panel: Cluster Detail */
+    .detail-panel {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow-y: auto;
+      background: var(--bg);
+      padding: 20px;
+      gap: 16px;
+    }
+    .detail-header {
+      background: var(--panel-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+      box-shadow: var(--card-shadow);
+    }
+    .detail-meta {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .detail-title {
+      font-size: 1.1rem;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .detail-subtitle {
+      font-size: 0.82rem;
+      color: var(--text-muted);
+    }
+    .detail-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    /* Swap Proposal Banner */
+    .swap-banner {
+      background: var(--warning-bg);
+      border: 1px solid var(--warning-border);
+      border-radius: 8px;
+      padding: 14px 18px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      box-shadow: var(--card-shadow);
+    }
+    .swap-banner-text {
+      font-size: 0.88rem;
+      font-weight: 500;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .swap-banner-text span.bolt {
+      font-size: 18px;
+    }
+    .swap-banner-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+    .btn-approve {
+      background: var(--primary);
+      color: #fff;
+      border: none;
+      padding: 5px 12px;
+      border-radius: 6px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .btn-skip {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      padding: 5px 12px;
+      border-radius: 6px;
+      font-size: 0.8rem;
+      cursor: pointer;
+    }
+
+    /* Member Copies Grid */
+    .member-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      gap: 16px;
+    }
+    .member-card {
+      background: var(--panel-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      box-shadow: var(--card-shadow);
+      position: relative;
+      transition: transform 0.15s ease;
+    }
+    .member-card:hover {
+      transform: translateY(-2px);
+    }
+
+    /* Glowing outline for Recommended Keeper */
+    @keyframes keeper-glow {
+      0% {
+        box-shadow: 0 0 6px rgba(16, 185, 129, 0.5), inset 0 0 2px rgba(16, 185, 129, 0.3);
+        border-color: #10b981;
+      }
+      50% {
+        box-shadow: 0 0 18px rgba(16, 185, 129, 0.85), inset 0 0 6px rgba(16, 185, 129, 0.5);
+        border-color: #34d399;
+      }
+      100% {
+        box-shadow: 0 0 6px rgba(16, 185, 129, 0.5), inset 0 0 2px rgba(16, 185, 129, 0.3);
+        border-color: #10b981;
+      }
+    }
+    .member-card.is-keeper {
+      animation: keeper-glow 2.5s infinite ease-in-out;
+      border: 2px solid #10b981;
+    }
+
+    .member-thumb-wrap {
+      width: 100%;
+      height: 200px;
+      background: #000;
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+    .member-thumb-wrap img {
+      max-width: 100%;
+      max-height: 100%;
+      object-fit: contain;
+    }
+    .card-top-badges {
+      position: absolute;
+      top: 8px;
+      left: 8px;
+      display: flex;
+      gap: 6px;
+      align-items: center;
+    }
+    .badge-recommended {
+      background: #10b981;
+      color: #ffffff;
+      font-size: 0.72rem;
+      font-weight: 700;
+      padding: 3px 8px;
+      border-radius: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      cursor: help;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+    }
+    .badge-verified {
+      background: rgba(0, 0, 0, 0.65);
+      backdrop-filter: blur(4px);
+      color: #38bdf8;
+      font-size: 0.72rem;
+      font-weight: 600;
+      padding: 3px 6px;
+      border-radius: 4px;
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      cursor: help;
+    }
+
+    .card-content {
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      flex: 1;
+    }
+    .card-filename {
+      font-size: 0.85rem;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .metrics-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 0.8rem;
+    }
+    .metric-item {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      cursor: help;
+      border-bottom: 1px dotted var(--text-muted);
+    }
+    .metric-val {
+      font-weight: 600;
+      color: var(--text);
+    }
+    .status-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-top: auto;
+      padding-top: 6px;
+    }
+    .chip-status {
+      font-size: 0.75rem;
+      font-weight: 600;
+      padding: 3px 8px;
+      border-radius: 4px;
+    }
+    .chip-status-keep {
+      background: var(--success-bg);
+      color: var(--success);
+      border: 1px solid var(--success-border);
+    }
+    .chip-status-delete {
+      background: var(--danger-bg);
+      color: var(--danger);
+      border: 1px solid var(--danger-border);
+    }
+    .chip-status-review {
+      background: var(--warning-bg);
+      color: var(--warning);
+      border: 1px solid var(--warning-border);
+    }
+    .btn-file-trash {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--danger);
+      font-size: 0.75rem;
+      font-weight: 500;
+      padding: 3px 8px;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .btn-file-trash:hover {
+      background: var(--danger-bg);
+    }
+
+    /* Modals */
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.6);
+      backdrop-filter: blur(2px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+      padding: 16px;
+    }
+    .modal-box {
+      background: var(--panel-bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      width: 100%;
+      max-width: 600px;
+      max-height: 85vh;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.3);
+      overflow: hidden;
+    }
+    .modal-header {
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .modal-title {
+      font-size: 1.05rem;
+      font-weight: 700;
+    }
+    .modal-body {
+      padding: 20px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .modal-footer {
+      padding: 14px 20px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 10px;
+    }
+    .modal-notice {
+      background: var(--warning-bg);
+      border: 1px solid var(--warning-border);
+      color: var(--text);
+      padding: 10px 14px;
+      border-radius: 6px;
+      font-size: 0.88rem;
+      font-weight: 500;
+    }
+    .file-plan-list {
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      max-height: 220px;
+      overflow-y: auto;
+      font-size: 0.8rem;
+    }
+    .file-plan-item {
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .file-plan-item:last-child { border-bottom: none; }
+    .file-plan-path {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-family: monospace;
+    }
+
+    /* History Table */
+    .history-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.82rem;
+    }
+    .history-table th, .history-table td {
+      padding: 8px 10px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    .history-table th {
+      background: var(--chip-bg);
+      font-weight: 600;
+    }
+
+    /* Empty states */
+    .empty-state {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      color: var(--text-muted);
+      gap: 12px;
+      padding: 40px;
+      text-align: center;
+    }
+
+    /* Responsive Mobile Breakpoint (< 768px) */
+    @media (max-width: 768px) {
+      .app-main {
+        flex-direction: column;
+      }
+      .sidebar {
+        width: 100%;
+        max-width: 100%;
+        height: 40vh;
+        border-right: none;
+        border-bottom: 1px solid var(--border);
+      }
+      .detail-panel {
+        height: 60vh;
+      }
+      header {
+        flex-wrap: wrap;
+        padding: 8px 12px;
+      }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Top App Header -->
+  <header>
+    <div class="brand">
+      <div class="brand-icon">A</div>
+      <span>ARGUS</span>
+    </div>
+
+    <!-- Mode Slider (Conservative / Balanced / Aggressive) -->
+    <div class="mode-slider-wrap" id="mode-slider">
+      <span class="mode-slider-label">Mode:</span>
+      <div class="segmented-control">
+        <button type="button" class="mode-btn active" data-mode="conservative" id="mode-conservative">Conservative</button>
+        <button type="button" class="mode-btn" data-mode="balanced" id="mode-balanced">Balanced</button>
+        <button type="button" class="mode-btn" data-mode="aggressive" id="mode-aggressive">Aggressive</button>
+      </div>
+    </div>
+
+    <div class="header-actions">
+      <button type="button" class="btn" id="btn-open-history">📜 History</button>
+    </div>
+  </header>
+
+  <!-- Main View -->
+  <div class="app-main">
+
+    <!-- Left Column: Cluster List -->
+    <aside class="sidebar" id="cluster-list-panel">
+      <div class="sidebar-controls">
+        <div class="search-row">
+          <input type="text" class="search-input" id="search-input" placeholder="Search images by content...">
+          <button type="button" class="search-clear" id="search-clear">&times;</button>
+        </div>
+        <div class="filter-row">
+          <select class="filter-select" id="category-filter">
+            <option value="">All Categories</option>
+          </select>
+          <select class="filter-select" id="sort-select">
+            <option value="savings">Sort: Savings</option>
+            <option value="count">Sort: Copies</option>
+            <option value="id">Sort: Cluster ID</option>
+          </select>
+        </div>
+        <div class="filter-row">
+          <label class="checkbox-label">
+            <input type="checkbox" id="has-savings-toggle"> Has savings only
+          </label>
+        </div>
+      </div>
+
+      <!-- Cluster List items -->
+      <div class="cluster-list-container" id="cluster-list">
+        <!-- Rendered via JS -->
+      </div>
+    </aside>
+
+    <!-- Right Panel: Cluster Detail & Copies -->
+    <main class="detail-panel" id="cluster-detail-panel">
+      <div class="empty-state" id="detail-empty">
+        <p>Select a duplicate cluster on the left to review copies.</p>
+      </div>
+
+      <div id="detail-content" style="display:none; flex-direction:column; gap:16px;">
+        <!-- Detail Header -->
+        <div class="detail-header">
+          <div class="detail-meta">
+            <div class="detail-title">
+              <span id="detail-cluster-title">Cluster #1</span>
+              <span class="chip chip-category" id="detail-cluster-category">Landscape</span>
+            </div>
+            <div class="detail-subtitle">
+              <span id="detail-member-count">6 copies</span> &bull; 
+              Reclaimable now: <strong class="cluster-reclaimable" id="detail-reclaimable-total">50.5 KB</strong>
+            </div>
+          </div>
+          <div class="detail-actions">
+            <button type="button" class="btn" id="btn-select-safe">Select all safe copies</button>
+            <button type="button" class="btn btn-danger" id="btn-plan-deletion">Move to trash</button>
+          </div>
+        </div>
+
+        <!-- Swap Proposal Banner -->
+        <div class="swap-banner" id="swap-proposal-banner" style="display:none;">
+          <div class="swap-banner-text">
+            <span class="bolt">⚡</span>
+            <span id="swap-banner-desc">Replace original with smaller keeper</span>
+          </div>
+          <div class="swap-banner-actions">
+            <button type="button" class="btn-approve" id="btn-swap-approve">Approve</button>
+            <button type="button" class="btn-skip" id="btn-swap-skip">Skip</button>
+          </div>
+        </div>
+
+        <!-- Members Grid -->
+        <div class="member-grid" id="member-grid">
+          <!-- Member Cards Rendered via JS -->
+        </div>
+      </div>
+    </main>
+
+  </div>
+
+  <!-- Confirm Deletion Modal Screen (Built from POST /plan) -->
+  <div class="modal-backdrop" id="confirm-modal">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3 class="modal-title">Confirm Move to Trash</h3>
+        <button type="button" class="btn" id="btn-close-modal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <!-- Sentence required by spec -->
+        <div class="modal-notice">
+          <strong>Files are moved to trash and can be undone.</strong>
+        </div>
+
+        <div style="font-size:0.9rem;">
+          <p>Batch ID: <code id="plan-batch-id">batch_...</code></p>
+          <p style="margin-top:4px;">
+            Total files: <strong id="plan-file-count">0</strong> &bull; 
+            Total space to free: <strong class="cluster-reclaimable" id="plan-bytes-freed">0 KB</strong>
+          </p>
+        </div>
+
+        <div class="file-plan-list" id="plan-file-list">
+          <!-- Files listed here -->
+        </div>
+
+        <div id="apply-success-box" style="display:none; font-size:0.9rem; color:var(--success);">
+          <p><strong>✓ Files successfully moved to trash.</strong></p>
+          <div style="margin-top:10px; display:flex; gap:10px;">
+            <button type="button" class="btn" id="btn-undo-apply">↺ Undo This Deletion</button>
+            <button type="button" class="btn" id="btn-view-history">View History</button>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer" id="modal-footer-actions">
+        <button type="button" class="btn" id="btn-cancel-modal">Cancel</button>
+        <button type="button" class="btn btn-danger" id="btn-confirm-apply">Confirm & Move</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- History Modal Screen -->
+  <div class="modal-backdrop" id="history-modal">
+    <div class="modal-box" style="max-width:750px;">
+      <div class="modal-header">
+        <h3 class="modal-title">Deletion Batch History</h3>
+        <button type="button" class="btn" id="btn-close-history">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div id="history-loading" style="text-align:center; padding:20px;">Loading history...</div>
+        <table class="history-table" id="history-table" style="display:none;">
+          <thead>
+            <tr>
+              <th>Batch ID</th>
+              <th>Date</th>
+              <th>Mode</th>
+              <th>Files</th>
+              <th>Reclaimed</th>
+              <th>Status</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="history-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // State management
+    let currentMode = "conservative";
+    let activeClusterId = null;
+    let clustersData = [];
+    let currentClusterData = null;
+    let selectedImageIds = new Set();
+    let approvedSwapClusterIds = new Set();
+    let currentPlannedBatchId = null;
+
+    // Helper: format bytes
+    function formatBytes(bytes) {
+      if (!bytes || bytes <= 0) return "0 KB";
+      const kb = bytes / 1024;
+      if (kb < 1024) return kb.toFixed(1) + " KB";
+      return (kb / 1024).toFixed(2) + " MB";
+    }
+
+    // Helper: safe filename
+    function getBasename(filePath) {
+      if (!filePath) return "";
+      const parts = filePath.split(/[/\\]/);
+      return parts[parts.length - 1];
+    }
+
+    // Load Categories for filter
+    async function loadCategories() {
+      try {
+        const res = await fetch("/categories");
+        if (!res.ok) return;
+        const cats = await res.json();
+        const sel = document.getElementById("category-filter");
+        sel.innerHTML = '<option value="">All Categories</option>';
+        for (const [name, count] of Object.entries(cats)) {
+          const opt = document.createElement("option");
+          opt.value = name;
+          opt.textContent = `${name} (${count})`;
+          sel.appendChild(opt);
+        }
+      } catch (err) {
+        console.error("Failed to load categories:", err);
+      }
+    }
+
+    // Load Cluster List
+    async function loadClusters() {
+      const cat = document.getElementById("category-filter").value;
+      const sort = document.getElementById("sort-select").value;
+      const hasSavings = document.getElementById("has-savings-toggle").checked;
+
+      let url = `/clusters?mode=${encodeURIComponent(currentMode)}&sort=${encodeURIComponent(sort)}`;
+      if (cat) url += `&category=${encodeURIComponent(cat)}`;
+
+      try {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error("Failed to load clusters");
+        let clusters = await res.json();
+
+        if (hasSavings) {
+          clusters = clusters.filter(c => (c.reclaimable_bytes || c.savings_bytes || 0) > 0);
+        }
+
+        clustersData = clusters;
+        renderClusterList(clusters);
+
+        // If no active cluster or active is not in list, pick first
+        if (clusters.length > 0) {
+          if (!activeClusterId || !clusters.some(c => c.id === activeClusterId)) {
+            selectCluster(clusters[0].id);
+          } else {
+            // Re-fetch current active cluster live
+            selectCluster(activeClusterId);
+          }
+        } else {
+          activeClusterId = null;
+          document.getElementById("detail-empty").style.display = "flex";
+          document.getElementById("detail-content").style.display = "none";
+        }
+      } catch (err) {
+        console.error("Failed to fetch clusters:", err);
+      }
+    }
+
+    // Render left sidebar clusters
+    function renderClusterList(clusters) {
+      const container = document.getElementById("cluster-list");
+      container.innerHTML = "";
+
+      if (clusters.length === 0) {
+        container.innerHTML = '<div style="padding:24px; text-align:center; color:var(--text-muted); font-size:0.85rem;">No duplicate clusters found.</div>';
+        return;
+      }
+
+      clusters.forEach(c => {
+        const item = document.createElement("div");
+        item.className = `cluster-item ${c.id === activeClusterId ? "active" : ""}`;
+        item.dataset.clusterId = c.id;
+
+        const thumbUrl = c.keeper && c.keeper.id ? `/thumb/${c.keeper.id}?size=96` : "";
+        const reclaimableText = formatBytes(c.reclaimable_bytes || c.savings_bytes || 0);
+
+        item.innerHTML = `
+          <div class="cluster-thumb-box">
+            ${thumbUrl ? `<img src="${thumbUrl}" alt="Keeper thumb" loading="lazy">` : ""}
+          </div>
+          <div class="cluster-info">
+            <div class="cluster-title-row">
+              <span class="cluster-title">Cluster #${c.id}</span>
+              <span class="cluster-copies">${c.member_count} copies</span>
+            </div>
+            <div class="cluster-reclaimable">Reclaimable now: ${reclaimableText}</div>
+            <div class="cluster-badges">
+              ${c.review_count > 0 ? `<span class="chip chip-review">${c.review_count} need review</span>` : ""}
+              ${c.category ? `<span class="chip chip-category">${c.category}</span>` : ""}
+              ${c.has_swap_proposal ? `<span class="chip chip-swap">⚡ Swap</span>` : ""}
+            </div>
+          </div>
+        `;
+
+        item.addEventListener("click", () => selectCluster(c.id));
+        container.appendChild(item);
+      });
+    }
+
+    // Select and load active cluster
+    async function selectCluster(clusterId) {
+      activeClusterId = clusterId;
+
+      // Update active highlight in left list
+      document.querySelectorAll(".cluster-item").forEach(el => {
+        el.classList.toggle("active", parseInt(el.dataset.clusterId, 10) === clusterId);
+      });
+
+      try {
+        const res = await fetch(`/clusters/${clusterId}?mode=${encodeURIComponent(currentMode)}`);
+        if (!res.ok) throw new Error("Failed to load cluster details");
+        const data = await res.json();
+        currentClusterData = data;
+        renderClusterDetail(data);
+      } catch (err) {
+        console.error("Failed to load cluster:", err);
+      }
+    }
+
+    // Render cluster detail panel
+    function renderClusterDetail(data) {
+      document.getElementById("detail-empty").style.display = "none";
+      const content = document.getElementById("detail-content");
+      content.style.display = "flex";
+
+      document.getElementById("detail-cluster-title").textContent = `Cluster #${data.id}`;
+      const catEl = document.getElementById("detail-cluster-category");
+      if (data.category) {
+        catEl.textContent = data.category;
+        catEl.style.display = "inline-flex";
+      } else {
+        catEl.style.display = "none";
+      }
+
+      document.getElementById("detail-member-count").textContent = `${data.members.length} copies`;
+
+      // Calculate reclaimable now
+      const deleteSafeMembers = data.members.filter(m => m.delete_safe);
+      const totalReclaimable = deleteSafeMembers.reduce((sum, m) => sum + (m.size || 0), 0);
+      document.getElementById("detail-reclaimable-total").textContent = formatBytes(totalReclaimable);
+
+      // Reset selection to default (all delete-safe copies selected by default)
+      selectedImageIds.clear();
+      deleteSafeMembers.forEach(m => selectedImageIds.add(m.id));
+
+      // Swap Proposal Banner
+      const swapBanner = document.getElementById("swap-proposal-banner");
+      const swapDesc = document.getElementById("swap-banner-desc");
+      const btnApprove = document.getElementById("btn-swap-approve");
+      const btnSkip = document.getElementById("btn-swap-skip");
+
+      if (data.swap_proposal) {
+        const sp = data.swap_proposal;
+        swapBanner.style.display = "flex";
+
+        const isApproved = approvedSwapClusterIds.has(data.id);
+        if (isApproved) {
+          swapDesc.innerHTML = `<strong>✓ Swap approved:</strong> Replace original with smaller keeper (${formatBytes(sp.bytes_saved)} saved, ${sp.match_pct}% match)`;
+          btnApprove.style.display = "none";
+          btnSkip.textContent = "Revert to Original";
+          btnSkip.style.display = "inline-block";
+        } else {
+          // Find filenames
+          const fromMember = data.members.find(m => m.id === sp.from_id);
+          const toMember = data.members.find(m => m.id === sp.to_id);
+          const fromName = fromMember ? getBasename(fromMember.file_path) : "original";
+          const toName = toMember ? getBasename(toMember.file_path) : "keeper";
+
+          swapDesc.textContent = `Replace original (${formatBytes(fromMember ? fromMember.size : 0)}) with ${toName} (${formatBytes(toMember ? toMember.size : 0)}) — saves ${formatBytes(sp.bytes_saved)}, ${sp.match_pct}% match`;
+          btnApprove.textContent = "Approve";
+          btnApprove.style.display = "inline-block";
+          btnSkip.textContent = "Skip";
+          btnSkip.style.display = "inline-block";
+        }
+
+        btnApprove.onclick = () => {
+          approvedSwapClusterIds.add(data.id);
+          selectCluster(data.id);
+        };
+        btnSkip.onclick = () => {
+          approvedSwapClusterIds.delete(data.id);
+          selectCluster(data.id);
+        };
+      } else {
+        swapBanner.style.display = "none";
+      }
+
+      // Render Member Copies Grid
+      const grid = document.getElementById("member-grid");
+      grid.innerHTML = "";
+
+      data.members.forEach(m => {
+        const card = document.createElement("div");
+        card.className = `member-card ${m.is_recommended_keeper ? "is-keeper" : ""}`;
+
+        // Status Chip
+        let statusHtml = "";
+        if (m.is_recommended_keeper) {
+          statusHtml = `<span class="chip-status chip-status-keep">Keep</span>`;
+        } else if (m.delete_safe) {
+          statusHtml = `<span class="chip-status chip-status-delete">Safe to delete</span>`;
+        } else {
+          statusHtml = `<span class="chip-status chip-status-review">Needs review</span>`;
+        }
+
+        // Verified Badge
+        const confPct = m.confidence !== null ? (m.confidence * 100).toFixed(1) : "100.0";
+        const verifiedHtml = `<span class="badge-verified" title="Verified duplicate (${confPct}% confidence)">✓ verified</span>`;
+
+        // Recommended label
+        const recHtml = m.is_recommended_keeper
+          ? `<span class="badge-recommended" title="${m.reason || 'Recommended keeper'}">Recommended</span>`
+          : "";
+
+        const fname = getBasename(m.file_path);
+        const matchStr = m.match_pct !== null ? `${m.match_pct}%` : "100.0%";
+        const resStr = m.resolution_pct !== null ? `${m.resolution_pct}%` : "100.0%";
+
+        const isChecked = selectedImageIds.has(m.id);
+
+        card.innerHTML = `
+          <div class="member-thumb-wrap">
+            <img src="/thumb/${m.id}?size=320" alt="${fname}" loading="lazy">
+            <div class="card-top-badges">
+              ${recHtml}
+              ${verifiedHtml}
+            </div>
+          </div>
+          <div class="card-content">
+            <div class="card-filename" title="${m.file_path}">${fname}</div>
+            <div class="metrics-row">
+              <span class="metric-item" title="how close this copy is to the original after alignment">
+                Match <span class="metric-val">${matchStr}</span>
+              </span>
+              <span class="metric-item" title="pixels kept">
+                Res <span class="metric-val">${resStr}</span>
+              </span>
+              <span style="font-weight:600; color:var(--text);">${formatBytes(m.size)}</span>
+            </div>
+            <div style="font-size:0.75rem; color:var(--text-muted);">${m.width} &times; ${m.height} &bull; ${m.format}</div>
+            <div class="status-row">
+              ${statusHtml}
+              ${!m.is_recommended_keeper ? `
+                <div style="display:flex; align-items:center; gap:6px;">
+                  <label style="font-size:0.75rem; display:flex; align-items:center; gap:4px; cursor:pointer;">
+                    <input type="checkbox" class="copy-select-cb" data-id="${m.id}" ${isChecked ? "checked" : ""}> Select
+                  </label>
+                  <button type="button" class="btn-file-trash" data-id="${m.id}">Move to trash</button>
+                </div>
+              ` : ''}
+            </div>
+          </div>
+        `;
+
+        // Checkbox toggle
+        const cb = card.querySelector(".copy-select-cb");
+        if (cb) {
+          cb.addEventListener("change", (e) => {
+            if (e.target.checked) {
+              selectedImageIds.add(m.id);
+            } else {
+              selectedImageIds.delete(m.id);
+            }
+          });
+        }
+
+        // Single file Move to Trash button
+        const btnSingleTrash = card.querySelector(".btn-file-trash");
+        if (btnSingleTrash) {
+          btnSingleTrash.addEventListener("click", () => {
+            selectedImageIds.clear();
+            selectedImageIds.add(m.id);
+            buildAndShowPlanModal();
+          });
+        }
+
+        grid.appendChild(card);
+      });
+    }
+
+    // Select all safe copies button
+    document.getElementById("btn-select-safe").addEventListener("click", () => {
+      if (!currentClusterData) return;
+      selectedImageIds.clear();
+      currentClusterData.members.forEach(m => {
+        if (m.delete_safe) selectedImageIds.add(m.id);
+      });
+      // Update checkboxes in UI
+      document.querySelectorAll(".copy-select-cb").forEach(cb => {
+        const id = parseInt(cb.dataset.id, 10);
+        cb.checked = selectedImageIds.has(id);
+      });
+    });
+
+    // Move to trash / Review Plan button
+    document.getElementById("btn-plan-deletion").addEventListener("click", () => {
+      buildAndShowPlanModal();
+    });
+
+    // Build plan modal via POST /plan
+    async function buildAndShowPlanModal() {
+      if (!currentClusterData) return;
+
+      // Determine excluded IDs: in this cluster, any non-keeper member NOT in selectedImageIds is excluded
+      const excludedIds = [];
+      currentClusterData.members.forEach(m => {
+        if (!m.is_recommended_keeper && !selectedImageIds.has(m.id)) {
+          excludedIds.push(m.id);
+        }
+      });
+
+      const payload = {
+        mode: currentMode,
+        approved_swap_cluster_ids: Array.from(approvedSwapClusterIds),
+        excluded_ids: excludedIds,
+      };
+
+      try {
+        const res = await fetch("/plan", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+
+        if (!res.ok) {
+          const err = await res.json();
+          alert("Planning error: " + (err.detail || "Unable to build plan"));
+          return;
+        }
+
+        const planData = await res.json();
+        currentPlannedBatchId = planData.batch_id;
+
+        document.getElementById("plan-batch-id").textContent = planData.batch_id;
+        document.getElementById("plan-file-count").textContent = planData.file_count;
+        document.getElementById("plan-bytes-freed").textContent = formatBytes(planData.bytes_freed);
+
+        const listContainer = document.getElementById("plan-file-list");
+        listContainer.innerHTML = "";
+
+        if (planData.entries.length === 0) {
+          listContainer.innerHTML = '<div style="padding:16px; text-align:center; color:var(--text-muted);">No copies eligible for deletion with current selection.</div>';
+          document.getElementById("btn-confirm-apply").disabled = true;
+        } else {
+          document.getElementById("btn-confirm-apply").disabled = false;
+          planData.entries.forEach(e => {
+            const row = document.createElement("div");
+            row.className = "file-plan-item";
+            row.innerHTML = `
+              <div class="file-plan-path" title="${e.original_path}">${getBasename(e.original_path)}</div>
+              <div>${formatBytes(e.file_size)}</div>
+            `;
+            listContainer.appendChild(row);
+          });
+        }
+
+        // Show modal and reset apply status
+        document.getElementById("apply-success-box").style.display = "none";
+        document.getElementById("modal-footer-actions").style.display = "flex";
+        document.getElementById("confirm-modal").style.display = "flex";
+      } catch (err) {
+        console.error("Failed to call /plan:", err);
+      }
+    }
+
+    // Confirm button calling POST /apply
+    document.getElementById("btn-confirm-apply").addEventListener("click", async () => {
+      if (!currentPlannedBatchId) return;
+
+      const confirmBtn = document.getElementById("btn-confirm-apply");
+      confirmBtn.disabled = true;
+      confirmBtn.textContent = "Moving...";
+
+      try {
+        const res = await fetch("/apply", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ batch_id: currentPlannedBatchId, confirm: true }),
+        });
+
+        if (!res.ok) {
+          const err = await res.json();
+          alert("Apply failed: " + (err.detail || "Error during execution"));
+          confirmBtn.disabled = false;
+          confirmBtn.textContent = "Confirm & Move";
+          return;
+        }
+
+        const result = await res.json();
+        document.getElementById("modal-footer-actions").style.display = "none";
+        document.getElementById("apply-success-box").style.display = "block";
+
+        // Refresh clusters and current view
+        await loadClusters();
+      } catch (err) {
+        console.error("Failed to call /apply:", err);
+        alert("Failed to execute move: " + err);
+        confirmBtn.disabled = false;
+        confirmBtn.textContent = "Confirm & Move";
+      }
+    });
+
+    // Undo from modal apply-success-box
+    document.getElementById("btn-undo-apply").addEventListener("click", async () => {
+      if (!currentPlannedBatchId) return;
+      try {
+        const res = await fetch("/undo", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ batch_id: currentPlannedBatchId }),
+        });
+        if (!res.ok) throw new Error("Undo failed");
+        alert("Batch successfully undone! Files have been restored.");
+        document.getElementById("confirm-modal").style.display = "none";
+        await loadClusters();
+      } catch (err) {
+        alert("Undo failed: " + err);
+      }
+    });
+
+    // Modal Close / Cancel
+    document.getElementById("btn-close-modal").onclick = () => {
+      document.getElementById("confirm-modal").style.display = "none";
+    };
+    document.getElementById("btn-cancel-modal").onclick = () => {
+      document.getElementById("confirm-modal").style.display = "none";
+    };
+
+    // Mode slider switches
+    document.querySelectorAll(".mode-btn").forEach(btn => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll(".mode-btn").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+        currentMode = btn.dataset.mode;
+        loadClusters();
+      });
+    });
+
+    // Filter and Sort change handlers
+    document.getElementById("category-filter").addEventListener("change", loadClusters);
+    document.getElementById("sort-select").addEventListener("change", loadClusters);
+    document.getElementById("has-savings-toggle").addEventListener("change", loadClusters);
+
+    // Search Box handler
+    const searchInput = document.getElementById("search-input");
+    const searchClear = document.getElementById("search-clear");
+    let searchDebounce = null;
+
+    searchInput.addEventListener("input", () => {
+      const q = searchInput.value.trim();
+      searchClear.style.display = q ? "block" : "none";
+      clearTimeout(searchDebounce);
+      searchDebounce = setTimeout(async () => {
+        if (!q) {
+          loadClusters();
+          return;
+        }
+        try {
+          const res = await fetch(`/search?q=${encodeURIComponent(q)}&limit=50`);
+          if (!res.ok) return;
+          const results = await res.json();
+          // Map matching cluster IDs
+          const matchingClusterIds = new Set(results.map(r => r.cluster_id).filter(Boolean));
+          const filtered = clustersData.filter(c => matchingClusterIds.has(c.id));
+          renderClusterList(filtered);
+        } catch (err) {
+          console.error("Search error:", err);
+        }
+      }, 300);
+    });
+
+    searchClear.addEventListener("click", () => {
+      searchInput.value = "";
+      searchClear.style.display = "none";
+      loadClusters();
+    });
+
+    // History Modal
+    async function openHistoryModal() {
+      document.getElementById("history-modal").style.display = "flex";
+      document.getElementById("history-loading").style.display = "block";
+      document.getElementById("history-table").style.display = "none";
+
+      try {
+        const res = await fetch("/history?limit=100");
+        if (!res.ok) throw new Error("Failed to load history");
+        const historyList = await res.json();
+
+        const tbody = document.getElementById("history-tbody");
+        tbody.innerHTML = "";
+
+        if (historyList.length === 0) {
+          document.getElementById("history-loading").textContent = "No deletion batches found in ledger.";
+          return;
+        }
+
+        historyList.forEach(b => {
+          const tr = document.createElement("tr");
+          const canUndo = b.status === "executed";
+          tr.innerHTML = `
+            <td><code>${b.batch_id}</code></td>
+            <td>${b.executed_at || b.created_at || "N/A"}</td>
+            <td>${b.mode || "N/A"}</td>
+            <td>${b.file_count || 0}</td>
+            <td>${formatBytes(b.bytes_freed)}</td>
+            <td><span class="chip ${b.status === 'executed' ? 'chip-review' : 'chip-category'}">${b.status}</span></td>
+            <td>
+              ${canUndo ? `<button type="button" class="btn btn-undo-row" data-batch="${b.batch_id}" style="padding:2px 8px; font-size:0.75rem;">Undo</button>` : "-"}
+            </td>
+          `;
+          tbody.appendChild(tr);
+        });
+
+        tbody.querySelectorAll(".btn-undo-row").forEach(btn => {
+          btn.addEventListener("click", async () => {
+            const bId = btn.dataset.batch;
+            if (!confirm(`Are you sure you want to restore batch ${bId}?`)) return;
+            try {
+              const uRes = await fetch("/undo", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ batch_id: bId }),
+              });
+              if (!uRes.ok) throw new Error("Undo failed");
+              alert(`Batch ${bId} restored successfully!`);
+              openHistoryModal();
+              loadClusters();
+            } catch (err) {
+              alert("Undo failed: " + err);
+            }
+          });
+        });
+
+        document.getElementById("history-loading").style.display = "none";
+        document.getElementById("history-table").style.display = "table";
+      } catch (err) {
+        document.getElementById("history-loading").textContent = "Failed to load history: " + err;
+      }
+    }
+
+    document.getElementById("btn-open-history").addEventListener("click", openHistoryModal);
+    document.getElementById("btn-view-history").addEventListener("click", () => {
+      document.getElementById("confirm-modal").style.display = "none";
+      openHistoryModal();
+    });
+    document.getElementById("btn-close-history").addEventListener("click", () => {
+      document.getElementById("history-modal").style.display = "none";
+    });
+
+    // Initial Load
+    loadCategories();
+    loadClusters();
+  </script>
+</body>
+</html>

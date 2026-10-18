@@ -410,6 +410,11 @@ class TestAPIServer:
 
         initial_state = snapshot_files()
 
+        # 0. GET / (UI route)
+        ui_res = client.get("/")
+        assert ui_res.status_code == 200
+        assert snapshot_files() == initial_state
+
         # 1. GET /clusters
         client.get("/clusters?mode=conservative")
         client.get("/clusters?mode=aggressive")
@@ -475,4 +480,43 @@ class TestAPIServer:
         assert run_called["host"] == "127.0.0.1"
         assert run_called["port"] == 8001
         assert run_called["app"].state.db_path == db_file.resolve()
+
+    def test_ui_smoke_and_element_ids(self, api_test_env):
+        """Smoke test for UI: GET / returns 200, serves text/html, contains required element IDs and text."""
+        client = api_test_env["client"]
+
+        res = client.get("/")
+        assert res.status_code == 200
+        assert "text/html" in res.headers.get("content-type", "")
+        html = res.text
+
+        # Required element IDs used by the script
+        required_ids = [
+            'id="cluster-list"',
+            'id="cluster-detail-panel"',
+            'id="mode-slider"',
+            'id="category-filter"',
+            'id="sort-select"',
+            'id="has-savings-toggle"',
+            'id="search-input"',
+            'id="swap-proposal-banner"',
+            'id="member-grid"',
+            'id="btn-select-safe"',
+            'id="btn-plan-deletion"',
+            'id="confirm-modal"',
+            'id="btn-confirm-apply"',
+            'id="btn-undo-apply"',
+            'id="history-modal"',
+        ]
+        for elem_id in required_ids:
+            assert elem_id in html, f"Missing required element ID {elem_id} in UI HTML"
+
+        # Required confirmation sentence
+        assert "Files are moved to trash and can be undone." in html
+
+        # Verify /thumb works alongside UI
+        thumb_res = client.get("/thumb/1?size=96")
+        assert thumb_res.status_code == 200
+        assert thumb_res.headers.get("content-type") == "image/jpeg"
+
 
