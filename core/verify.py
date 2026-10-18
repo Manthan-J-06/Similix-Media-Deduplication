@@ -844,6 +844,9 @@ def run_stage3_verification(
                     (seed_id,),
                 )
 
+    # Populate images.confidence using the fused logistic regression model
+    update_cluster_duplicate_confidences(conn)
+
     res.low_confidence_members = conn.execute(
         "SELECT COUNT(*) FROM images WHERE cluster_id IS NOT NULL AND is_low_confidence = 1"
     ).fetchone()[0]
@@ -856,3 +859,116 @@ def run_stage3_verification(
         res.time_per_1000 = (res.elapsed_seconds / res.pairs_evaluated) * 1000.0
 
     return res
+
+
+def update_cluster_duplicate_confidences(
+    conn: sqlite3.Connection,
+    cluster_ids: list[int] | None = None,
+    model_path: str | Path | None = None,
+) -> int:
+    """
+    Populate images.confidence using the fused logistic regression model
+    (models/duplicate_confidence.json) for all clustered images.
+    - Exact MD5 matches and cluster representatives are fixed at 100.0%.
+    - Non-MD5 members use pHash distance, best CLIP cosine across rotations,
+      and SIFT inlier count / ratio (from pair_transforms table if present).
+    """
+    from core.keeper import predict_duplicate_confidence
+    from core.embeddings import deserialize_embedding
+
+    if cluster_ids is not None:
+        if not cluster_ids:
+            return 0
+        placeholders = ",".join("?" for _ in cluster_ids)
+        clusters = conn.execute(
+            f"SELECT id, representative_id FROM clusters WHERE id IN ({placeholders})",
+            cluster_ids,
+        ).fetchall()
+    else:
+        clusters = conn.execute(
+            "SELECT id, representative_id FROM clusters WHERE representative_id IS NOT NULL"
+        ).fetchall()
+
+    updated_count = 0
+    for c in clusters:
+        cid = c["id"]
+        rep_id = c["representative_id"]
+        if rep_id is None:
+            continue
+
+        rep = conn.execute(
+            "SELECT id, md5, phash, clip_vector FROM images WHERE id = ?",
+            (rep_id,),
+        ).fetchone()
+        if not rep:
+            continue
+
+        # Representative is anchor -> 100.0
+        conn.execute(
+            "UPDATE images SET confidence = 100.0 WHERE id = ?",
+            (rep_id,),
+        )
+
+        members = conn.execute(
+            """
+            SELECT id, md5, phash, link_signal,
+                   clip_vector, clip_vector_90, clip_vector_180, clip_vector_270
+            FROM images
+            WHERE cluster_id = ? AND id != ?
+            """,
+            (cid, rep_id),
+        ).fetchall()
+
+        rep_clip = deserialize_embedding(rep["clip_vector"]) if rep["clip_vector"] else None
+
+        for m in members:
+            mid = m["id"]
+            is_md5 = (m["md5"] == rep["md5"]) or (m["link_signal"] == "md5")
+            if is_md5:
+                conf = 100.0
+            else:
+                # 1. pHash distance
+                if rep["phash"] and m["phash"]:
+                    h_dist = bin(int(rep["phash"], 16) ^ int(m["phash"], 16)).count("1")
+                else:
+                    h_dist = 0
+
+                # 2. best CLIP cosine across rotations
+                best_cos = 1.0
+                if rep_clip is not None and m["clip_vector"]:
+                    m_clip = deserialize_embedding(m["clip_vector"])
+                    cosines = [float(np.dot(rep_clip, m_clip))]
+                    for rot_col in ["clip_vector_90", "clip_vector_180", "clip_vector_270"]:
+                        if m[rot_col]:
+                            v_rot = deserialize_embedding(m[rot_col])
+                            cosines.append(float(np.dot(rep_clip, v_rot)))
+                    best_cos = max(cosines)
+
+                # 3. SIFT features from pair_transforms table if present
+                pt = conn.execute(
+                    """
+                    SELECT inlier_count, inlier_ratio FROM pair_transforms
+                    WHERE (source_id = ? AND target_id = ?) OR (source_id = ? AND target_id = ?)
+                    """,
+                    (rep_id, mid, mid, rep_id),
+                ).fetchone()
+
+                inliers = int(pt["inlier_count"]) if pt else 0
+                ratio = float(pt["inlier_ratio"]) if pt else 0.0
+
+                conf = predict_duplicate_confidence(
+                    phash_distance=h_dist,
+                    best_clip_cosine=best_cos,
+                    sift_inlier_ratio=ratio,
+                    inlier_count=inliers,
+                    md5_match=False,
+                    model_path=model_path,
+                )
+
+            conn.execute(
+                "UPDATE images SET confidence = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
+                (conf, mid),
+            )
+            updated_count += 1
+
+    return updated_count

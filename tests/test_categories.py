@@ -453,4 +453,5 @@ class TestCategoryEvaluationAndCLI:
         assert "landscape (1)" in content
         assert "data:image/jpeg;base64," in content
         assert "sample.jpg" in content
+        assert "category confidence: 92.0%" in content
 

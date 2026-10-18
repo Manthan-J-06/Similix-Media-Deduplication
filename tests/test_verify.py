@@ -385,3 +385,64 @@ class TestStage3ClusterPipelineSplitting:
         cache_count = conn.execute("SELECT COUNT(*) FROM keypoint_cache").fetchone()[0]
         assert cache_count == 2
 
+
+class TestFusedDuplicateConfidenceIntegration:
+    def test_update_cluster_duplicate_confidences(self, tmp_path: Path):
+        """Verify update_cluster_duplicate_confidences sets 100 for MD5 and calibrated fused score for non-MD5."""
+        from core.verify import update_cluster_duplicate_confidences
+        from core.embeddings import serialize_embedding
+        import numpy as np
+
+        db_path = tmp_path / "test_conf.db"
+        conn = init_db(db_path)
+
+        # Create 1 cluster with representative (id 1) and 3 members:
+        # id 2: exact MD5 match
+        # id 3: high similarity non-MD5 (low phash, high cosine, high inliers)
+        # id 4: marginal similarity non-MD5 (higher phash, lower cosine, few inliers)
+        v_rep = np.ones(512, dtype=np.float32) / np.sqrt(512)
+        v_high = v_rep.copy()  # cosine = 1.0
+        v_low = np.zeros(512, dtype=np.float32)
+        v_low[0] = 1.0  # low cosine ~ 0.044
+
+        conn.execute("INSERT INTO clusters (id, representative_id, stage_detected, member_count) VALUES (1, NULL, 2, 4)")
+        conn.execute(
+            "INSERT INTO images (id, file_path, md5, phash, clip_vector, cluster_id, is_keeper) VALUES (1, 'orig.jpg', 'md5_1', '0000000000000000', ?, 1, 1)",
+            (serialize_embedding(v_rep),)
+        )
+        conn.execute(
+            "INSERT INTO images (id, file_path, md5, phash, clip_vector, cluster_id, is_keeper) VALUES (2, 'exact.jpg', 'md5_1', '0000000000000000', ?, 1, 0)",
+            (serialize_embedding(v_rep),)
+        )
+        conn.execute(
+            "INSERT INTO images (id, file_path, md5, phash, clip_vector, cluster_id, is_keeper) VALUES (3, 'high.jpg', 'md5_3', '0000000000000001', ?, 1, 0)",
+            (serialize_embedding(v_high),)
+        )
+        conn.execute(
+            "INSERT INTO images (id, file_path, md5, phash, clip_vector, cluster_id, is_keeper) VALUES (4, 'low.jpg', 'md5_4', 'ffffffffffffffff', ?, 1, 0)",
+            (serialize_embedding(v_low),)
+        )
+        conn.execute("UPDATE clusters SET representative_id = 1 WHERE id = 1")
+
+        # Cache SIFT transforms
+        conn.execute(
+            "INSERT INTO pair_transforms (source_id, target_id, transform_matrix, inlier_count, inlier_ratio) VALUES (1, 3, x'00', 200, 0.95)"
+        )
+        conn.execute(
+            "INSERT INTO pair_transforms (source_id, target_id, transform_matrix, inlier_count, inlier_ratio) VALUES (1, 4, x'00', 5, 0.10)"
+        )
+        conn.commit()
+
+        updated = update_cluster_duplicate_confidences(conn)
+        assert updated == 3
+
+        conf_rep = conn.execute("SELECT confidence FROM images WHERE id = 1").fetchone()[0]
+        conf_exact = conn.execute("SELECT confidence FROM images WHERE id = 2").fetchone()[0]
+        conf_high = conn.execute("SELECT confidence FROM images WHERE id = 3").fetchone()[0]
+        conf_low = conn.execute("SELECT confidence FROM images WHERE id = 4").fetchone()[0]
+
+        assert conf_rep == 100.0
+        assert conf_exact == 100.0
+        assert conf_high >= 99.0
+        assert conf_low <= 15.0
+

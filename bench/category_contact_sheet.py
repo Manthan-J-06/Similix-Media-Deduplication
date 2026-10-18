@@ -289,7 +289,7 @@ def generate_contact_sheet_html(
         <div class="img-wrap">{img_tag}</div>
         <div class="card-body">
           <div class="filename" title="{fname}">{fname}</div>
-          <div><span class="prob-badge {badge_cls}">{cat} ({prob*100:.1f}%)</span></div>
+          <div><span class="prob-badge {badge_cls}">{cat} &bull; category confidence: {prob*100:.1f}%</span></div>
           {f'<div class="top3-list">{top3_str}</div>' if top3_str else ''}
         </div>
       </div>

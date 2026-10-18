@@ -172,6 +172,11 @@ indoor = [
     "a photograph of an indoor space, living room, or bedroom",
     "an interior view of a room, hallway, or furnished space",
 ]
+other = [
+    "a photo of a miscellaneous, abstract, or uncategorized object",
+    "a photograph that does not belong to standard categories",
+    "a photo of other, ambiguous, or unclassified subject matter",
+]
 
 # ── Deletion ledger & trash (core/ledger.py) ──────────────────────────────────
 [ledger]

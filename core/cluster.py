@@ -455,5 +455,9 @@ def run_stage2_clustering(
             # Seed could not form a cluster, remove it
             unclustered_pool.discard(seed_id)
 
+    # Populate images.confidence using the fused logistic regression model
+    from core.verify import update_cluster_duplicate_confidences
+    update_cluster_duplicate_confidences(conn)
+
     conn.commit()
     return res
