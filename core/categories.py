@@ -245,13 +245,17 @@ def update_cluster_categories(conn: sqlite3.Connection) -> int:
     clusters = conn.execute("SELECT id, representative_id FROM clusters ORDER BY id").fetchall()
     updated = 0
 
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(images)").fetchall()}
+    has_rec = "is_recommended_keeper" in cols
+    rec_col = "is_recommended_keeper" if has_rec else "0 AS is_recommended_keeper"
+
     for c in clusters:
         cid = c["id"]
         rep_id = c["representative_id"]
 
         members = conn.execute(
-            """
-            SELECT id, is_keeper, is_recommended_keeper, category_top1
+            f"""
+            SELECT id, is_keeper, {rec_col}, category_top1
             FROM images
             WHERE cluster_id = ?
             ORDER BY id

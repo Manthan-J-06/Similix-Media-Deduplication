@@ -61,6 +61,12 @@ def init_db(db_path: str | Path) -> sqlite3.Connection:
         ("match_pct", "REAL"),
         ("resolution_pct", "REAL"),
         ("is_cluster_anchor", "INTEGER NOT NULL DEFAULT 0"),
+        ("is_recommended_keeper", "INTEGER NOT NULL DEFAULT 0"),
+        ("delete_safe", "INTEGER NOT NULL DEFAULT 0"),
+        ("review_flag", "INTEGER NOT NULL DEFAULT 0"),
+        ("quality_retained_pct", "REAL"),
+        ("bytes_saved_if_deleted", "INTEGER DEFAULT 0"),
+        ("reason", "TEXT"),
     ):
         if col not in existing_cols:
             conn.execute(f"ALTER TABLE images ADD COLUMN {col} {col_type};")

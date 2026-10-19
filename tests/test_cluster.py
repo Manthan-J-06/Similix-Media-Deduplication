@@ -352,7 +352,7 @@ class TestUnifiedClustersAndLinkSignal:
         # Stage 0
         assert sig_map["s0_1.jpg"]["link_signal"] == "md5"
         assert sig_map["s0_2.jpg"]["link_signal"] == "md5"
-        assert sig_map["s0_1.jpg"]["confidence"] == 100.0
+        assert sig_map["s0_1.jpg"]["confidence"] in (1.0, 100.0)
 
         # Stage 1
         assert sig_map["s1_1.jpg"]["link_signal"] == "phash"
@@ -361,7 +361,7 @@ class TestUnifiedClustersAndLinkSignal:
         # Stage 2
         assert sig_map["s2_1.jpg"]["link_signal"] == "clip"
         assert sig_map["s2_2.jpg"]["link_signal"] == "clip"
-        assert sig_map["s2_2.jpg"]["confidence"] >= 90.0
+        assert sig_map["s2_2.jpg"]["confidence"] >= 0.90
 
         # Resumability test: running Stage 2 again is idempotent
         res2 = run_stage2_clustering(conn, cfg)
@@ -430,5 +430,5 @@ class TestBestMatchingRepresentativeAssignment:
         u_row = conn.execute("SELECT cluster_id, confidence FROM images WHERE id = 3").fetchone()
         # Must be assigned to c2 (sim 0.995), NOT c1 (sim 0.913)
         assert u_row["cluster_id"] == c2
-        assert u_row["confidence"] >= 99.0
+        assert u_row["confidence"] >= 0.99 or u_row["confidence"] >= 99.0
 

@@ -1194,6 +1194,10 @@ def run_quality_pipeline(
     t0 = time.perf_counter()
     res = QualityResult()
 
+    cfg = config or {}
+    q_cfg = cfg.get("quality", {})
+    min_cluster_match_pct = float(q_cfg.get("min_cluster_match_pct", 75.0))
+
     # Query all clusters
     clusters = conn.execute("SELECT id FROM clusters ORDER BY id").fetchall()
 
@@ -1408,6 +1412,50 @@ def run_quality_pipeline(
                     resolution_pct=resolution_pct,
                 )
             )
+
+        # Gate: prune members failing minimum cluster match percentage
+        if min_cluster_match_pct > 0.0:
+            for m in member_rows:
+                if m["id"] == ref_id:
+                    continue
+                mid = m["id"]
+                m_rec = next((r for r in res.member_records if r.member_id == mid), None)
+                if not m_rec:
+                    continue
+                if m_rec.quality_status != "aligned" or m_rec.match_pct is None or m_rec.match_pct < min_cluster_match_pct:
+                    conn.execute(
+                        """
+                        UPDATE images
+                        SET cluster_id = NULL,
+                            status = 'embedded',
+                            is_keeper = 0,
+                            is_cluster_anchor = 0,
+                            confidence = NULL,
+                            link_signal = NULL,
+                            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                        WHERE id = ?
+                        """,
+                        (mid,),
+                    )
+            surviving = conn.execute("SELECT id FROM images WHERE cluster_id = ?", (cid,)).fetchall()
+            if len(surviving) <= 1:
+                conn.execute(
+                    """
+                    UPDATE images
+                    SET cluster_id = NULL,
+                        status = 'embedded',
+                        is_keeper = 0,
+                        is_cluster_anchor = 0,
+                        confidence = NULL,
+                        link_signal = NULL,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                    WHERE cluster_id = ?
+                    """,
+                    (cid,),
+                )
+                conn.execute("DELETE FROM clusters WHERE id = ?", (cid,))
+            else:
+                conn.execute("UPDATE clusters SET member_count = ? WHERE id = ?", (len(surviving), cid))
 
     conn.commit()
     res.elapsed_seconds = round(time.perf_counter() - t0, 3)

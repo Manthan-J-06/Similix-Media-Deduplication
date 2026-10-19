@@ -80,6 +80,9 @@ ransac_reproj_threshold = 4.0
 min_align_inliers = 15
 # Minimum ratio of inliers to good feature matches.
 min_align_inlier_ratio = 0.50
+# Minimum match_pct (SSIM on aligned proxies) to remain in a duplicate cluster (default 75.0).
+# Rejects architectural impostors that share repetitive keypoints but differ in overall visual scene.
+min_cluster_match_pct = 75.0
 
 # ── Stage 4: Keeper selection ─────────────────────────────────────────────────
 [keeper]
