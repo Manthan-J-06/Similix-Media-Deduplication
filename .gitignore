@@ -40,6 +40,10 @@ Thumbs.db
 .env.*
 *.pem
 *.key
+client_secret.json
+drive_token.json
+*client_secret*.json
+*drive_token*.json
 
 # ── Logs ─────────────────────────────────────────────────────────────────────
 logs/

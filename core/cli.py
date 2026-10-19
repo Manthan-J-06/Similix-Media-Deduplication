@@ -114,14 +114,27 @@ def cmd_scan(args: argparse.Namespace) -> None:
 
 
 def cmd_embed(args: argparse.Namespace) -> None:
-    folder = Path(args.folder).resolve()
-    if not folder.exists() or not folder.is_dir():
-        print(f"Error: Target directory does not exist: {folder}", file=sys.stderr)
-        sys.exit(1)
-
     cfg = load_config(args.config)
     db_path = args.db or cfg.get("general", {}).get("db_path", "argus.db")
     conn = init_db(db_path)
+
+    source = None
+    if args.folder:
+        folder = Path(args.folder).resolve()
+        if not folder.exists() or not folder.is_dir():
+            print(f"Error: Target directory does not exist: {folder}", file=sys.stderr)
+            sys.exit(1)
+        source = LocalFolderSource(folder)
+        target_display = str(folder)
+    else:
+        has_gdrive = conn.execute("SELECT 1 FROM images WHERE source = 'gdrive' LIMIT 1").fetchone() is not None
+        if has_gdrive:
+            from sources.google_drive import GoogleDriveSource
+            source = GoogleDriveSource(conn=conn, stage="stage2")
+            target_display = "Google Drive"
+        else:
+            print("Error: Target directory required when database has no Google Drive images", file=sys.stderr)
+            sys.exit(1)
 
     from core.embeddings import run_embeddings, get_device
     device = get_device()
@@ -131,7 +144,7 @@ def cmd_embed(args: argparse.Namespace) -> None:
     print("==================================================")
     print("  ARGUS Stage 2 CLIP Embedding Pipeline")
     print("==================================================")
-    print(f"Target folder : {folder}")
+    print(f"Target        : {target_display}")
     print(f"Database      : {db_path}")
     print(f"Model         : {stage2_cfg.get('clip_model', 'ViT-B-32')}")
     print(f"Weights       : {stage2_cfg.get('clip_pretrained', 'laion2b_s34b_b79k')}")
@@ -140,7 +153,6 @@ def cmd_embed(args: argparse.Namespace) -> None:
     print(f"Rotations     : {'Enabled (0°, 90°, 180°, 270°)' if rotations else 'Disabled (0° only)'}")
     print()
 
-    source = LocalFolderSource(folder)
     start_time = time.time()
 
     def on_progress(current: int, total: int):
@@ -229,6 +241,11 @@ def cmd_verify(args: argparse.Namespace) -> None:
         folder = Path(args.folder).resolve()
         if folder.exists() and folder.is_dir():
             source = LocalFolderSource(folder)
+    else:
+        has_gdrive = conn.execute("SELECT 1 FROM images WHERE source = 'gdrive' LIMIT 1").fetchone() is not None
+        if has_gdrive:
+            from sources.google_drive import GoogleDriveSource
+            source = GoogleDriveSource(conn=conn, stage="stage3")
 
     from core.verify import run_stage3_verification
     res = run_stage3_verification(conn, cfg, source=source)
@@ -271,6 +288,11 @@ def cmd_quality(args: argparse.Namespace) -> None:
         folder = Path(args.folder).resolve()
         if folder.exists() and folder.is_dir():
             source = LocalFolderSource(folder)
+    else:
+        has_gdrive = conn.execute("SELECT 1 FROM images WHERE source = 'gdrive' LIMIT 1").fetchone() is not None
+        if has_gdrive:
+            from sources.google_drive import GoogleDriveSource
+            source = GoogleDriveSource(conn=conn, stage="stage4")
 
     from core.quality import run_quality_pipeline
     res = run_quality_pipeline(conn, cfg, source=source)
@@ -771,6 +793,101 @@ def cmd_serve(args: argparse.Namespace) -> None:
     uvicorn.run(app, host=host, port=port)
 
 
+def cmd_drive_auth(args: argparse.Namespace) -> None:
+    from sources.google_drive import (
+        get_drive_credentials,
+        DEFAULT_CLIENT_SECRET_PATH,
+        DEFAULT_TOKEN_PATH,
+    )
+
+    client_secret = args.client_secret or DEFAULT_CLIENT_SECRET_PATH
+    token_path = args.token or DEFAULT_TOKEN_PATH
+
+    print("==================================================")
+    print("  ARGUS Google Drive Authorization (READ-ONLY)")
+    print("==================================================")
+    print(f"Client Secret : {client_secret}")
+    print(f"Token Path    : {token_path}")
+    print("Scope         : https://www.googleapis.com/auth/drive.readonly")
+    print()
+
+    try:
+        get_drive_credentials(
+            client_secret_path=client_secret,
+            token_path=token_path,
+            prompt_if_missing=True,
+        )
+        print("Google Drive authorization successful!")
+        print(f"Token stored securely at {token_path} with 0600 permissions.")
+    except Exception as exc:
+        print(f"Authorization error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_scan_drive(args: argparse.Namespace) -> None:
+    from sources.google_drive import GoogleDriveSource, print_bandwidth_summary
+
+    cfg = load_config(args.config)
+    db_path = args.db or cfg.get("general", {}).get("db_path", "drive.db")
+    conn = init_db(db_path)
+
+    folder_id = args.folder
+    all_drive = args.all
+    if not folder_id and not all_drive:
+        print("Error: Either --folder <id> or --all must be specified for scan-drive", file=sys.stderr)
+        sys.exit(1)
+
+    print("==================================================")
+    print("  ARGUS Google Drive Deduplication Pipeline")
+    print("==================================================")
+    target_str = "Whole Drive (--all)" if all_drive else f"Folder ID: {folder_id}"
+    print(f"Target        : {target_str}")
+    print(f"Database      : {db_path}")
+    print(f"Permissions   : drive.readonly (READ-ONLY)")
+    print()
+
+    try:
+        source = GoogleDriveSource(
+            folder_id=folder_id,
+            all_drive=all_drive,
+            conn=conn,
+            concurrency=getattr(args, "concurrency", 4),
+            stage="stage0",
+        )
+    except Exception as exc:
+        print(f"Error initializing Google Drive client: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    # ── Phase 1: Stage 0 (Metadata only, Zero downloads) ──
+    print("[1/2] Running Stage 0: Metadata discovery & exact matching (0 downloads)...")
+    stage0_res = run_stage0(source, conn, cfg)
+    print(f"      Discovered / updated : {stage0_res.files_discovered}")
+    if stage0_res.files_unchanged > 0:
+        print(f"      Unchanged (in DB)    : {stage0_res.files_unchanged}")
+    print(f"      MD5 hashes verified  : {stage0_res.files_hashed} (from Drive metadata)")
+    print(f"      Exact clusters found : {stage0_res.clusters_created} ({stage0_res.files_clustered} files)")
+    if stage0_res.files_skipped > 0:
+        print(f"      Skipped (missing md5): {stage0_res.files_skipped}")
+        for path_str, reason in stage0_res.skipped_reasons:
+            print(f"        - {path_str}: {reason}")
+    print()
+
+    # ── Phase 2: Stage 1 (pHash on thumbnails) ──
+    print("[2/2] Running Stage 1: Perceptual hashing via cached thumbnails...")
+    source.stage = "stage1"
+    stage1_res = run_stage1(source, conn, cfg)
+    print(f"      pHashes computed     : {stage1_res.hashes_computed}")
+    print(f"      Near clusters created: {stage1_res.clusters_created}")
+    print(f"      Added to clusters    : {stage1_res.members_added_to_existing}")
+    print(f"      Total near-clustered : {stage1_res.files_clustered}")
+    if stage1_res.files_skipped > 0:
+        print(f"      Skipped in Stage 1   : {stage1_res.files_skipped}")
+        for path_str, reason in stage1_res.skipped_reasons:
+            print(f"        - {path_str}: {reason}")
+    print()
+
+    # ── Bandwidth Accounting Summary ──
+    print_bandwidth_summary(conn)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -786,7 +903,7 @@ def main(argv: list[str] | None = None) -> None:
     scan_parser.add_argument("--db", default=None, help="Path to SQLite database file")
 
     embed_parser = subparsers.add_parser("embed", help="Compute CLIP embeddings for images")
-    embed_parser.add_argument("folder", help="Path to image folder")
+    embed_parser.add_argument("folder", nargs="?", default=None, help="Path to image folder (optional)")
     embed_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
     embed_parser.add_argument("--db", default=None, help="Path to SQLite database file")
 
@@ -880,6 +997,17 @@ def main(argv: list[str] | None = None) -> None:
     serve_parser.add_argument("--thumb-cache-dir", default=None, help="Path to thumbnail cache directory")
     serve_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
 
+    drive_auth_parser = subparsers.add_parser("drive-auth", help="Authorize Google Drive read-only access (OAuth)")
+    drive_auth_parser.add_argument("--client-secret", default=None, help="Path to OAuth client_secret.json")
+    drive_auth_parser.add_argument("--token", default=None, help="Path to drive_token.json")
+
+    scan_drive_parser = subparsers.add_parser("scan-drive", help="Scan Google Drive for duplicate images")
+    scan_drive_parser.add_argument("--folder", default=None, help="Google Drive folder ID to scan")
+    scan_drive_parser.add_argument("--all", action="store_true", help="Scan entire Google Drive")
+    scan_drive_parser.add_argument("--concurrency", type=int, default=4, help="Concurrent worker count (default: 4)")
+    scan_drive_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
+    scan_drive_parser.add_argument("--db", default=None, help="Path to SQLite database file")
+
     args = parser.parse_args(argv)
     if args.subcommand == "scan":
         cmd_scan(args)
@@ -913,6 +1041,10 @@ def main(argv: list[str] | None = None) -> None:
         cmd_show(args)
     elif args.subcommand == "serve":
         cmd_serve(args)
+    elif args.subcommand == "drive-auth":
+        cmd_drive_auth(args)
+    elif args.subcommand == "scan-drive":
+        cmd_scan_drive(args)
 
 
 if __name__ == "__main__":

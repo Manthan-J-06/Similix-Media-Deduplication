@@ -67,9 +67,14 @@ def init_db(db_path: str | Path) -> sqlite3.Connection:
         ("quality_retained_pct", "REAL"),
         ("bytes_saved_if_deleted", "INTEGER DEFAULT 0"),
         ("reason", "TEXT"),
+        ("source", "TEXT NOT NULL DEFAULT 'local'"),
+        ("drive_id", "TEXT"),
     ):
         if col not in existing_cols:
             conn.execute(f"ALTER TABLE images ADD COLUMN {col} {col_type};")
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_images_drive_id ON images(drive_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_images_source ON images(source);")
 
     existing_cluster_cols = {
         col[1] for col in conn.execute("PRAGMA table_info(clusters)").fetchall()

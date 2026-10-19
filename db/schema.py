@@ -48,11 +48,27 @@ CREATE TABLE IF NOT EXISTS images (
     reason        TEXT,                          -- explanation for keeper / delete / review verdict
     match_pct     REAL,                          -- color SSIM match % vs reference (100.0 for ref/exact)
     resolution_pct REAL,                         -- pixel count % vs reference (100.0 for ref/exact)
+    source        TEXT    NOT NULL DEFAULT 'local',      -- 'local' | 'gdrive'
+    drive_id      TEXT,                                  -- Google Drive file ID (when source='gdrive')
     category_top1 TEXT,                          -- top-1 predicted category or 'uncertain'
     category_top1_prob REAL,                     -- probability of top-1 category (0.0 - 1.0)
     category_top3 TEXT,                          -- JSON array of [{"label": ..., "prob": ...}, ...]
     created_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
     updated_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+"""
+
+# ---------------------------------------------------------------------------
+# Table: drive_bandwidth (Bandwidth accounting for Google Drive)
+# ---------------------------------------------------------------------------
+CREATE_DRIVE_BANDWIDTH = """
+CREATE TABLE IF NOT EXISTS drive_bandwidth (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    stage            TEXT    NOT NULL,                  -- 'stage0' | 'stage1' | 'stage2' | 'stage3' | 'stage4'
+    file_id          TEXT    NOT NULL,
+    bytes_downloaded INTEGER NOT NULL,
+    item_type        TEXT    NOT NULL,                  -- 'metadata' | 'thumbnail' | 'full_file'
+    created_at       TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 """
 
@@ -153,10 +169,14 @@ CREATE INDEX IF NOT EXISTS idx_pair_transforms_target ON pair_transforms(target_
 CREATE INDEX IF NOT EXISTS idx_journal_batch    ON deletion_journal(batch_id);
 CREATE INDEX IF NOT EXISTS idx_journal_status   ON deletion_journal(status);
 CREATE INDEX IF NOT EXISTS idx_journal_path     ON deletion_journal(original_path);
+CREATE INDEX IF NOT EXISTS idx_images_drive_id  ON images(drive_id);
+CREATE INDEX IF NOT EXISTS idx_images_source    ON images(source);
+CREATE INDEX IF NOT EXISTS idx_bandwidth_stage  ON drive_bandwidth(stage);
 """
 
 ALL_DDL = "\n".join([
     CREATE_IMAGES,
+    CREATE_DRIVE_BANDWIDTH,
     CREATE_CLUSTERS,
     CREATE_PAIR_TRANSFORMS,
     CREATE_ACTIONS,

@@ -23,6 +23,9 @@ class ImageMetadata:
     width: int | None = None
     height: int | None = None
     format: str | None = None # e.g. "JPEG", "PNG", "WEBP", "HEIC"
+    md5: str | None = None   # Hex MD5 checksum if available from source metadata
+    source: str = "local"    # 'local' | 'gdrive'
+    drive_id: str | None = None # Stable Google Drive file ID if remote
 
 
 class ImageSource(ABC):

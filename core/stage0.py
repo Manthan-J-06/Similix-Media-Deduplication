@@ -121,7 +121,8 @@ def _scan_and_sync_files(
             continue
 
         p_ext = Path(file_id).suffix.lower()
-        if (meta.width is None or meta.height is None) and p_ext not in raw_exts:
+        is_remote = getattr(meta, "source", "local") != "local"
+        if (meta.width is None or meta.height is None) and p_ext not in raw_exts and not is_remote:
             skipped_files.append((file_id, "Cannot identify image dimensions (corrupt or unreadable)"))
             continue
 
@@ -133,16 +134,28 @@ def _scan_and_sync_files(
                 continue
 
             # Modified file — reset for re-processing
+            meta_md5 = getattr(meta, "md5", None)
+            meta_source = getattr(meta, "source", "local")
+            meta_drive_id = getattr(meta, "drive_id", None)
+            status = "hashed" if meta_md5 else "discovered"
             updates.append((
                 meta.file_size,
                 meta.modified_time,
                 meta.width,
                 meta.height,
                 meta.format,
+                meta_md5,
+                meta_source,
+                meta_drive_id,
+                status,
                 img_id,
             ))
             discovered_count += 1
         else:
+            meta_md5 = getattr(meta, "md5", None)
+            meta_source = getattr(meta, "source", "local")
+            meta_drive_id = getattr(meta, "drive_id", None)
+            status = "hashed" if meta_md5 else "discovered"
             inserts.append((
                 meta.file_id,
                 meta.file_size,
@@ -150,6 +163,10 @@ def _scan_and_sync_files(
                 meta.width,
                 meta.height,
                 meta.format,
+                meta_md5,
+                meta_source,
+                meta_drive_id,
+                status,
             ))
             discovered_count += 1
 
@@ -157,8 +174,9 @@ def _scan_and_sync_files(
         conn.executemany(
             """
             INSERT OR IGNORE INTO images (
-                file_path, file_size, modified_time, width, height, format, status
-            ) VALUES (?, ?, ?, ?, ?, ?, 'discovered')
+                file_path, file_size, modified_time, width, height, format,
+                md5, source, drive_id, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             inserts,
         )
@@ -172,13 +190,15 @@ def _scan_and_sync_files(
                 width = ?,
                 height = ?,
                 format = ?,
-                md5 = NULL,
+                md5 = ?,
+                source = ?,
+                drive_id = ?,
                 phash = NULL,
                 clip_vector = NULL,
                 cluster_id = NULL,
                 is_keeper = 0,
                 confidence = NULL,
-                status = 'discovered',
+                status = ?,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
             WHERE id = ?
             """,
