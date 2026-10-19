@@ -69,9 +69,28 @@ def init_db(db_path: str | Path) -> sqlite3.Connection:
         ("reason", "TEXT"),
         ("source", "TEXT NOT NULL DEFAULT 'local'"),
         ("drive_id", "TEXT"),
+        ("quality_basis", "TEXT"),
     ):
         if col not in existing_cols:
             conn.execute(f"ALTER TABLE images ADD COLUMN {col} {col_type};")
+
+    # Backfill quality_basis if missing
+    conn.execute(
+        """
+        UPDATE images
+        SET quality_basis = 'thumbnail'
+        WHERE (source = 'gdrive' OR file_path LIKE 'drive://%')
+          AND quality_basis IS NULL
+        """
+    )
+    conn.execute(
+        """
+        UPDATE images
+        SET quality_basis = 'full'
+        WHERE (source != 'gdrive' AND file_path NOT LIKE 'drive://%')
+          AND quality_basis IS NULL
+        """
+    )
 
     conn.execute("CREATE INDEX IF NOT EXISTS idx_images_drive_id ON images(drive_id);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_images_source ON images(source);")

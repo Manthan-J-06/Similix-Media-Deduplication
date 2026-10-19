@@ -903,6 +903,38 @@ def cmd_scan_drive(args: argparse.Namespace) -> None:
     print_bandwidth_summary(conn)
 
 
+def cmd_confirm_drive(args: argparse.Namespace) -> None:
+    from sources.google_drive import run_confirm_drive
+
+    cfg = load_config(args.config)
+    db_path = args.db or cfg.get("general", {}).get("db_path", "drive.db")
+    conn = init_db(db_path)
+    mode = getattr(args, "mode", "balanced")
+
+    print("==================================================")
+    print("  ARGUS Google Drive Full-Resolution Confirmation")
+    print("==================================================")
+    print(f"Database      : {db_path}")
+    print(f"Mode          : {mode}")
+    print(f"Permissions   : drive.readonly (READ-ONLY)")
+    print()
+
+    res = run_confirm_drive(conn, config=cfg, mode=mode)
+    print("Confirmation Results:")
+    print(f"  Members evaluated / confirmed: {len(res.confirmed_members)}")
+    for m in res.confirmed_members:
+        thumb_str = f"{m.thumb_match_pct:.1f}%" if m.thumb_match_pct is not None else "N/A"
+        full_str = f"{m.full_match_pct:.1f}%" if m.full_match_pct is not None else "N/A"
+        status_str = "delete_safe" if m.is_delete_safe else f"review ({m.reason})"
+        print(f"    - Member {m.member_id} ({m.file_path}): thumb={thumb_str} -> full={full_str} [{status_str}]")
+    print()
+    print("Bandwidth Summary:")
+    print(f"  Confirmation downloaded : {res.total_confirmed_bytes:,} bytes")
+    print(f"  Total library size      : {res.total_library_bytes:,} bytes")
+    print(f"  Bandwidth ratio         : {res.bandwidth_ratio_pct:.2f}%")
+    print()
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="argus",
@@ -1021,6 +1053,19 @@ def main(argv: list[str] | None = None) -> None:
     scan_drive_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
     scan_drive_parser.add_argument("--db", default=None, help="Path to SQLite database file")
 
+    confirm_drive_parser = subparsers.add_parser(
+        "confirm-drive",
+        help="Confirm candidate delete_safe Drive images at full resolution",
+    )
+    confirm_drive_parser.add_argument("--db", default=None, help="Path to SQLite database file")
+    confirm_drive_parser.add_argument(
+        "--mode",
+        choices=["conservative", "balanced", "aggressive"],
+        default="balanced",
+        help="Keeper selection mode (default: balanced)",
+    )
+    confirm_drive_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
+
     args = parser.parse_args(argv)
     if args.subcommand == "scan":
         cmd_scan(args)
@@ -1058,6 +1103,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_drive_auth(args)
     elif args.subcommand == "scan-drive":
         cmd_scan_drive(args)
+    elif args.subcommand == "confirm-drive":
+        cmd_confirm_drive(args)
 
 
 if __name__ == "__main__":

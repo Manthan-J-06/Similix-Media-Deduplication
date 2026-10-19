@@ -17,16 +17,20 @@ from __future__ import annotations
 import io
 import json
 import os
+import pickle
 import sqlite3
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
+
+import numpy as np
 
 import pytest
 from PIL import Image
 
 from core.config import load_config
 from core.stage0 import run_stage0
+from core.keeper import choose_keeper, run_keeper_pipeline
 from db.connection import init_db
 from sources.google_drive import (
     GoogleDriveSource,
@@ -36,6 +40,7 @@ from sources.google_drive import (
     print_bandwidth_summary,
     record_bandwidth,
     retry_with_backoff,
+    run_confirm_drive,
 )
 
 
@@ -568,4 +573,191 @@ class TestLRUThumbnailCache:
         # Verify access time was updated to current time
         new_atime = f.stat().st_atime
         assert new_atime > old_time
+
+
+class TestDriveThumbnailConfirmation:
+    def test_thumbnail_based_member_never_delete_safe(self, db: sqlite3.Connection, cfg: dict):
+        """In choose_keeper / run_keeper_pipeline, a Drive member with quality_basis='thumbnail' is never delete_safe."""
+        db.execute(
+            """
+            INSERT INTO clusters (id, stage_detected, member_count)
+            VALUES (1, 1, 2)
+            """
+        )
+        # Reference image
+        db.execute(
+            """
+            INSERT INTO images (
+                id, file_path, file_size, width, height, format, md5,
+                quality_status, ssim, ssim_color, match_pct, cluster_id,
+                source, drive_id, quality_basis
+            ) VALUES (
+                1, 'drive://ref_id/ref.jpg', 200000, 2000, 2000, 'JPEG', 'ref_md5',
+                'reference', 1.0, 1.0, 100.0, 1,
+                'gdrive', 'ref_id', 'thumbnail'
+            )
+            """
+        )
+        # Candidate smaller duplicate (95% match, 95% ssim, confidence 1.0, 50% file size)
+        db.execute(
+            """
+            INSERT INTO images (
+                id, file_path, file_size, width, height, format, md5,
+                quality_status, ssim, ssim_color, match_pct, cluster_id,
+                confidence, is_low_confidence, source, drive_id, quality_basis
+            ) VALUES (
+                2, 'drive://cand_id/cand.jpg', 100000, 1500, 1500, 'JPEG', 'cand_md5',
+                'aligned', 0.95, 0.95, 95.0, 1,
+                1.0, 0, 'gdrive', 'cand_id', 'thumbnail'
+            )
+            """
+        )
+        db.execute("UPDATE clusters SET representative_id = 1 WHERE id = 1")
+        db.commit()
+
+        run_keeper_pipeline(db, config=cfg, mode="balanced")
+
+        row = db.execute("SELECT delete_safe, review_flag, reason FROM images WHERE id = 2").fetchone()
+        assert row["delete_safe"] == 0
+        assert row["review_flag"] == 1
+        assert "needs full-resolution confirmation" in row["reason"]
+
+    def test_md5_copies_unaffected(self, db: sqlite3.Connection, cfg: dict):
+        """Byte-identical MD5 copies remain delete_safe even with quality_basis='thumbnail'."""
+        db.execute(
+            """
+            INSERT INTO clusters (id, stage_detected, member_count)
+            VALUES (1, 0, 2)
+            """
+        )
+        # Reference image
+        db.execute(
+            """
+            INSERT INTO images (
+                id, file_path, file_size, width, height, format, md5,
+                quality_status, ssim, ssim_color, match_pct, cluster_id,
+                source, drive_id, quality_basis
+            ) VALUES (
+                1, 'drive://ref_id/ref.jpg', 200000, 2000, 2000, 'JPEG', 'exact_md5',
+                'reference', 1.0, 1.0, 100.0, 1,
+                'gdrive', 'ref_id', 'thumbnail'
+            )
+            """
+        )
+        # Exact copy
+        db.execute(
+            """
+            INSERT INTO images (
+                id, file_path, file_size, width, height, format, md5,
+                quality_status, ssim, ssim_color, match_pct, cluster_id,
+                confidence, is_low_confidence, source, drive_id, quality_basis
+            ) VALUES (
+                2, 'drive://copy_id/copy.jpg', 200000, 2000, 2000, 'JPEG', 'exact_md5',
+                'aligned', 1.0, 1.0, 100.0, 1,
+                1.0, 0, 'gdrive', 'copy_id', 'thumbnail'
+            )
+            """
+        )
+        db.execute("UPDATE clusters SET representative_id = 1 WHERE id = 1")
+        db.commit()
+
+        run_keeper_pipeline(db, config=cfg, mode="balanced")
+
+        row = db.execute("SELECT delete_safe, review_flag, reason FROM images WHERE id = 2").fetchone()
+        assert row["delete_safe"] == 1
+        assert row["review_flag"] == 0
+        assert "Byte-identical" in row["reason"]
+
+    def test_after_confirm_can_be_delete_safe(self, db: sqlite3.Connection, cfg: dict, tmp_path: Path):
+        """After running confirm-drive, confirmed Drive member gets quality_basis='full' and can become delete_safe."""
+        db.execute(
+            """
+            INSERT INTO clusters (id, stage_detected, member_count)
+            VALUES (1, 1, 2)
+            """
+        )
+        db.execute(
+            """
+            INSERT INTO images (
+                id, file_path, file_size, width, height, format, md5,
+                quality_status, ssim, ssim_color, match_pct, cluster_id,
+                source, drive_id, quality_basis
+            ) VALUES (
+                1, 'drive://ref_id/ref.jpg', 200000, 2000, 2000, 'JPEG', 'ref_md5',
+                'reference', 1.0, 1.0, 100.0, 1,
+                'gdrive', 'ref_id', 'thumbnail'
+            )
+            """
+        )
+        db.execute(
+            """
+            INSERT INTO images (
+                id, file_path, file_size, width, height, format, md5,
+                quality_status, ssim, ssim_color, match_pct, cluster_id,
+                confidence, is_low_confidence, source, drive_id, quality_basis
+            ) VALUES (
+                2, 'drive://cand_id/cand.jpg', 100000, 1500, 1500, 'JPEG', 'cand_md5',
+                'aligned', 0.95, 0.95, 95.0, 1,
+                1.0, 0, 'gdrive', 'cand_id', 'thumbnail'
+            )
+            """
+        )
+        db.execute("UPDATE clusters SET representative_id = 1 WHERE id = 1")
+        db.commit()
+
+        # Pre-cache transform from Stage 3 verification
+        M_ident = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+        db.execute(
+            """
+            INSERT INTO pair_transforms (source_id, target_id, model, transform_matrix, inlier_count, inlier_ratio)
+            VALUES (2, 1, 'affine', ?, 50, 0.95)
+            """,
+            (pickle.dumps(M_ident),),
+        )
+        db.commit()
+
+        # Generate realistic image bytes for ref and cand
+        ref_buf = io.BytesIO()
+        ref_im = Image.new("RGB", (200, 200), color=(120, 140, 160))
+        ref_im.save(ref_buf, format="JPEG")
+        ref_bytes = ref_buf.getvalue()
+
+        cand_buf = io.BytesIO()
+        cand_im = Image.new("RGB", (200, 200), color=(120, 140, 160))
+        cand_im.save(cand_buf, format="JPEG")
+        cand_bytes = cand_buf.getvalue()
+
+        mock_source = MagicMock(spec=GoogleDriveSource)
+        mock_source.conn = db
+        mock_source.stage = "confirm"
+
+        def mock_get_bytes(fpath: str) -> bytes:
+            if "ref_id" in fpath:
+                record_bandwidth(db, "confirm", "ref_id", len(ref_bytes), "full_file")
+                return ref_bytes
+            else:
+                record_bandwidth(db, "confirm", "cand_id", len(cand_bytes), "full_file")
+                return cand_bytes
+
+        mock_source.get_bytes.side_effect = mock_get_bytes
+
+        res = run_confirm_drive(db, config=cfg, mode="balanced", source=mock_source)
+
+        assert len(res.confirmed_members) == 1
+        rec = res.confirmed_members[0]
+        assert rec.member_id == 2
+        assert rec.full_match_pct is not None
+        assert rec.is_delete_safe is True
+
+        cand_row = db.execute("SELECT quality_basis, delete_safe, review_flag FROM images WHERE id = 2").fetchone()
+        assert cand_row["quality_basis"] == "full"
+        assert cand_row["delete_safe"] == 1
+        assert cand_row["review_flag"] == 0
+
+        ref_row = db.execute("SELECT quality_basis FROM images WHERE id = 1").fetchone()
+        assert ref_row["quality_basis"] == "full"
+
+        # Check bandwidth was recorded under stage confirm
+        bw_row = db.execute("SELECT SUM(bytes_downloaded) FROM drive_bandwidth WHERE stage = 'confirm'").fetchone()
+        assert bw_row[0] == len(ref_bytes) + len(cand_bytes)
 

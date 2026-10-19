@@ -1165,6 +1165,7 @@ def ensure_quality_columns(conn: sqlite3.Connection) -> None:
         ("source_likelihood", "REAL"),
         ("match_pct", "REAL"),
         ("resolution_pct", "REAL"),
+        ("quality_basis", "TEXT"),
     ]
     for col_name, col_def in cols_to_add:
         if col_name not in existing_cols:
@@ -1289,6 +1290,11 @@ def run_quality_pipeline(
             )
 
         # Mark reference member in DB
+        is_ref_gdrive = (
+            ref_member.get("source") == "gdrive"
+            or str(ref_path).startswith("drive://")
+        )
+        ref_q_basis = ref_member.get("quality_basis") if ref_member.get("quality_basis") == "full" else ("thumbnail" if is_ref_gdrive else "full")
         conn.execute(
             """
             UPDATE images
@@ -1300,10 +1306,11 @@ def run_quality_pipeline(
                 quality_status = 'reference',
                 match_pct = 100.0,
                 resolution_pct = 100.0,
+                quality_basis = ?,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
             WHERE id = ?
             """,
-            (ref_id,),
+            (ref_q_basis, ref_id),
         )
         res.members_evaluated += 1
         res.member_records.append(
@@ -1359,6 +1366,13 @@ def run_quality_pipeline(
                 match_pct = round(metrics.ssim_color * 100.0, 1) if metrics.ssim_color is not None else None
                 resolution_pct = round(metrics.pixel_ratio * 100.0, 1) if metrics.pixel_ratio is not None else None
 
+            is_gdrive_member = (
+                m.get("source") == "gdrive"
+                or str(m_path).startswith("drive://")
+            )
+            existing_basis = m.get("quality_basis")
+            q_basis = existing_basis if existing_basis == "full" else ("thumbnail" if is_gdrive_member else "full")
+
             conn.execute(
                 """
                 UPDATE images
@@ -1370,6 +1384,7 @@ def run_quality_pipeline(
                     quality_status = ?,
                     match_pct = ?,
                     resolution_pct = ?,
+                    quality_basis = ?,
                     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
                 WHERE id = ?
                 """,
@@ -1382,6 +1397,7 @@ def run_quality_pipeline(
                     metrics.quality_status,
                     match_pct,
                     resolution_pct,
+                    q_basis,
                     mid,
                 ),
             )

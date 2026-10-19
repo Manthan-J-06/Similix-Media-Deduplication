@@ -413,6 +413,23 @@ def choose_keeper(
             reasons[mid] = "Inconclusive keypoints (< 100) / low confidence (manual review required)"
             continue
 
+        # Drive thumbnail quality invariant:
+        # A Drive member whose quality_basis is 'thumbnail' can never be delete_safe
+        # (byte-identical md5 copies excepted); it goes to review with reason
+        # "needs full-resolution confirmation".
+        is_gdrive = (
+            m.get("source") == "gdrive"
+            or str(m.get("file_path") or "").startswith("drive://")
+        )
+        q_basis = m.get("quality_basis") or ("thumbnail" if is_gdrive else "full")
+        is_exact_copy_of_keeper = bool(
+            keeper_md5 and m_md5 == keeper_md5 and (m.get("file_size") or 0) == keeper_sz
+        )
+        if is_gdrive and q_basis == "thumbnail" and not is_exact_copy_of_keeper:
+            review_ids.append(mid)
+            reasons[mid] = "needs full-resolution confirmation"
+            continue
+
         # Handle secondary byte-identical duplicates first
         if mid in secondary_duplicate_map:
             anchor = secondary_duplicate_map[mid]
@@ -496,6 +513,19 @@ def choose_keeper(
         if ds_px >= k_px:
             assert keeper_sz <= ds_sz, (
                 f"Keeper file size ({keeper_sz} B) exceeds same-resolution delete_safe member ({ds_sz} B)"
+            )
+
+        is_ds_gdrive = (
+            ds_m.get("source") == "gdrive"
+            or str(ds_m.get("file_path") or "").startswith("drive://")
+        )
+        ds_q_basis = ds_m.get("quality_basis") or ("thumbnail" if is_ds_gdrive else "full")
+        if is_ds_gdrive and ds_q_basis == "thumbnail":
+            is_ds_exact_keeper = bool(
+                keeper_md5 and ds_m.get("md5") == keeper_md5 and (ds_m.get("file_size") or 0) == keeper_sz
+            )
+            assert is_ds_exact_keeper, (
+                f"Hard invariant violation: Drive member {ds_id} with quality_basis='thumbnail' marked delete_safe"
             )
 
     # Total savings in bytes if delete_safe members are deleted
@@ -676,10 +706,7 @@ def run_keeper_pipeline(
         cid = c["id"]
         members = conn.execute(
             """
-            SELECT id, file_path, file_size, width, height, format, md5, phash,
-                   status, cluster_id, is_keeper, is_low_confidence,
-                   ssim, ssim_color, sharpness_ratio, pixel_ratio, bytes_ratio, quality_status,
-                   source_likelihood, jpeg_quality_est
+            SELECT *
             FROM images
             WHERE cluster_id = ?
             ORDER BY id

@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS images (
     resolution_pct REAL,                         -- pixel count % vs reference (100.0 for ref/exact)
     source        TEXT    NOT NULL DEFAULT 'local',      -- 'local' | 'gdrive'
     drive_id      TEXT,                                  -- Google Drive file ID (when source='gdrive')
+    quality_basis TEXT,                                  -- 'thumbnail' | 'full'
     category_top1 TEXT,                          -- top-1 predicted category or 'uncertain'
     category_top1_prob REAL,                     -- probability of top-1 category (0.0 - 1.0)
     category_top3 TEXT,                          -- JSON array of [{"label": ..., "prob": ...}, ...]

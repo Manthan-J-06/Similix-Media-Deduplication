@@ -15,6 +15,7 @@ READ-ONLY integration:
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import io
 import json
 import logging
@@ -292,11 +293,13 @@ class GoogleDriveSource(ImageSource):
         stage: str = "stage0",
         max_file_download_size: int = 100 * 1024 * 1024,
         max_cache_bytes: int = DEFAULT_MAX_CACHE_BYTES,
+        config: dict | None = None,
     ):
         self.folder_id = folder_id
         self.all_drive = all_drive
         self._service = service
         self._credentials = credentials
+        self.config = config or {}
         self.cache_dir = Path(cache_dir or DEFAULT_CACHE_DIR).expanduser()
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.temp_dir = Path(temp_dir) if temp_dir else None
@@ -717,3 +720,243 @@ class GoogleDriveSource(ImageSource):
 
         record_bandwidth(self.conn, self.stage, drive_id, len(data), "full_file")
         return data
+
+
+@dataclass
+class MemberConfirmationRecord:
+    member_id: int
+    file_path: str
+    cluster_id: int
+    thumb_match_pct: float | None
+    full_match_pct: float | None
+    thumb_ssim: float | None
+    full_ssim: float | None
+    bytes_downloaded: int
+    is_delete_safe: bool = False
+    reason: str | None = None
+
+
+@dataclass
+class ConfirmDriveResult:
+    confirmed_members: list[MemberConfirmationRecord] = field(default_factory=list)
+    total_confirmed_bytes: int = 0
+    total_library_bytes: int = 0
+    bandwidth_ratio_pct: float = 0.0
+
+
+def run_confirm_drive(
+    conn: sqlite3.Connection,
+    config: dict | None = None,
+    mode: str = "balanced",
+    source: GoogleDriveSource | None = None,
+) -> ConfirmDriveResult:
+    """
+    Confirm Drive candidate delete_safe images at full resolution.
+    For every Drive member that WOULD be delete_safe in the current mode:
+    1. Streams the full file (size cap, temp dir, deleted after use).
+    2. Recomputes ssim/ssim_color/match_pct at 1024px against the reference's full file.
+    3. Sets quality_basis='full'.
+    4. Re-runs existing invariants via run_keeper_pipeline.
+    Logs all bytes in drive_bandwidth table under stage='confirm'.
+    """
+    from core.keeper import choose_keeper, run_keeper_pipeline
+    from core.quality import align_and_compute_metrics, ensure_quality_columns
+
+    ensure_quality_columns(conn)
+
+    # Initialize GoogleDriveSource if not provided
+    if source is None:
+        source = GoogleDriveSource(conn=conn, config=config, stage="confirm")
+    else:
+        source.stage = "confirm"
+        if source.conn is None:
+            source.conn = conn
+
+    initial_confirmed_bytes_row = conn.execute(
+        "SELECT COALESCE(SUM(bytes_downloaded), 0) FROM drive_bandwidth WHERE stage = 'confirm'"
+    ).fetchone()
+    initial_confirmed_bytes = int(initial_confirmed_bytes_row[0]) if initial_confirmed_bytes_row else 0
+
+    clusters = conn.execute(
+        "SELECT id, representative_id FROM clusters ORDER BY id"
+    ).fetchall()
+
+    confirmed_records: list[MemberConfirmationRecord] = []
+
+    for cluster in clusters:
+        cid = cluster["id"]
+        members_rows = conn.execute(
+            "SELECT * FROM images WHERE cluster_id = ? ORDER BY id",
+            (cid,),
+        ).fetchall()
+        if not members_rows or len(members_rows) < 2:
+            continue
+
+        members = [dict(r) for r in members_rows]
+
+        # Determine which members WOULD be delete_safe in current mode:
+        hypo_members = []
+        for m in members:
+            m_copy = dict(m)
+            m_copy["quality_basis"] = "full"
+            hypo_members.append(m_copy)
+
+        hypo_plan = choose_keeper(hypo_members, mode=mode, config=config)
+        hypo_delete_safe_ids = set(hypo_plan.get("delete_safe_ids", []))
+        keeper_id = hypo_plan.get("keeper_id")
+        keeper_m = next((x for x in members if x["id"] == keeper_id), None)
+        keeper_md5 = keeper_m.get("md5") if keeper_m else None
+
+        # Identify Drive members that need full-resolution confirmation:
+        candidates_to_confirm = []
+        for m in members:
+            mid = m["id"]
+            if mid not in hypo_delete_safe_ids:
+                continue
+            is_drive = m.get("source") == "gdrive" or str(m.get("file_path", "")).startswith("drive://")
+            if not is_drive:
+                continue
+            is_keeper_copy = bool(keeper_md5 and m.get("md5") and m.get("md5") == keeper_md5)
+            if is_keeper_copy:
+                continue
+            if m.get("quality_basis") == "full":
+                continue
+            candidates_to_confirm.append(m)
+
+        if not candidates_to_confirm:
+            continue
+
+        # Find cluster reference member (representative_id or first member)
+        ref_id = cluster["representative_id"]
+        ref_m = next((x for x in members if x["id"] == ref_id), members[0])
+
+        # Load reference full file
+        ref_path = ref_m["file_path"]
+        ref_bytes = source.get_bytes(ref_path)
+        ref_img_full = Image.open(io.BytesIO(ref_bytes)).convert("RGB")
+        ref_orig_dims = (ref_m.get("width") or ref_img_full.size[0], ref_m.get("height") or ref_img_full.size[1])
+        ref_sz = ref_m.get("file_size") or len(ref_bytes)
+
+        # For each candidate, stream full file and recompute at 1024px against ref
+        for cand in candidates_to_confirm:
+            cand_id = cand["id"]
+            cand_path = cand["file_path"]
+            thumb_match_pct = cand.get("match_pct")
+            thumb_ssim = cand.get("ssim")
+
+            bytes_before_row = conn.execute(
+                "SELECT COALESCE(SUM(bytes_downloaded), 0) FROM drive_bandwidth WHERE stage = 'confirm'"
+            ).fetchone()
+            bytes_before = int(bytes_before_row[0]) if bytes_before_row else 0
+
+            cand_bytes = source.get_bytes(cand_path)
+            cand_img_full = Image.open(io.BytesIO(cand_bytes)).convert("RGB")
+            cand_orig_dims = (cand.get("width") or cand_img_full.size[0], cand.get("height") or cand_img_full.size[1])
+            cand_sz = cand.get("file_size") or len(cand_bytes)
+
+            metrics = align_and_compute_metrics(
+                member_path=cand_img_full,
+                reference_path=ref_img_full,
+                member_id=cand_id,
+                reference_id=ref_m["id"],
+                member_orig_dims=cand_orig_dims,
+                reference_orig_dims=ref_orig_dims,
+                member_file_size=cand_sz,
+                reference_file_size=ref_sz,
+                conn=conn,
+                config=config,
+                source=None,
+            )
+
+            is_exact = bool(cand.get("md5") and cand.get("md5") == ref_m.get("md5"))
+            if is_exact:
+                match_pct = 100.0
+                resolution_pct = 100.0
+            else:
+                match_pct = round(metrics.ssim_color * 100.0, 1) if metrics.ssim_color is not None else None
+                resolution_pct = round(metrics.pixel_ratio * 100.0, 1) if metrics.pixel_ratio is not None else None
+
+            # Update candidate in DB with quality_basis='full'
+            conn.execute(
+                """
+                UPDATE images
+                SET ssim = ?,
+                    ssim_color = ?,
+                    sharpness_ratio = ?,
+                    pixel_ratio = ?,
+                    bytes_ratio = ?,
+                    quality_status = ?,
+                    match_pct = ?,
+                    resolution_pct = ?,
+                    quality_basis = 'full',
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                WHERE id = ?
+                """,
+                (
+                    metrics.ssim,
+                    metrics.ssim_color,
+                    metrics.sharpness_ratio,
+                    metrics.pixel_ratio,
+                    metrics.bytes_ratio,
+                    metrics.quality_status,
+                    match_pct,
+                    resolution_pct,
+                    cand_id,
+                ),
+            )
+
+            # Update reference in DB with quality_basis='full'
+            conn.execute(
+                "UPDATE images SET quality_basis = 'full' WHERE id = ?",
+                (ref_m["id"],),
+            )
+            conn.commit()
+
+            bytes_after_row = conn.execute(
+                "SELECT COALESCE(SUM(bytes_downloaded), 0) FROM drive_bandwidth WHERE stage = 'confirm'"
+            ).fetchone()
+            bytes_after = int(bytes_after_row[0]) if bytes_after_row else 0
+
+            confirmed_records.append(
+                MemberConfirmationRecord(
+                    member_id=cand_id,
+                    file_path=cand_path,
+                    cluster_id=cid,
+                    thumb_match_pct=thumb_match_pct,
+                    full_match_pct=match_pct,
+                    thumb_ssim=thumb_ssim,
+                    full_ssim=metrics.ssim,
+                    bytes_downloaded=bytes_after - bytes_before,
+                )
+            )
+
+    # Re-run existing invariants via run_keeper_pipeline
+    run_keeper_pipeline(conn, config=config, mode=mode)
+
+    # Populate final delete_safe / reason status for confirmed members
+    for rec in confirmed_records:
+        row = conn.execute(
+            "SELECT delete_safe, reason FROM images WHERE id = ?",
+            (rec.member_id,),
+        ).fetchone()
+        if row:
+            rec.is_delete_safe = bool(row["delete_safe"])
+            rec.reason = row["reason"]
+
+    # Bandwidth accounting totals
+    final_confirmed_bytes_row = conn.execute(
+        "SELECT COALESCE(SUM(bytes_downloaded), 0) FROM drive_bandwidth WHERE stage = 'confirm'"
+    ).fetchone()
+    total_confirmed = (int(final_confirmed_bytes_row[0]) if final_confirmed_bytes_row else 0) - initial_confirmed_bytes
+
+    lib_row = conn.execute("SELECT COALESCE(SUM(file_size), 0) FROM images").fetchone()
+    total_library = int(lib_row[0]) if lib_row else 0
+
+    ratio_pct = (total_confirmed / total_library * 100.0) if total_library > 0 else 0.0
+
+    return ConfirmDriveResult(
+        confirmed_members=confirmed_records,
+        total_confirmed_bytes=total_confirmed,
+        total_library_bytes=total_library,
+        bandwidth_ratio_pct=round(ratio_pct, 2),
+    )
