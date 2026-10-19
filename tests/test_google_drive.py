@@ -460,3 +460,112 @@ class TestBandwidthAccountingSummary:
         assert "STAGE1" in captured
         assert "STAGE3" in captured
         assert "Bandwidth saved vs full download" in captured
+
+    def test_metadata_bytes_logged_during_list_and_get(self, db: sqlite3.Connection, tmp_path: Path):
+        """All metadata API operations (list, get, fetch thumbnailLink) must be logged in drive_bandwidth."""
+        mock_service = MagicMock()
+        mock_service.files().list().execute.return_value = {
+            "files": [
+                {
+                    "id": "item_1",
+                    "name": "pic.jpg",
+                    "mimeType": "image/jpeg",
+                    "size": "50000",
+                    "md5Checksum": "hash_1",
+                    "modifiedTime": "2024-01-01T00:00:00.000Z",
+                    "imageMediaMetadata": {"width": 800, "height": 600},
+                    "trashed": False,
+                }
+            ]
+        }
+        mock_service.files().get().execute.return_value = {
+            "id": "item_1",
+            "name": "pic.jpg",
+            "mimeType": "image/jpeg",
+            "size": "50000",
+            "md5Checksum": "hash_1",
+            "modifiedTime": "2024-01-01T00:00:00.000Z",
+            "imageMediaMetadata": {"width": 800, "height": 600},
+            "thumbnailLink": "https://example.com/thumb",
+            "trashed": False,
+        }
+
+        source = GoogleDriveSource(
+            service=mock_service,
+            cache_dir=tmp_path / "cache",
+            conn=db,
+            stage="stage0",
+        )
+
+        files = list(source.list_files())
+        assert len(files) == 1
+
+        # Check list metadata logged
+        rows = db.execute("SELECT item_type, bytes_downloaded FROM drive_bandwidth WHERE item_type = 'metadata'").fetchall()
+        assert len(rows) >= 1
+        assert rows[0]["bytes_downloaded"] > 0
+
+        # Now call get_metadata
+        source._metadata_cache.clear()
+        source.get_metadata(files[0])
+        rows_after = db.execute("SELECT item_type, bytes_downloaded FROM drive_bandwidth WHERE item_type = 'metadata'").fetchall()
+        assert len(rows_after) >= 2
+
+
+class TestLRUThumbnailCache:
+    def test_lru_cache_eviction(self, tmp_path: Path):
+        """Cache must respect max_cache_bytes and evict least recently used files."""
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+
+        # Set limit to 4000 bytes
+        source = GoogleDriveSource(
+            cache_dir=cache_dir,
+            max_cache_bytes=4000,
+        )
+
+        # Create two 1500-byte files with different access times
+        f1 = cache_dir / "old_file.jpg"
+        f1.write_bytes(b"A" * 1500)
+        os.utime(f1, (1000.0, 1000.0))
+
+        f2 = cache_dir / "recent_file.jpg"
+        f2.write_bytes(b"B" * 1500)
+        os.utime(f2, (2000.0, 2000.0))
+
+        # Total cache is now 3000 bytes <= 4000
+        source._enforce_cache_cap(incoming_bytes=0)
+        assert f1.exists()
+        assert f2.exists()
+
+        # Now simulate incoming 1500 bytes (total would be 4500 > 4000)
+        source._enforce_cache_cap(incoming_bytes=1500)
+
+        # Oldest file (f1 with atime 1000) must be evicted!
+        assert not f1.exists()
+        assert f2.exists()
+
+    def test_cache_hit_updates_atime(self, tmp_path: Path):
+        """Reading an existing thumbnail from cache must update its atime (marking it MRU)."""
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+
+        sample_jpeg = _create_sample_jpeg_bytes()
+        f = cache_dir / "test_100.jpg"
+        f.write_bytes(sample_jpeg)
+        old_time = 500000.0
+        os.utime(f, (old_time, old_time))
+
+        source = GoogleDriveSource(
+            cache_dir=cache_dir,
+            max_cache_bytes=100000,
+        )
+        source._metadata_cache["test"] = MagicMock(modified_time=100.0)
+
+        thumb = source.get_thumbnail("drive://test/photo.jpg")
+        assert isinstance(thumb, Image.Image)
+
+        # Verify access time was updated to current time
+        new_atime = f.stat().st_atime
+        assert new_atime > old_time
+

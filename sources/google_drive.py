@@ -44,6 +44,7 @@ SCOPES = [DRIVE_READONLY_SCOPE]
 DEFAULT_CLIENT_SECRET_PATH = Path.home() / ".argus" / "client_secret.json"
 DEFAULT_TOKEN_PATH = Path.home() / ".argus" / "drive_token.json"
 DEFAULT_CACHE_DIR = Path.home() / ".argus" / "drive_cache"
+DEFAULT_MAX_CACHE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 
 DRIVE_LIST_FIELDS = (
     "nextPageToken, files("
@@ -290,6 +291,7 @@ class GoogleDriveSource(ImageSource):
         concurrency: int = 4,
         stage: str = "stage0",
         max_file_download_size: int = 100 * 1024 * 1024,
+        max_cache_bytes: int = DEFAULT_MAX_CACHE_BYTES,
     ):
         self.folder_id = folder_id
         self.all_drive = all_drive
@@ -302,10 +304,45 @@ class GoogleDriveSource(ImageSource):
         self.concurrency = max(1, concurrency)
         self.stage = stage
         self.max_file_download_size = max_file_download_size
+        self.max_cache_bytes = max_cache_bytes
 
         self.skipped_files: list[tuple[str, str]] = []
         self._metadata_cache: dict[str, ImageMetadata] = {}
         self._drive_item_cache: dict[str, dict[str, Any]] = {}
+
+    def _enforce_cache_cap(self, incoming_bytes: int = 0) -> None:
+        """
+        Enforce max_cache_bytes limit on cache_dir using LRU eviction based on access time (st_atime).
+        """
+        if not self.cache_dir.exists():
+            return
+
+        entries: list[tuple[float, int, Path]] = []
+        total_size = 0
+        try:
+            for p in self.cache_dir.iterdir():
+                if p.is_file() and not p.name.startswith("."):
+                    stat = p.stat()
+                    entries.append((stat.st_atime, stat.st_size, p))
+                    total_size += stat.st_size
+        except OSError:
+            return
+
+        target_size = self.max_cache_bytes - incoming_bytes
+        if total_size <= target_size:
+            return
+
+        # Sort by access time ascending (oldest accessed first = LRU)
+        entries.sort(key=lambda x: x[0])
+
+        for atime, size, path in entries:
+            try:
+                path.unlink(missing_ok=True)
+                total_size -= size
+            except OSError:
+                pass
+            if total_size <= target_size:
+                break
 
     @property
     def service(self) -> Any:
@@ -360,6 +397,8 @@ class GoogleDriveSource(ImageSource):
                     includeItemsFromAllDrives=True,
                 )
                 res = retry_with_backoff(lambda: req.execute())
+                res_bytes = len(json.dumps(res).encode("utf-8"))
+                record_bandwidth(self.conn, self.stage, curr_folder or "drive_root", res_bytes, "metadata")
 
                 files = res.get("files", [])
                 for item in files:
@@ -452,6 +491,8 @@ class GoogleDriveSource(ImageSource):
             supportsAllDrives=True,
         )
         item = retry_with_backoff(lambda: req.execute())
+        res_bytes = len(json.dumps(item).encode("utf-8"))
+        record_bandwidth(self.conn, self.stage, drive_id, res_bytes, "metadata")
         self._drive_item_cache[drive_id] = item
 
         mtime_raw = item.get("modifiedTime")
@@ -500,6 +541,8 @@ class GoogleDriveSource(ImageSource):
             supportsAllDrives=True,
         )
         item = retry_with_backoff(lambda: req.execute())
+        res_bytes = len(json.dumps(item).encode("utf-8"))
+        record_bandwidth(self.conn, self.stage, drive_id, res_bytes, "metadata")
         link = item.get("thumbnailLink")
         if drive_id in self._drive_item_cache and link:
             self._drive_item_cache[drive_id]["thumbnailLink"] = link
@@ -555,6 +598,9 @@ class GoogleDriveSource(ImageSource):
         # Check local cache
         if cache_path.exists() and cache_path.stat().st_size > 0:
             try:
+                # Update atime to now for LRU tracking
+                now = time.time()
+                os.utime(cache_path, (now, now))
                 with Image.open(cache_path) as img:
                     thumb = img.convert("RGB")
                     thumb.thumbnail(size, Image.Resampling.LANCZOS)
@@ -594,11 +640,16 @@ class GoogleDriveSource(ImageSource):
         # Record bandwidth
         record_bandwidth(self.conn, self.stage, drive_id, len(raw_bytes), "thumbnail")
 
+        # Enforce LRU cache cap before saving
+        self._enforce_cache_cap(incoming_bytes=len(raw_bytes))
+
         # Save to cache atomically
         tmp_cache = self.cache_dir / f".tmp_{drive_id}_{os.getpid()}_{time.time_ns()}.jpg"
         try:
             tmp_cache.write_bytes(raw_bytes)
             os.replace(tmp_cache, cache_path)
+            now = time.time()
+            os.utime(cache_path, (now, now))
         except Exception:
             if tmp_cache.exists():
                 tmp_cache.unlink(missing_ok=True)

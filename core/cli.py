@@ -169,6 +169,11 @@ def cmd_embed(args: argparse.Namespace) -> None:
     print(f"Device used           : {res.device_used}")
     print("--------------------------------------------------")
 
+    if has_gdrive:
+        from sources.google_drive import print_bandwidth_summary
+        print()
+        print_bandwidth_summary(conn)
+
 
 def cmd_cluster(args: argparse.Namespace) -> None:
     cfg = load_config(args.config)
@@ -236,16 +241,15 @@ def cmd_verify(args: argparse.Namespace) -> None:
     print(f"Min Inlier Ratio : {min_rat}")
     print()
 
+    has_gdrive = conn.execute("SELECT 1 FROM images WHERE source = 'gdrive' LIMIT 1").fetchone() is not None
     source = None
     if args.folder:
         folder = Path(args.folder).resolve()
         if folder.exists() and folder.is_dir():
             source = LocalFolderSource(folder)
-    else:
-        has_gdrive = conn.execute("SELECT 1 FROM images WHERE source = 'gdrive' LIMIT 1").fetchone() is not None
-        if has_gdrive:
-            from sources.google_drive import GoogleDriveSource
-            source = GoogleDriveSource(conn=conn, stage="stage3")
+    elif has_gdrive:
+        from sources.google_drive import GoogleDriveSource
+        source = GoogleDriveSource(conn=conn, stage="stage3")
 
     from core.verify import run_stage3_verification
     res = run_stage3_verification(conn, cfg, source=source)
@@ -262,6 +266,11 @@ def cmd_verify(args: argparse.Namespace) -> None:
     print(f"Remaining duplicate groups: {total_clusters}")
     print(f"Remaining clustered files: {clustered_images}")
     print("--------------------------------------------------")
+
+    if has_gdrive:
+        from sources.google_drive import print_bandwidth_summary
+        print()
+        print_bandwidth_summary(conn)
 
 
 def cmd_quality(args: argparse.Namespace) -> None:
@@ -283,16 +292,15 @@ def cmd_quality(args: argparse.Namespace) -> None:
     print(f"Min Inlier Ratio : {min_rat}")
     print()
 
+    has_gdrive = conn.execute("SELECT 1 FROM images WHERE source = 'gdrive' LIMIT 1").fetchone() is not None
     source = None
     if args.folder:
         folder = Path(args.folder).resolve()
         if folder.exists() and folder.is_dir():
             source = LocalFolderSource(folder)
-    else:
-        has_gdrive = conn.execute("SELECT 1 FROM images WHERE source = 'gdrive' LIMIT 1").fetchone() is not None
-        if has_gdrive:
-            from sources.google_drive import GoogleDriveSource
-            source = GoogleDriveSource(conn=conn, stage="stage4")
+    elif has_gdrive:
+        from sources.google_drive import GoogleDriveSource
+        source = GoogleDriveSource(conn=conn, stage="stage4")
 
     from core.quality import run_quality_pipeline
     res = run_quality_pipeline(conn, cfg, source=source)
@@ -304,6 +312,11 @@ def cmd_quality(args: argparse.Namespace) -> None:
     print(f"Members aligned          : {res.members_aligned}")
     print(f"Members unalignable      : {res.members_unalignable}")
     print("--------------------------------------------------")
+
+    if has_gdrive:
+        from sources.google_drive import print_bandwidth_summary
+        print()
+        print_bandwidth_summary(conn)
 
 
 def cmd_keeper(args: argparse.Namespace) -> None:
