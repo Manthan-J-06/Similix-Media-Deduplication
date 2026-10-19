@@ -1155,3 +1155,174 @@ class TestSwapProposals:
         assert orig_entry.keeper_id == 2
 
 
+class TestHardDeleteSafeInvariants:
+    """
+    Hard invariant in core/keeper.py:
+    No member with match_pct below min_cluster_match_pct (75.0),
+    or with confidence < 0.99,
+    or with quality_status != 'aligned'/'reference'
+    can ever be delete_safe in ANY mode (conservative, balanced, aggressive).
+    Tested using the exact false-merge pairs from realset.
+    """
+
+    def test_cluster_41_bodleian_low_match_pct_never_delete_safe(self):
+        # Cluster 41 exact members from realset
+        members = [
+            {
+                "id": 348,
+                "file_path": "/photos/bodleian_000019.jpg",
+                "file_size": 260_991,
+                "width": 1024,
+                "height": 768,
+                "md5": "md5_bodleian_19",
+                "ssim": 0.6411,
+                "ssim_color": 0.6334,
+                "match_pct": 63.3,
+                "quality_status": "aligned",
+                "is_low_confidence": 0,
+                "confidence": 0.9999936,
+            },
+            {
+                "id": 366,
+                "file_path": "/photos/bodleian_000351.jpg",
+                "file_size": 285_120,
+                "width": 1024,
+                "height": 768,
+                "md5": "md5_bodleian_351",
+                "ssim": 1.0,
+                "ssim_color": 1.0,
+                "match_pct": 100.0,
+                "quality_status": "reference",
+                "is_low_confidence": 0,
+                "confidence": 1.0,
+            },
+        ]
+        for mode in ("conservative", "balanced", "aggressive"):
+            res = choose_keeper(members, mode=mode)
+            # bodleian_000019 (match_pct 63.3 < 75.0) MUST NEVER be delete_safe
+            assert 348 not in res["delete_safe_ids"], f"Failed in {mode} mode"
+            assert 348 in res["review_ids"], f"Expected review in {mode} mode"
+            assert "below minimum cluster match threshold" in res["reasons"][348]
+
+    def test_cluster_42_radcliffe_camera_low_match_and_conf_never_delete_safe(self):
+        # Cluster 42 exact members from realset
+        members = [
+            {
+                "id": 113,
+                "file_path": "/photos/oxford_001122.jpg",
+                "file_size": 395_100,
+                "width": 1024,
+                "height": 768,
+                "md5": "md5_oxford_1122",
+                "ssim": 1.0,
+                "ssim_color": 1.0,
+                "match_pct": 100.0,
+                "quality_status": "reference",
+                "is_low_confidence": 0,
+                "confidence": 1.0,
+            },
+            {
+                "id": 120,
+                "file_path": "/photos/radcliffe_camera_000116.jpg",
+                "file_size": 287_484,
+                "width": 1024,
+                "height": 768,
+                "md5": "md5_radcliffe_116",
+                "ssim": 0.2706,
+                "ssim_color": 0.2627,
+                "match_pct": 26.3,
+                "quality_status": "aligned",
+                "is_low_confidence": 0,
+                "confidence": 0.916877,
+            },
+            {
+                "id": 282,
+                "file_path": "/photos/radcliffe_camera_000130.jpg",
+                "file_size": 361_145,
+                "width": 1024,
+                "height": 768,
+                "md5": "md5_radcliffe_130",
+                "ssim": 0.4026,
+                "ssim_color": 0.3964,
+                "match_pct": 39.6,
+                "quality_status": "aligned",
+                "is_low_confidence": 0,
+                "confidence": 0.999248,
+            },
+        ]
+        for mode in ("conservative", "balanced", "aggressive"):
+            res = choose_keeper(members, mode=mode)
+            # Both radcliffe members have match_pct < 75.0 (and 120 has conf < 0.99)
+            assert 120 not in res["delete_safe_ids"], f"Failed 120 in {mode} mode"
+            assert 282 not in res["delete_safe_ids"], f"Failed 282 in {mode} mode"
+            assert 120 in res["review_ids"]
+            assert 282 in res["review_ids"]
+
+    def test_cluster_31_unalignable_member_never_delete_safe(self):
+        # Cluster 31 exact members from realset
+        members = [
+            {
+                "id": 50,
+                "file_path": "/photos/magdalen_000538_screenshot.png",
+                "file_size": 1_334_966,
+                "width": 1024,
+                "height": 768,
+                "md5": "md5_screenshot",
+                "ssim": 0.9233,
+                "ssim_color": 0.9174,
+                "match_pct": 91.7,
+                "quality_status": "aligned",
+                "is_low_confidence": 0,
+                "confidence": 0.9999998,
+            },
+            {
+                "id": 111,
+                "file_path": "/photos/magdalen_000538.jpg",
+                "file_size": 398_172,
+                "width": 1024,
+                "height": 768,
+                "md5": "md5_orig",
+                "ssim": 0.9233,
+                "ssim_color": 0.9174,
+                "match_pct": 91.7,
+                "quality_status": "aligned",
+                "is_low_confidence": 0,
+                "confidence": 1.0,
+            },
+            {
+                "id": 416,
+                "file_path": "/photos/magdalen_000538_res_1080_q70.jpg",
+                "file_size": 95_000,
+                "width": 1024,
+                "height": 768,
+                "md5": "md5_1080_q70",
+                "ssim": 1.0,
+                "ssim_color": 1.0,
+                "match_pct": 100.0,
+                "quality_status": "reference",
+                "is_low_confidence": 0,
+                "confidence": 0.9999995,
+            },
+            {
+                "id": 423,
+                "file_path": "/photos/radcliffe_camera_000345.jpg",
+                "file_size": 290_000,
+                "width": 1024,
+                "height": 768,
+                "md5": "md5_radcliffe_345",
+                "ssim": None,
+                "ssim_color": None,
+                "match_pct": None,
+                "quality_status": "unalignable",
+                "is_low_confidence": 0,
+                "confidence": 0.1233,
+            },
+        ]
+        for mode in ("conservative", "balanced", "aggressive"):
+            res = choose_keeper(members, mode=mode)
+            # Radcliffe impostor (unalignable, conf 0.12 < 0.99) MUST NEVER be delete_safe
+            assert 423 not in res["delete_safe_ids"], f"Failed 423 in {mode} mode"
+            assert 423 in res["review_ids"]
+
+
+

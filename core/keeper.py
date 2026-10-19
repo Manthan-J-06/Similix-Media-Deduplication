@@ -180,6 +180,10 @@ def choose_keeper(
     if allow_resolution_loss is not None:
         res_loss_allowed = bool(allow_resolution_loss)
 
+    cfg = config or {}
+    q_cfg = cfg.get("quality", {})
+    min_cluster_match_pct = float(q_cfg.get("min_cluster_match_pct", 75.0))
+
     # Identify the cluster reference member
     ref_member = None
     for m in members:
@@ -371,6 +375,44 @@ def choose_keeper(
         else:
             m_quality = 0.0
 
+        # Determine effective match percentage
+        m_match_pct = m.get("match_pct")
+        if m_match_pct is None and m.get("ssim_color") is not None:
+            m_match_pct = round(float(m["ssim_color"]) * 100.0, 1)
+        elif m_match_pct is None and keeper_md5 and m_md5 == keeper_md5:
+            m_match_pct = 100.0
+        elif m_match_pct is None and m.get("ssim") is not None:
+            m_match_pct = round(float(m["ssim"]) * 100.0, 1)
+
+        m_conf = m.get("confidence")
+        conf_val = (float(m_conf) if float(m_conf) <= 1.0 else float(m_conf) / 100.0) if m_conf is not None else None
+
+        # Hard invariant: no member with match_pct below min_cluster_match_pct,
+        # or with confidence < 0.99, or with quality_status != 'aligned'/'reference'
+        # can ever be delete_safe in any mode.
+        if q_status not in ("reference", "aligned"):
+            review_ids.append(mid)
+            if q_status == "unalignable":
+                reasons[mid] = "Unalignable member (geometric verification/alignment failed)"
+            else:
+                reasons[mid] = f"Unverified quality status '{q_status}' (manual review required)"
+            continue
+
+        if m_match_pct is not None and m_match_pct < min_cluster_match_pct:
+            review_ids.append(mid)
+            reasons[mid] = f"Match percentage ({m_match_pct:.1f}%) below minimum cluster match threshold ({min_cluster_match_pct:.1f}%)"
+            continue
+
+        if conf_val is not None and conf_val < 0.99:
+            review_ids.append(mid)
+            reasons[mid] = f"Duplicate confidence ({conf_val:.4f}) below safe deletion threshold (0.99)"
+            continue
+
+        if is_low_conf:
+            review_ids.append(mid)
+            reasons[mid] = "Inconclusive keypoints (< 100) / low confidence (manual review required)"
+            continue
+
         # Handle secondary byte-identical duplicates first
         if mid in secondary_duplicate_map:
             anchor = secondary_duplicate_map[mid]
@@ -390,17 +432,7 @@ def choose_keeper(
                     reasons[mid] = f"Byte-identical duplicate of {anchor_name}"
             continue
 
-        # Check unalignable, low-confidence, or unverified
-        if q_status == "unalignable":
-            review_ids.append(mid)
-            reasons[mid] = "Unalignable member (geometric verification/alignment failed)"
-        elif is_low_conf:
-            review_ids.append(mid)
-            reasons[mid] = "Inconclusive keypoints (< 100) / low confidence (manual review required)"
-        elif q_status not in ("reference", "aligned"):
-            review_ids.append(mid)
-            reasons[mid] = f"Unverified quality status '{q_status}' (manual review required)"
-        elif mode == "conservative":
+        if mode == "conservative":
             # Conservative mode: keeper = reference.
             # delete_safe = byte-identical copies of keeper plus members strictly worse
             # (lower resolution or SSIM below keeper by > 0.005) and verified.
@@ -432,10 +464,33 @@ def choose_keeper(
     assert keeper_id not in delete_safe_ids, "Keeper cannot be marked delete_safe"
     assert len(delete_safe_ids) < len(members), "Cannot mark all cluster members as delete_safe"
 
-    # Invariant: Keeper file size must never exceed any same-resolution delete_safe member's size
     id_to_m = {m.get("id"): m for m in members}
     for ds_id in delete_safe_ids:
         ds_m = id_to_m[ds_id]
+        ds_status = ds_m.get("quality_status")
+        assert ds_status in ("aligned", "reference"), (
+            f"Hard invariant violation: delete_safe member {ds_id} has quality_status '{ds_status}'"
+        )
+        ds_mp = ds_m.get("match_pct")
+        if ds_mp is None and ds_m.get("ssim_color") is not None:
+            ds_mp = round(float(ds_m["ssim_color"]) * 100.0, 1)
+        elif ds_mp is None and keeper_md5 and ds_m.get("md5") == keeper_md5:
+            ds_mp = 100.0
+        elif ds_mp is None and ds_m.get("ssim") is not None:
+            ds_mp = round(float(ds_m["ssim"]) * 100.0, 1)
+
+        if ds_mp is not None:
+            assert ds_mp >= min_cluster_match_pct, (
+                f"Hard invariant violation: delete_safe member {ds_id} has match_pct {ds_mp} < {min_cluster_match_pct}"
+            )
+
+        ds_conf = ds_m.get("confidence")
+        if ds_conf is not None:
+            ds_conf_val = float(ds_conf) if float(ds_conf) <= 1.0 else float(ds_conf) / 100.0
+            assert ds_conf_val >= 0.99, (
+                f"Hard invariant violation: delete_safe member {ds_id} has confidence {ds_conf_val} < 0.99"
+            )
+
         ds_px = (ds_m.get("width") or 0) * (ds_m.get("height") or 0)
         ds_sz = ds_m.get("file_size") or 0
         if ds_px >= k_px:
