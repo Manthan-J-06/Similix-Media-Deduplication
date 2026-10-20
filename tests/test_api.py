@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+import shutil
 import sqlite3
 import time
 
@@ -601,6 +602,78 @@ class TestAPIServer:
         # Unknown ID not in DB -> 404
         res_unknown = client.get("/thumb/99999?size=96")
         assert res_unknown.status_code == 404
+
+    def test_old_schema_db_migration_and_viewer_clusters(self, tmp_path: Path):
+        """
+        Build a DB using the oldest schema (copy real ~/dedupe_test/demo_backup2/demo.db)
+        and open it with init_db without error, and verify the viewer API lists clusters from it.
+        """
+        real_backup = Path.home() / "dedupe_test/demo_backup2/demo.db"
+        test_db = tmp_path / "old_demo_copy.db"
+
+        if real_backup.exists():
+            shutil.copyfile(real_backup, test_db)
+            raw_conn = sqlite3.connect(test_db)
+            cols_before = {r[1] for r in raw_conn.execute("PRAGMA table_info(images)").fetchall()}
+            raw_conn.close()
+            assert "drive_id" not in cols_before
+        else:
+            raw_conn = sqlite3.connect(test_db)
+            raw_conn.executescript(
+                """
+                CREATE TABLE images (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_path     TEXT NOT NULL UNIQUE,
+                    file_size     INTEGER,
+                    modified_time REAL,
+                    width         INTEGER,
+                    height        INTEGER,
+                    format        TEXT,
+                    md5           TEXT,
+                    phash         TEXT,
+                    clip_vector   BLOB,
+                    status        TEXT NOT NULL DEFAULT 'discovered',
+                    cluster_id    INTEGER,
+                    is_keeper     INTEGER NOT NULL DEFAULT 0,
+                    created_at    TEXT NOT NULL,
+                    updated_at    TEXT NOT NULL
+                );
+                CREATE TABLE clusters (
+                    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                    representative_id INTEGER,
+                    stage_detected    INTEGER NOT NULL,
+                    member_count      INTEGER NOT NULL DEFAULT 0,
+                    created_at        TEXT NOT NULL
+                );
+                INSERT INTO clusters (id, representative_id, stage_detected, member_count, created_at)
+                VALUES (1, NULL, 0, 2, '2026-01-01T00:00:00Z');
+                INSERT INTO images (id, file_path, file_size, width, height, format, md5, cluster_id, is_keeper, created_at, updated_at)
+                VALUES (1, '/p/1.jpg', 1000, 100, 100, 'JPEG', 'md5_1', 1, 1, '2026-01-01', '2026-01-01');
+                INSERT INTO images (id, file_path, file_size, width, height, format, md5, cluster_id, is_keeper, created_at, updated_at)
+                VALUES (2, '/p/2.jpg', 1000, 100, 100, 'JPEG', 'md5_1', 1, 0, '2026-01-01', '2026-01-01');
+                """
+            )
+            raw_conn.commit()
+            raw_conn.close()
+
+        # Opening with init_db directly must not raise OperationalError
+        conn = init_db(test_db)
+        cols_after = {r[1] for r in conn.execute("PRAGMA table_info(images)").fetchall()}
+        assert "drive_id" in cols_after
+        assert "source" in cols_after
+        assert "quality_basis" in cols_after
+        conn.close()
+
+        # The viewer API can list clusters from the migrated DB
+        app = create_app(db_path=test_db)
+        client = TestClient(app)
+        resp = client.get("/clusters")
+        assert resp.status_code == 200
+        clusters = resp.json()
+        assert isinstance(clusters, list)
+        assert len(clusters) > 0
+        assert "id" in clusters[0]
+        assert "keeper" in clusters[0]
 
 
 

@@ -173,9 +173,11 @@ CREATE INDEX IF NOT EXISTS idx_journal_path     ON deletion_journal(original_pat
 CREATE INDEX IF NOT EXISTS idx_images_drive_id  ON images(drive_id);
 CREATE INDEX IF NOT EXISTS idx_images_source    ON images(source);
 CREATE INDEX IF NOT EXISTS idx_bandwidth_stage  ON drive_bandwidth(stage);
+CREATE INDEX IF NOT EXISTS idx_images_category  ON images(category_top1);
+CREATE INDEX IF NOT EXISTS idx_clusters_category ON clusters(category);
 """
 
-ALL_DDL = "\n".join([
+CREATE_TABLES = "\n".join([
     CREATE_IMAGES,
     CREATE_DRIVE_BANDWIDTH,
     CREATE_CLUSTERS,
@@ -183,5 +185,6 @@ ALL_DDL = "\n".join([
     CREATE_ACTIONS,
     CREATE_LEDGER_BATCHES,
     CREATE_DELETION_JOURNAL,
-    CREATE_INDEXES,
 ])
+
+ALL_DDL = CREATE_TABLES + "\n" + CREATE_INDEXES
