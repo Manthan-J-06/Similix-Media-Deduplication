@@ -20,12 +20,14 @@ Verifies:
 from __future__ import annotations
 
 import hashlib
+import io
 from pathlib import Path
 import shutil
 import sqlite3
 import time
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from PIL import Image
 
@@ -618,9 +620,13 @@ class TestAPIServer:
             raw_conn.close()
             assert "drive_id" not in cols_before
         else:
+            p1 = tmp_path / "1.jpg"
+            p2 = tmp_path / "2.jpg"
+            _create_test_image(p1)
+            _create_test_image(p2)
             raw_conn = sqlite3.connect(test_db)
             raw_conn.executescript(
-                """
+                f"""
                 CREATE TABLE images (
                     id            INTEGER PRIMARY KEY AUTOINCREMENT,
                     file_path     TEXT NOT NULL UNIQUE,
@@ -648,9 +654,9 @@ class TestAPIServer:
                 INSERT INTO clusters (id, representative_id, stage_detected, member_count, created_at)
                 VALUES (1, NULL, 0, 2, '2026-01-01T00:00:00Z');
                 INSERT INTO images (id, file_path, file_size, width, height, format, md5, cluster_id, is_keeper, created_at, updated_at)
-                VALUES (1, '/p/1.jpg', 1000, 100, 100, 'JPEG', 'md5_1', 1, 1, '2026-01-01', '2026-01-01');
+                VALUES (1, '{p1}', 1000, 100, 100, 'JPEG', 'md5_1', 1, 1, '2026-01-01', '2026-01-01');
                 INSERT INTO images (id, file_path, file_size, width, height, format, md5, cluster_id, is_keeper, created_at, updated_at)
-                VALUES (2, '/p/2.jpg', 1000, 100, 100, 'JPEG', 'md5_1', 1, 0, '2026-01-01', '2026-01-01');
+                VALUES (2, '{p2}', 1000, 100, 100, 'JPEG', 'md5_1', 1, 0, '2026-01-01', '2026-01-01');
                 """
             )
             raw_conn.commit()
@@ -674,6 +680,264 @@ class TestAPIServer:
         assert len(clusters) > 0
         assert "id" in clusters[0]
         assert "keeper" in clusters[0]
+
+    def test_apply_omits_trashed_file_and_undo_restores(self, api_test_env):
+        """
+        A.1: After apply, GET /clusters/1 omits the trashed file.
+        Undo restores it on disk and brings it back in /clusters/1.
+        """
+        app = api_test_env["app"]
+        client = TestClient(app)
+
+        # Before apply: Cluster 1 has 3 members
+        c1_before = client.get("/clusters/1?mode=conservative").json()
+        assert len(c1_before["members"]) == 3
+        member_ids = [m["id"] for m in c1_before["members"]]
+        assert member_ids == [1, 2, 3]
+
+        # Plan and apply
+        plan_resp = client.post("/plan", json={"mode": "conservative"}).json()
+        batch_id = plan_resp["batch_id"]
+        assert plan_resp["file_count"] >= 1
+
+        apply_resp = client.post("/apply", json={"batch_id": batch_id, "confirm": True})
+        assert apply_resp.status_code == 200
+
+        # After apply: GET /clusters/1 must omit the trashed member (id=2)
+        c1_after = client.get("/clusters/1?mode=conservative").json()
+        live_ids = [m["id"] for m in c1_after["members"]]
+        assert 2 not in live_ids
+        assert live_ids == [1, 3]
+        # Never list a file not on disk
+        for m in c1_after["members"]:
+            assert Path(m["file_path"]).exists()
+
+        # Clusters list also reflects updated member count
+        c_list = client.get("/clusters?mode=conservative").json()
+        c1_summary = next(c for c in c_list if c["id"] == 1)
+        assert c1_summary["member_count"] == 2
+
+        # Undo brings it back
+        undo_resp = client.post("/undo", json={"batch_id": batch_id})
+        assert undo_resp.status_code == 200
+
+        c1_restored = client.get("/clusters/1?mode=conservative").json()
+        restored_ids = [m["id"] for m in c1_restored["members"]]
+        assert 2 in restored_ids
+        assert len(restored_ids) == 3
+        assert Path(api_test_env["files"][2]).exists()
+
+    def test_clusters_hidden_when_under_two_live_members(self, api_test_env):
+        """
+        A.1: Clusters with < 2 live members on disk are hidden from /clusters,
+        and /clusters/{id} returns 404.
+        """
+        app = api_test_env["app"]
+        client = TestClient(app)
+
+        # Cluster 2 initially has 2 members (IDs 4 and 5)
+        c2 = client.get("/clusters/2").json()
+        assert len(c2["members"]) == 2
+
+        # Manually delete member 5 file from disk
+        p_food2 = Path(api_test_env["files"][5])
+        assert p_food2.exists()
+        p_food2.unlink()
+
+        # GET /clusters must now hide Cluster 2
+        clusters = client.get("/clusters").json()
+        c_ids = [c["id"] for c in clusters]
+        assert 2 not in c_ids
+
+        # GET /clusters/2 must return 404
+        resp = client.get("/clusters/2")
+        assert resp.status_code == 404
+        assert "fewer than 2 live members" in resp.json()["detail"]
+
+    def test_upload_path_traversal_filename_rejected(self, api_test_env):
+        """
+        B.2 & B.6: Path traversal filenames must be rejected with 400.
+        """
+        app = api_test_env["app"]
+        client = TestClient(app)
+
+        traversal_names = [
+            "../../escape.jpg",
+            "/absolute/path.jpg",
+            "folder/sub.jpg",
+            "..\\windows_escape.jpg",
+            "....//test.jpg",
+        ]
+        for name in traversal_names:
+            resp = client.post(
+                "/sources/upload",
+                files=[("files", (name, b"dummyimagebytes", "image/jpeg"))],
+            )
+            assert resp.status_code == 400, f"Expected 400 for {name}, got {resp.status_code}"
+            assert "Path traversal rejected" in resp.json()["detail"]
+
+    def test_upload_oversize_rejected(self, api_test_env):
+        """
+        B.2 & B.6: Files exceeding per-file cap (50 MB) must be rejected with 400.
+        """
+        app = api_test_env["app"]
+        # Set per-file cap to 1 MB for testing
+        app.state.config["sources"] = {"upload": {"per_file_cap_mb": 1, "total_cap_mb": 100}}
+        client = TestClient(app)
+
+        # 1.5 MB payload
+        large_bytes = b"0" * (1500 * 1024)
+        resp = client.post(
+            "/sources/upload",
+            files=[("files", ("large.jpg", large_bytes, "image/jpeg"))],
+        )
+        assert resp.status_code == 400
+        assert "cap" in resp.json()["detail"].lower()
+
+    def test_upload_non_image_rejected(self, api_test_env):
+        """
+        B.2 & B.6: Non-image extensions (not jpg/png/webp/heic) rejected with 400.
+        """
+        app = api_test_env["app"]
+        client = TestClient(app)
+
+        bad_files = ["malware.exe", "script.sh", "notes.txt", "data.json", "archive.tar"]
+        for bf in bad_files:
+            resp = client.post(
+                "/sources/upload",
+                files=[("files", (bf, b"some content", "application/octet-stream"))],
+            )
+            assert resp.status_code == 400, f"Expected 400 for {bf}, got {resp.status_code}"
+            assert "Non-image rejected" in resp.json()["detail"]
+
+    def test_dataset_host_outside_allow_list_rejected(self, api_test_env):
+        """
+        B.4 & B.6: Host outside allow-list and non-HTTPS rejected with 400.
+        """
+        app = api_test_env["app"]
+        client = TestClient(app)
+
+        # Disallowed host
+        resp = client.post("/sources/dataset", json={"url": "https://evil.com/dataset.zip"})
+        assert resp.status_code == 400
+        assert "outside allow-list" in resp.json()["detail"].lower()
+
+        # Non-HTTPS
+        resp_http = client.post("/sources/dataset", json={"url": "http://huggingface.co/dataset.zip"})
+        assert resp_http.status_code == 400
+        assert "https" in resp_http.json()["detail"].lower()
+
+    def test_dataset_redirect_off_list_rejected(self, api_test_env, monkeypatch):
+        """
+        B.4 & B.6: Redirect off allow-list rejected with 400.
+        """
+        import urllib.request
+        from urllib.error import HTTPError
+        from api.server import create_app
+
+        app = api_test_env["app"]
+        client = TestClient(app)
+
+        # Mock urllib.request.build_opener to simulate a redirect off the allow-list
+        class MockOpener:
+            def open(self, req, timeout=30):
+                # Simulate redirect to evil.com triggering rejection
+                raise HTTPException(status_code=400, detail="Redirect off allow-list to 'evil.com' rejected")
+
+        monkeypatch.setattr(urllib.request, "build_opener", lambda *args: MockOpener())
+
+        resp = client.post("/sources/dataset", json={"url": "https://huggingface.co/redirect_me.zip"})
+        assert resp.status_code == 400
+        assert "redirect off allow-list" in resp.json()["detail"].lower()
+
+    def test_drive_link_parsing_and_auth_check(self, api_test_env):
+        """
+        B.3 & B.6: Test Drive URL parsing and authentication check.
+        """
+        from api.server import extract_drive_folder_id
+
+        # Parsing variations
+        assert extract_drive_folder_id("https://drive.google.com/drive/folders/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs") == "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs"
+        assert extract_drive_folder_id("https://drive.google.com/drive/u/0/folders/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs?usp=sharing") == "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs"
+        assert extract_drive_folder_id("https://drive.google.com/open?id=1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs") == "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs"
+        assert extract_drive_folder_id("1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs") == "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs"
+
+        # Invalid link
+        with pytest.raises(HTTPException) as exc_info:
+            extract_drive_folder_id("not-a-valid-link")
+        assert exc_info.value.status_code == 400
+
+        # Endpoint auth check when drive-auth not done
+        app = api_test_env["app"]
+        app.state.config["sources"] = {"google_drive": {"token_path": "/tmp/nonexistent_drive_token_xyz.json"}}
+        client = TestClient(app)
+        resp = client.post("/sources/drive", json={"link": "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs"})
+        assert resp.status_code == 400
+        assert "drive-auth" in resp.json()["detail"].lower()
+
+    def test_no_deletion_calls_in_sources_endpoints(self, api_test_env, monkeypatch):
+        """
+        B.6 Security Invariant: Zero deletion or file removal calls in /sources/* endpoints.
+        """
+        import os
+        import shutil
+
+        deletion_called = []
+
+        def spy_remove(path, *args, **kwargs):
+            deletion_called.append(str(path))
+            raise RuntimeError("Deletion forbidden in sources endpoints!")
+
+        monkeypatch.setattr(os, "remove", spy_remove)
+        monkeypatch.setattr(os, "unlink", spy_remove)
+        monkeypatch.setattr(shutil, "rmtree", spy_remove)
+
+        app = api_test_env["app"]
+        # Mock background pipeline launch so test focuses on endpoint logic
+        app.state.pipeline_worker = lambda *args, **kwargs: None
+        client = TestClient(app)
+
+        # 1. Valid upload
+        img_bytes = io.BytesIO()
+        Image.new("RGB", (10, 10)).save(img_bytes, format="JPEG")
+        resp_up = client.post(
+            "/sources/upload",
+            files=[("files", ("test_safe.jpg", img_bytes.getvalue(), "image/jpeg"))],
+        )
+        assert resp_up.status_code == 200
+        assert len(deletion_called) == 0
+
+        # 2. Rescan endpoint
+        resp_rescan = client.post("/sources/rescan")
+        assert resp_rescan.status_code == 200
+        assert len(deletion_called) == 0
+
+        # 3. Jobs endpoint
+        job_id = resp_up.json()["job_id"]
+        resp_job = client.get(f"/jobs/{job_id}")
+        assert resp_job.status_code == 200
+        assert len(deletion_called) == 0
+
+    def test_categories_empty_shows_not_categorized_yet(self, tmp_path):
+        """
+        C.7: In the category filter, show 'Not categorized yet' when the DB has no category rows.
+        """
+        empty_db = tmp_path / "empty_categories.db"
+        conn = init_db(empty_db)
+        conn.close()
+
+        app = create_app(db_path=empty_db)
+        client = TestClient(app)
+
+        # GET /categories returns empty dict
+        resp = client.get("/categories")
+        assert resp.status_code == 200
+        assert resp.json() == {}
+
+        # UI index.html contains "Not categorized yet" handling
+        ui_resp = client.get("/")
+        assert ui_resp.status_code == 200
+        assert "Not categorized yet" in ui_resp.text
 
 
 

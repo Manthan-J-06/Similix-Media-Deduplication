@@ -11,12 +11,18 @@ import io
 import logging
 import os
 from pathlib import Path
+import re
+import shutil
 import sqlite3
 import threading
+import time
 from typing import Any, Optional
+import urllib.parse
+import urllib.request
 import uuid
+import zipfile
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from PIL import Image
@@ -78,6 +84,160 @@ class UndoRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
 
+class DriveSourceRequest(BaseModel):
+    link: str
+    project: str = "default"
+    model_config = ConfigDict(extra="ignore")
+
+
+class DatasetSourceRequest(BaseModel):
+    url: str
+    project: str = "default"
+    model_config = ConfigDict(extra="ignore")
+
+
+def extract_drive_folder_id(link: str) -> str:
+    """Extract and validate Google Drive folder ID from link or raw ID string."""
+    link = link.strip()
+    if link.startswith("http://") or link.startswith("https://"):
+        m = re.search(r"/folders/([a-zA-Z0-9_-]+)", link)
+        if m:
+            return m.group(1)
+        m = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", link)
+        if m:
+            return m.group(1)
+        raise HTTPException(status_code=400, detail=f"Invalid Drive folder link: {link}")
+
+    # Raw ID: Google Drive folder IDs are typically 28-45 alphanumeric/underscore/hyphen characters
+    if re.fullmatch(r"[a-zA-Z0-9_-]{20,60}", link):
+        return link
+    raise HTTPException(status_code=400, detail=f"Invalid Drive folder link or ID: {link}")
+
+
+def _run_pipeline_job(
+    job_id: str,
+    app_state: Any,
+    source_type: str = "local",
+    folder: Path | None = None,
+    drive_folder_id: str | None = None,
+) -> None:
+    """Background sequential pipeline job runner."""
+    job = app_state.jobs.get(job_id)
+    if not job:
+        return
+    db_path = app_state.db_path
+    cfg = app_state.config
+    conn = get_connection(db_path)
+    try:
+        from core.categories import run_categorization
+        from core.cluster import run_stage2_clustering
+        from core.embeddings import run_embeddings
+        from core.quality import run_quality_pipeline
+        from core.stage0 import run_stage0
+        from core.stage1 import run_stage1
+        from core.verify import run_stage3_verification
+
+        job["stage"] = "scan"
+        job["message"] = "Scanning and computing hashes..."
+        job["progress"] = 10
+        job["updated_at"] = time.time()
+
+        if source_type == "drive":
+            from sources.google_drive import GoogleDriveSource
+            source0 = GoogleDriveSource(folder_id=drive_folder_id, conn=conn, stage="stage0")
+            run_stage0(source0, conn, cfg)
+            job["progress"] = 20
+            job["updated_at"] = time.time()
+            source_active = GoogleDriveSource(folder_id=drive_folder_id, conn=conn, stage="stage1")
+            run_stage1(source_active, conn, cfg)
+        else:
+            from sources.local_folder import LocalFolderSource
+            scan_dir = folder or app_state.library_dir
+            source_active = LocalFolderSource(scan_dir)
+            run_stage0(source_active, conn, cfg)
+            job["progress"] = 20
+            job["updated_at"] = time.time()
+            run_stage1(source_active, conn, cfg)
+
+        # Stage 2: Embed
+        job["stage"] = "embed"
+        job["message"] = "Computing CLIP embeddings..."
+        job["progress"] = 35
+        job["updated_at"] = time.time()
+        run_embeddings(source_active, conn, cfg)
+
+        # Stage 2: Cluster
+        job["stage"] = "cluster"
+        job["message"] = "Clustering duplicates..."
+        job["progress"] = 55
+        job["updated_at"] = time.time()
+        run_stage2_clustering(conn, cfg)
+
+        # Stage 3: Verify
+        job["stage"] = "verify"
+        job["message"] = "Geometric verification..."
+        job["progress"] = 70
+        job["updated_at"] = time.time()
+        run_stage3_verification(conn, cfg, source=source_active)
+
+        # Stage 4: Quality
+        job["stage"] = "quality"
+        job["message"] = "Quality evaluation..."
+        job["progress"] = 85
+        job["updated_at"] = time.time()
+        run_quality_pipeline(conn, cfg, source=source_active)
+
+        # Categorize
+        job["stage"] = "categorize"
+        job["message"] = "Semantic categorization..."
+        job["progress"] = 95
+        job["updated_at"] = time.time()
+        run_categorization(conn, cfg)
+
+        job["stage"] = "done"
+        job["progress"] = 100
+        job["status"] = "completed"
+        job["message"] = "Pipeline complete"
+        job["updated_at"] = time.time()
+    except Exception as exc:
+        logger.exception("Pipeline job %s failed: %s", job_id, exc)
+        job["status"] = "failed"
+        job["error"] = str(exc)
+        job["message"] = f"Pipeline failed: {exc}"
+        job["updated_at"] = time.time()
+    finally:
+        conn.close()
+
+
+def launch_pipeline_job(
+    app: FastAPI,
+    source_type: str = "local",
+    folder: Path | None = None,
+    drive_folder_id: str | None = None,
+) -> str:
+    job_id = uuid.uuid4().hex[:12]
+    job_info = {
+        "id": job_id,
+        "status": "running",
+        "stage": "queued",
+        "progress": 0,
+        "message": "Job queued",
+        "error": None,
+        "source_type": source_type,
+        "created_at": time.time(),
+        "updated_at": time.time(),
+    }
+    app.state.jobs[job_id] = job_info
+    worker = getattr(app.state, "pipeline_worker", _run_pipeline_job)
+    t = threading.Thread(
+        target=worker,
+        args=(job_id, app.state, source_type, folder, drive_folder_id),
+        daemon=True,
+    )
+    t.start()
+    return job_id
+
+
 def get_db(request: Request):
     """Provide a per-request SQLite connection with row_factory enabled."""
     db_path = request.app.state.db_path
@@ -124,6 +284,14 @@ def create_app(
     except OSError:
         pass
 
+    cfg_library = config.get("sources", {}).get("library_dir")
+    library_dir = os.environ.get("ARGUS_LIBRARY_DIR") or cfg_library or (Path.home() / ".argus" / "library")
+    resolved_library_dir = Path(library_dir).expanduser().resolve()
+    try:
+        resolved_library_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
     app = FastAPI(title="Argus API", version="0.1.0")
 
     # Strict local-only CORS: never allow external origins
@@ -143,7 +311,9 @@ def create_app(
     app.state.db_path = resolved_db_path
     app.state.trash_dir = resolved_trash_dir
     app.state.thumb_cache_dir = resolved_thumb_cache_dir
+    app.state.library_dir = resolved_library_dir
     app.state.config = config
+    app.state.jobs = {}
 
     ui_file = Path(__file__).resolve().parent.parent / "ui" / "index.html"
 
@@ -183,18 +353,34 @@ def create_app(
                        is_keeper, is_low_confidence, ssim, ssim_color, sharpness_ratio,
                        pixel_ratio, bytes_ratio, quality_status, review_flag, delete_safe,
                        reason, source_likelihood, jpeg_quality_est, category_top1,
-                       category_top1_prob, match_pct, resolution_pct, confidence
+                       category_top1_prob, match_pct, resolution_pct, confidence, status
                 FROM images
-                WHERE cluster_id = ?
+                WHERE cluster_id = ? AND (status IS NULL OR status != 'trashed')
                 ORDER BY id
                 """,
                 (cid,),
             ).fetchall()
 
-            if len(members) < 2:
+            live_members = []
+            missing_ids = []
+            for m in members:
+                fp = m["file_path"]
+                if not str(fp).startswith("drive://") and not os.path.exists(fp):
+                    missing_ids.append(m["id"])
+                    continue
+                live_members.append(m)
+
+            if missing_ids:
+                try:
+                    conn.executemany("UPDATE images SET status = 'trashed' WHERE id = ?", [(mid,) for mid in missing_ids])
+                    conn.commit()
+                except Exception:
+                    pass
+
+            if len(live_members) < 2:
                 continue
 
-            member_dicts = [dict(m) for m in members]
+            member_dicts = [dict(m) for m in live_members]
             keeper_res = choose_keeper(
                 member_dicts,
                 mode=mode,
@@ -293,18 +479,34 @@ def create_app(
                    is_keeper, is_low_confidence, ssim, ssim_color, sharpness_ratio,
                    pixel_ratio, bytes_ratio, quality_status, review_flag, delete_safe,
                    reason, source_likelihood, jpeg_quality_est, category_top1,
-                   category_top1_prob, match_pct, resolution_pct, confidence
+                   category_top1_prob, match_pct, resolution_pct, confidence, status
             FROM images
-            WHERE cluster_id = ?
+            WHERE cluster_id = ? AND (status IS NULL OR status != 'trashed')
             ORDER BY id
             """,
             (cluster_id,),
         ).fetchall()
 
-        if not members:
-            raise HTTPException(status_code=404, detail=f"Cluster {cluster_id} has no members")
+        live_members = []
+        missing_ids = []
+        for m in members:
+            fp = m["file_path"]
+            if not str(fp).startswith("drive://") and not os.path.exists(fp):
+                missing_ids.append(m["id"])
+                continue
+            live_members.append(m)
 
-        member_dicts = [dict(m) for m in members]
+        if missing_ids:
+            try:
+                conn.executemany("UPDATE images SET status = 'trashed' WHERE id = ?", [(mid,) for mid in missing_ids])
+                conn.commit()
+            except Exception:
+                pass
+
+        if len(live_members) < 2:
+            raise HTTPException(status_code=404, detail=f"Cluster {cluster_id} has fewer than 2 live members on disk")
+
+        member_dicts = [dict(m) for m in live_members]
         ref_unc = c_row["reference_uncertain"] if "reference_uncertain" in c_row.keys() else 0
         keeper_res = choose_keeper(
             member_dicts,
@@ -445,7 +647,7 @@ def create_app(
             """
             SELECT category_top1, COUNT(*) AS count
             FROM images
-            WHERE category_top1 IS NOT NULL
+            WHERE category_top1 IS NOT NULL AND (status IS NULL OR status != 'trashed')
             GROUP BY category_top1
             ORDER BY count DESC
             """
@@ -596,6 +798,256 @@ def create_app(
         conn: sqlite3.Connection = Depends(get_db),
     ) -> list[dict[str, Any]]:
         return get_history(conn, limit=limit)
+
+    @app.post("/sources/upload")
+    async def upload_sources(
+        files: list[UploadFile] = File(...),
+        project: str = Query("default"),
+        request: Request = None,
+    ) -> dict[str, Any]:
+        """
+        Upload images into ~/.argus/library/<project>/ with path sanitization
+        and size caps. Never modifies or removes user original files.
+        """
+        clean_project = re.sub(r"[^a-zA-Z0-9_\-]", "_", project.strip()) or "default"
+        sources_cfg = request.app.state.config.get("sources", {})
+        upload_cfg = sources_cfg.get("upload", {})
+        library_base = request.app.state.library_dir
+        dest_dir = library_base / clean_project
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        allowed_exts = {e.lower().lstrip(".") for e in upload_cfg.get("allowed_extensions", ["jpg", "jpeg", "png", "webp", "heic"])}
+        per_file_cap = upload_cfg.get("per_file_cap_mb", 50) * 1024 * 1024
+        total_cap = upload_cfg.get("total_cap_mb", 1000) * 1024 * 1024
+
+        saved_files = []
+        for upload in files:
+            orig_name = upload.filename or ""
+            # Path traversal rejection
+            if not orig_name or "/" in orig_name or "\\" in orig_name or ".." in orig_name or orig_name != Path(orig_name).name:
+                raise HTTPException(status_code=400, detail=f"Path traversal rejected: {orig_name}")
+
+            # Non-image extension rejection
+            ext = Path(orig_name).suffix.lower().lstrip(".")
+            if ext not in allowed_exts:
+                raise HTTPException(status_code=400, detail=f"Non-image rejected: {orig_name}")
+
+            dest_path = dest_dir / orig_name
+            total_bytes = 0
+            with open(dest_path, "wb") as f_out:
+                while True:
+                    chunk = await upload.read(65536)
+                    if not chunk:
+                        break
+                    total_bytes += len(chunk)
+                    if total_bytes > per_file_cap:
+                        f_out.close()
+                        if dest_path.exists():
+                            dest_path.unlink()
+                        raise HTTPException(status_code=400, detail=f"File exceeds {per_file_cap // (1024*1024)} MB cap: {orig_name}")
+                    f_out.write(chunk)
+            saved_files.append(str(dest_path))
+
+        # Check total directory size against total_cap
+        dir_size = sum(f.stat().st_size for f in dest_dir.glob("*") if f.is_file())
+        if dir_size > total_cap:
+            for sf in saved_files:
+                p = Path(sf)
+                if p.exists():
+                    p.unlink()
+            raise HTTPException(status_code=400, detail=f"Upload exceeds total library cap ({total_cap // (1024*1024)} MB)")
+
+        job_id = launch_pipeline_job(request.app, source_type="local", folder=dest_dir)
+        return {
+            "job_id": job_id,
+            "uploaded_count": len(saved_files),
+            "project": clean_project,
+            "files": [Path(p).name for p in saved_files],
+        }
+
+    @app.post("/sources/drive")
+    def add_drive_source(
+        req: DriveSourceRequest,
+        request: Request = None,
+    ) -> dict[str, Any]:
+        """
+        Validate Google Drive link, ensure read-only auth is active,
+        and kick off read-only scan.
+        """
+        folder_id = extract_drive_folder_id(req.link)
+
+        # Verify Google Drive authentication status
+        from sources.google_drive import DEFAULT_TOKEN_PATH, get_drive_credentials
+        token_path = Path(request.app.state.config.get("sources", {}).get("google_drive", {}).get("token_path", DEFAULT_TOKEN_PATH)).expanduser()
+        if not token_path.exists():
+            raise HTTPException(
+                status_code=400,
+                detail="Google Drive authentication required. Please run 'argus drive-auth' first.",
+            )
+
+        try:
+            creds = get_drive_credentials(token_path=token_path, prompt_if_missing=False)
+            if not creds or not creds.valid:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Google Drive authentication expired or invalid. Please re-run 'argus drive-auth'.",
+                )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Google Drive authentication error: {exc}. Please run 'argus drive-auth' first.",
+            )
+
+        job_id = launch_pipeline_job(request.app, source_type="drive", drive_folder_id=folder_id)
+        return {
+            "job_id": job_id,
+            "folder_id": folder_id,
+            "status": "queued",
+        }
+
+    @app.post("/sources/dataset")
+    def add_dataset_source(
+        req: DatasetSourceRequest,
+        request: Request = None,
+    ) -> dict[str, Any]:
+        """
+        Download dataset from allow-listed HTTPS host, streaming with size and
+        file-count caps. Rejects non-images and archives with traversal or non-images.
+        """
+        url = req.url.strip()
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme.lower() != "https":
+            raise HTTPException(status_code=400, detail="HTTPS only: HTTP and other schemes are rejected")
+
+        dataset_cfg = request.app.state.config.get("sources", {}).get("dataset", {})
+        allowed_hosts = [h.lower().strip() for h in dataset_cfg.get("allowed_hosts", ["huggingface.co"])]
+        host = (parsed.netloc.split(":")[0]).lower()
+        if not any(host == ah or host.endswith("." + ah) for ah in allowed_hosts):
+            raise HTTPException(status_code=400, detail=f"Host '{host}' outside allow-list ({allowed_hosts}) rejected")
+
+        size_cap_bytes = dataset_cfg.get("size_cap_mb", 500) * 1024 * 1024
+        file_count_cap = dataset_cfg.get("file_count_cap", 1000)
+
+        class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req_obj, fp, code, msg, headers, newurl):
+                p = urllib.parse.urlparse(newurl)
+                if p.scheme.lower() != "https":
+                    raise HTTPException(status_code=400, detail="Redirect to non-HTTPS URL rejected")
+                h = (p.netloc.split(":")[0]).lower()
+                if not any(h == ah or h.endswith("." + ah) for ah in allowed_hosts):
+                    raise HTTPException(status_code=400, detail=f"Redirect off allow-list to '{h}' rejected")
+                return super().redirect_request(req_obj, fp, code, msg, headers, newurl)
+
+        opener = urllib.request.build_opener(SafeRedirectHandler())
+        req_head = urllib.request.Request(url, headers={"User-Agent": "Argus/0.1.0"})
+        try:
+            with opener.open(req_head, timeout=30) as resp:
+                content_len = resp.headers.get("Content-Length")
+                if content_len and int(content_len) > size_cap_bytes:
+                    raise HTTPException(status_code=400, detail=f"Dataset exceeds {size_cap_bytes // (1024*1024)} MB size cap")
+
+                content_type = (resp.headers.get("Content-Type") or "").lower()
+
+                # Stream with size cap
+                data = bytearray()
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+                    if len(data) > size_cap_bytes:
+                        raise HTTPException(status_code=400, detail=f"Dataset exceeds {size_cap_bytes // (1024*1024)} MB size cap")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Failed to download dataset: {exc}")
+
+        clean_project = re.sub(r"[^a-zA-Z0-9_\-]", "_", req.project.strip()) or "default"
+        dest_dir = request.app.state.library_dir / clean_project
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        is_zip = data.startswith(b"PK\x03\x04") or "zip" in content_type or url.lower().endswith(".zip")
+        extracted_files = []
+
+        if is_zip:
+            try:
+                zf = zipfile.ZipFile(io.BytesIO(data))
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=f"Invalid zip archive: {exc}")
+
+            entries = zf.infolist()
+            image_entries = [e for e in entries if not e.is_dir()]
+            if len(image_entries) > file_count_cap:
+                raise HTTPException(status_code=400, detail=f"Archive exceeds {file_count_cap} file cap (found {len(image_entries)})")
+
+            total_uncompressed = sum(e.file_size for e in image_entries)
+            if total_uncompressed > size_cap_bytes:
+                raise HTTPException(status_code=400, detail=f"Archive uncompressed size exceeds {size_cap_bytes // (1024*1024)} MB cap")
+
+            allowed_img_exts = {"jpg", "jpeg", "png", "webp", "heic"}
+            for e in image_entries:
+                ename = e.filename
+                if ".." in ename or ename.startswith("/") or ename.startswith("\\"):
+                    raise HTTPException(status_code=400, detail=f"Path traversal in archive rejected: {ename}")
+                ext = Path(ename).suffix.lower().lstrip(".")
+                if ext not in allowed_img_exts:
+                    raise HTTPException(status_code=400, detail=f"Non-image file in archive rejected: {ename}")
+
+            for e in image_entries:
+                safe_name = Path(e.filename).name
+                out_path = dest_dir / safe_name
+                out_path.write_bytes(zf.read(e))
+                extracted_files.append(str(out_path))
+        else:
+            # Direct image file
+            try:
+                im = Image.open(io.BytesIO(data))
+                im.verify()
+                fmt = (im.format or "JPEG").lower()
+            except Exception:
+                raise HTTPException(status_code=400, detail="Non-image content type rejected")
+
+            base_name = Path(urllib.parse.urlparse(url).path).name or f"dataset_{uuid.uuid4().hex[:8]}.{fmt}"
+            if "." not in base_name:
+                base_name = f"{base_name}.{fmt}"
+            out_path = dest_dir / base_name
+            out_path.write_bytes(data)
+            extracted_files.append(str(out_path))
+
+        job_id = launch_pipeline_job(request.app, source_type="local", folder=dest_dir)
+        return {
+            "job_id": job_id,
+            "project": clean_project,
+            "extracted_count": len(extracted_files),
+        }
+
+    @app.post("/sources/rescan")
+    def rescan_sources(
+        request: Request = None,
+        conn: sqlite3.Connection = Depends(get_db),
+    ) -> dict[str, Any]:
+        """Re-run the deduplication pipeline on existing sources."""
+        has_gdrive = conn.execute("SELECT 1 FROM images WHERE source = 'gdrive' LIMIT 1").fetchone() is not None
+        source_type = "drive" if has_gdrive else "local"
+        job_id = launch_pipeline_job(request.app, source_type=source_type, folder=request.app.state.library_dir)
+        return {
+            "job_id": job_id,
+            "status": "queued",
+            "source_type": source_type,
+        }
+
+    @app.get("/jobs/{job_id}")
+    def get_job_status(
+        job_id: str,
+        request: Request = None,
+    ) -> dict[str, Any]:
+        """Poll the status and progress of a background pipeline job."""
+        job = request.app.state.jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+        return job
 
     return app
 

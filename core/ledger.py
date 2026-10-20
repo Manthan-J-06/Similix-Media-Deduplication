@@ -693,6 +693,20 @@ def execute(
                 )
                 failures.append({"entry_id": e["id"], "path": e["original_path"], "error": fail_msg})
 
+    # Sync member_count in clusters table for all affected clusters
+    for cid in by_cluster.keys():
+        conn.execute(
+            """
+            UPDATE clusters
+            SET member_count = (
+                SELECT COUNT(*) FROM images
+                WHERE images.cluster_id = clusters.id AND images.status != 'trashed'
+            )
+            WHERE id = ?
+            """,
+            (cid,),
+        )
+
     final_status = "executed" if moved_count > 0 else ("refused" if len(refusals) > 0 else "failed")
     conn.execute(
         """
@@ -764,6 +778,21 @@ def undo(conn: sqlite3.Connection, batch_id: str) -> UndoResult:
         except Exception as exc:
             conflicts.append((str(orig_p), f"Restore move failed: {exc}"))
 
+    # Sync member_count in clusters table for all affected clusters
+    restored_cids = {e["cluster_id"] for e in entries if e["cluster_id"]}
+    for cid in restored_cids:
+        conn.execute(
+            """
+            UPDATE clusters
+            SET member_count = (
+                SELECT COUNT(*) FROM images
+                WHERE images.cluster_id = clusters.id AND images.status != 'trashed'
+            )
+            WHERE id = ?
+            """,
+            (cid,),
+        )
+
     # If all moved files restored without conflict, update batch status
     if restored_count == len(entries) and not conflicts:
         conn.execute("UPDATE ledger_batches SET status = 'undone' WHERE batch_id = ?", (batch_id,))
@@ -828,6 +857,18 @@ def undo_file(
         conn.execute("UPDATE deletion_journal SET status = 'restored' WHERE id = ?", (row["id"],))
         if row["image_id"]:
             conn.execute("UPDATE images SET status = 'clustered' WHERE id = ?", (row["image_id"],))
+        if row["cluster_id"]:
+            conn.execute(
+                """
+                UPDATE clusters
+                SET member_count = (
+                    SELECT COUNT(*) FROM images
+                    WHERE images.cluster_id = clusters.id AND images.status != 'trashed'
+                )
+                WHERE id = ?
+                """,
+                (row["cluster_id"],),
+            )
         conn.commit()
         return True, f"Successfully restored {orig_p}"
     except Exception as exc:

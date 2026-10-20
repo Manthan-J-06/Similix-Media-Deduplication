@@ -156,9 +156,19 @@ document = [
     "a scanned document or paper note",
 ]
 screenshot = [
-    "a screenshot of a computer screen or mobile phone display",
-    "a digital screen capture of an application or website",
-    "a screenshot of software or user interface",
+    "a direct digital screenshot or flat screen capture of a user interface",
+    "a clean digital screen grab of a website, application, or software window",
+    "a flat digital capture of an operating system, app UI, or computer desktop",
+]
+technology = [
+    "a photograph of modern technology such as laptops, computers, or smartphones",
+    "a photo of electronic devices, phones, or computer screens in an environment",
+    "a picture of tech gadgets, keyboards, laptops, or mobile devices",
+]
+people_working = [
+    "a photo of people working in an office, desk, or workplace setting",
+    "a photograph of employees, colleagues, or professionals at work",
+    "a picture of people collaborating, having a meeting, or working on laptops",
 ]
 vehicle = [
     "a photo of a car, automobile, or vehicle",
@@ -226,3 +236,18 @@ contrast_factors = [0.85, 1.15]
 
 # Rotation angles (degrees, counter-clockwise).
 rotate_angles = [90, 180, 270]
+
+# ── Library & Source ingestion (api/server.py) ──────────────────────────────
+[sources]
+library_dir = "~/.argus/library"
+
+[sources.upload]
+per_file_cap_mb = 50
+total_cap_mb = 1000
+allowed_extensions = ["jpg", "jpeg", "png", "webp", "heic"]
+
+[sources.dataset]
+allowed_hosts = ["huggingface.co"]
+size_cap_mb = 500
+file_count_cap = 1000
+
