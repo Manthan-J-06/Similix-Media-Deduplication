@@ -1024,7 +1024,17 @@ def create_app(
                 for jf in files:
                     state = read_job_state(jf)
                     if state and state.get("status") in ("running", "queued"):
-                        return {"active": True, "job": state}
+                        job_id = state.get("id") or state.get("job_id") or jf.stem
+                        stage = state.get("stage_display") or state.get("stage") or "running"
+                        done = int(state.get("current_file", 0))
+                        total = int(state.get("total_files", 0))
+                        return {
+                            "active": True,
+                            "job_id": str(job_id),
+                            "stage": str(stage),
+                            "done": done,
+                            "total": total,
+                        }
             except Exception:
                 pass
 
@@ -1034,9 +1044,19 @@ def create_app(
             reverse=True,
         ):
             if j_data.get("status") in ("running", "queued"):
-                return {"active": True, "job": j_data}
+                job_id = j_data.get("id") or j_data.get("job_id") or j_id
+                stage = j_data.get("stage_display") or j_data.get("stage") or "running"
+                done = int(j_data.get("current_file", 0))
+                total = int(j_data.get("total_files", 0))
+                return {
+                    "active": True,
+                    "job_id": str(job_id),
+                    "stage": str(stage),
+                    "done": done,
+                    "total": total,
+                }
 
-        return {"active": False, "job": None}
+        return {"active": False}
 
     @app.get("/jobs/{job_id}")
     def get_job_status(

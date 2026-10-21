@@ -1024,9 +1024,9 @@ class TestAPIServer:
 
     def test_job_status_active_endpoint_and_persistence(self, api_test_env, tmp_path):
         """
-        Requirement 4:
-        GET /jobs/{id} shows current stage and "N of M files", and the UI shows
-        this banner on every page load while a job is active (survives reload).
+        Requirement 2 & 4:
+        /jobs/active returns stable shape:
+        {"active": false} or {"active": true, "job_id": "...", "stage": "...", "done": N, "total": M}
         """
         app = api_test_env["app"]
         client = TestClient(app)
@@ -1034,6 +1034,11 @@ class TestAPIServer:
         jobs_dir = app.state.jobs_dir
         job_id = "testjob_active_1"
         job_file = jobs_dir / f"{job_id}.json"
+
+        # Initially when no job exists or is running
+        resp_initial = client.get("/jobs/active")
+        assert resp_initial.status_code == 200
+        assert resp_initial.json() == {"active": False}
 
         from core.worker import update_job_file
         update_job_file(
@@ -1047,16 +1052,17 @@ class TestAPIServer:
             message="Embedding (15 of 50 files)",
         )
 
-        # GET /jobs/active must find and return this active job
+        # GET /jobs/active must find and return this active job with stable shape:
         resp_act = client.get("/jobs/active")
         assert resp_act.status_code == 200
         data_act = resp_act.json()
-        assert data_act["active"] is True
-        assert data_act["job"]["id"] == job_id
-        assert data_act["job"]["stage"] == "embed"
-        assert data_act["job"]["current_file"] == 15
-        assert data_act["job"]["total_files"] == 50
-        assert "15 of 50 files" in data_act["job"]["message"]
+        assert data_act == {
+            "active": True,
+            "job_id": job_id,
+            "stage": "Embedding",
+            "done": 15,
+            "total": 50,
+        }
 
         # GET /jobs/{job_id} returns exact state
         resp_job = client.get(f"/jobs/{job_id}")
@@ -1076,10 +1082,46 @@ class TestAPIServer:
             message="Pipeline completed successfully",
         )
 
-        # Now GET /jobs/active returns active: false
+        # Now GET /jobs/active returns exact stable shape {"active": False}
         resp_none = client.get("/jobs/active")
         assert resp_none.status_code == 200
-        assert resp_none.json()["active"] is False
+        assert resp_none.json() == {"active": False}
+
+    def test_ui_smoke_no_jobs_undefined_request(self, api_test_env):
+        """
+        Requirement 4:
+        UI smoke test asserting the script has no code path that requests /jobs/undefined,
+        checks /jobs/active stable field names, and verifies backoff and visibility handling.
+        """
+        client = api_test_env["client"]
+        res = client.get("/")
+        assert res.status_code == 200
+        html = res.text
+
+        # 1. Never requests /jobs/undefined literally
+        assert "/jobs/undefined" not in html
+        assert "/jobs/null" not in html
+
+        # 2. Assert guards against undefined or empty job ID before building any URL
+        assert 'jobId === "undefined"' in html
+        assert 'stopJobPolling()' in html
+        assert 'setSourceButtonsDisabled(false)' in html
+
+        # 3. Assert /jobs/active stable field names are read by UI
+        assert 'data.active === true' in html
+        assert 'data.job_id' in html
+        assert 'activeInfo.stage' in html
+        assert 'activeInfo.done' in html
+        assert 'activeInfo.total' in html
+
+        # 4. Assert backoff logic (1s -> 2s -> 5s max)
+        assert 'pollDelayMs < 2000' in html
+        assert 'pollDelayMs = 2000' in html
+        assert 'pollDelayMs = 5000' in html
+
+        # 5. Assert stops when page is hidden
+        assert 'document.hidden' in html
+        assert 'visibilitychange' in html
 
     def test_upload_batch_cap(self, api_test_env):
         """

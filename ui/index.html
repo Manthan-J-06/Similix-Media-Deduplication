@@ -1619,8 +1619,40 @@
     }
 
     // Job progress polling
-    let activeJobPollInterval = null;
-    function pollJobProgress(jobId) {
+    let activeJobPollTimeout = null;
+    let currentPollingJobId = null;
+    let pollDelayMs = 1000;
+
+    function stopJobPolling() {
+      if (activeJobPollTimeout) {
+        clearTimeout(activeJobPollTimeout);
+        activeJobPollTimeout = null;
+      }
+      currentPollingJobId = null;
+      pollDelayMs = 1000;
+      const banner = document.getElementById("job-progress-banner");
+      if (banner) banner.style.display = "none";
+      setSourceButtonsDisabled(false);
+    }
+
+    function pollJobProgress(rawJobId, activeInfo) {
+      if (!rawJobId || typeof rawJobId !== "string") {
+        stopJobPolling();
+        return;
+      }
+      const jobId = rawJobId.trim();
+      if (!jobId || jobId === "undefined" || jobId === "null") {
+        stopJobPolling();
+        return;
+      }
+
+      currentPollingJobId = jobId;
+      pollDelayMs = 1000;
+      if (activeJobPollTimeout) {
+        clearTimeout(activeJobPollTimeout);
+        activeJobPollTimeout = null;
+      }
+
       const banner = document.getElementById("job-progress-banner");
       const statusText = document.getElementById("job-status-text");
       const percentText = document.getElementById("job-percent-text");
@@ -1629,22 +1661,47 @@
       banner.style.display = "block";
       fill.style.background = "#2563eb";
       setSourceButtonsDisabled(true);
-      if (activeJobPollInterval) clearInterval(activeJobPollInterval);
 
-      activeJobPollInterval = setInterval(async () => {
+      // If activeInfo provided from /jobs/active: read stage, done, total
+      if (activeInfo && typeof activeInfo === "object") {
+        const stage = activeInfo.stage || "Running";
+        const done = Number.isInteger(activeInfo.done) ? activeInfo.done : (activeInfo.current_file || 0);
+        const total = Number.isInteger(activeInfo.total) ? activeInfo.total : (activeInfo.total_files || 0);
+        const countText = total > 0 ? ` (${done} of ${total} files)` : "";
+        statusText.textContent = `${stage}${countText}`;
+        const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+        percentText.textContent = `${pct}%`;
+        fill.style.width = `${pct}%`;
+      }
+
+      async function pollStep() {
+        if (!currentPollingJobId || currentPollingJobId !== jobId) return;
+        if (document.hidden) {
+          // Stop polling when page is hidden
+          return;
+        }
+
         try {
-          const res = await fetch(`/jobs/${jobId}`);
-          if (!res.ok) return;
+          const res = await fetch(`/jobs/${encodeURIComponent(jobId)}`);
+          if (!res.ok) {
+            // Stop polling on HTTP error (e.g. 404)
+            stopJobPolling();
+            return;
+          }
           const data = await res.json();
           const stageText = data.stage_display || data.stage || "Running";
-          const countText = data.total_files > 0 ? ` (${data.current_file || 0} of ${data.total_files} files)` : "";
+          const countText = (data.total_files && data.total_files > 0) ? ` (${data.current_file || 0} of ${data.total_files} files)` : "";
           statusText.textContent = data.message || `${stageText}${countText}`;
           const pct = Math.round(data.progress || 0);
           percentText.textContent = `${pct}%`;
           fill.style.width = `${pct}%`;
 
           if (data.status === "completed" || data.status === "completed_with_warnings") {
-            clearInterval(activeJobPollInterval);
+            currentPollingJobId = null;
+            if (activeJobPollTimeout) {
+              clearTimeout(activeJobPollTimeout);
+              activeJobPollTimeout = null;
+            }
             setSourceButtonsDisabled(false);
             if (data.status === "completed_with_warnings") {
               statusText.textContent = data.message || `Pipeline completed with warnings (${(data.warnings || []).length} skipped)`;
@@ -1661,16 +1718,37 @@
               loadClusters();
               if (activeClusterId) selectCluster(activeClusterId);
             }, 3000);
-          } else if (data.status === "failed") {
-            clearInterval(activeJobPollInterval);
+            return;
+          } else if (data.status === "failed" || data.status === "error") {
+            currentPollingJobId = null;
+            if (activeJobPollTimeout) {
+              clearTimeout(activeJobPollTimeout);
+              activeJobPollTimeout = null;
+            }
             setSourceButtonsDisabled(false);
             statusText.textContent = `Pipeline error: ${data.error || "Job failed"}`;
             fill.style.background = "var(--danger)";
+            return;
           }
         } catch (err) {
           console.error("Failed to poll job:", err);
+          stopJobPolling();
+          return;
         }
-      }, 800);
+
+        // Backoff: 1s -> 2s -> 5s max
+        if (pollDelayMs < 2000) {
+          pollDelayMs = 2000;
+        } else {
+          pollDelayMs = 5000;
+        }
+
+        if (currentPollingJobId === jobId && !document.hidden) {
+          activeJobPollTimeout = setTimeout(pollStep, pollDelayMs);
+        }
+      }
+
+      activeJobPollTimeout = setTimeout(pollStep, pollDelayMs);
     }
 
     // Add Sources Modal & Tabs
@@ -1757,7 +1835,11 @@
         btnStartUpload.style.display = "none";
         btnStartUpload.disabled = false;
         btnStartUpload.textContent = "Upload & Run Pipeline";
-        pollJobProgress(data.job_id);
+        if (data && typeof data.job_id === "string" && data.job_id.trim()) {
+          pollJobProgress(data.job_id);
+        } else {
+          stopJobPolling();
+        }
       } catch (err) {
         btnStartUpload.disabled = false;
         btnStartUpload.textContent = "Upload & Run Pipeline";
@@ -1790,7 +1872,11 @@
         sourcesModal.style.display = "none";
         btn.disabled = false;
         btn.textContent = "Scan Drive (Read-Only)";
-        pollJobProgress(data.job_id);
+        if (data && typeof data.job_id === "string" && data.job_id.trim()) {
+          pollJobProgress(data.job_id);
+        } else {
+          stopJobPolling();
+        }
       } catch (err) {
         btn.disabled = false;
         btn.textContent = "Scan Drive (Read-Only)";
@@ -1823,7 +1909,11 @@
         sourcesModal.style.display = "none";
         btn.disabled = false;
         btn.textContent = "Import Dataset";
-        pollJobProgress(data.job_id);
+        if (data && typeof data.job_id === "string" && data.job_id.trim()) {
+          pollJobProgress(data.job_id);
+        } else {
+          stopJobPolling();
+        }
       } catch (err) {
         btn.disabled = false;
         btn.textContent = "Import Dataset";
@@ -1847,7 +1937,11 @@
         }
         const data = await res.json();
         btn.disabled = false;
-        pollJobProgress(data.job_id);
+        if (data && typeof data.job_id === "string" && data.job_id.trim()) {
+          pollJobProgress(data.job_id);
+        } else {
+          stopJobPolling();
+        }
       } catch (err) {
         btn.disabled = false;
         alert("Rescan error: " + err.message);
@@ -1858,15 +1952,33 @@
     async function checkActiveJob() {
       try {
         const res = await fetch("/jobs/active");
-        if (!res.ok) return;
+        if (!res.ok) {
+          stopJobPolling();
+          return;
+        }
         const data = await res.json();
-        if (data && data.active && data.job) {
-          pollJobProgress(data.job.id);
+        if (data && data.active === true && typeof data.job_id === "string" && data.job_id.trim() !== "" && data.job_id !== "undefined" && data.job_id !== "null") {
+          pollJobProgress(data.job_id, data);
+        } else {
+          stopJobPolling();
         }
       } catch (err) {
         console.error("Failed to check active job on load:", err);
+        stopJobPolling();
       }
     }
+
+    // Stop polling when page is hidden; check/resume when page becomes visible
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        if (activeJobPollTimeout) {
+          clearTimeout(activeJobPollTimeout);
+          activeJobPollTimeout = null;
+        }
+      } else {
+        checkActiveJob();
+      }
+    });
 
     // Initial Load
     loadCategories();
