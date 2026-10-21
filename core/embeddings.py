@@ -142,6 +142,7 @@ def run_embeddings(
         SELECT COUNT(*) FROM images
         WHERE clip_vector IS NULL
           AND is_raw_pair = 0
+          AND (status IS NULL OR status != 'skipped')
         """
     ).fetchone()[0]
 
@@ -176,6 +177,7 @@ def run_embeddings(
             SELECT id, file_path FROM images
             WHERE clip_vector IS NULL
               AND is_raw_pair = 0
+              AND (status IS NULL OR status != 'skipped')
             ORDER BY id
             LIMIT ?
             """,
@@ -188,6 +190,7 @@ def run_embeddings(
         # Load thumbnails (draft mode on JPEG)
         thumbs_0: list[Image.Image] = []
         valid_ids: list[int] = []
+        failed_ids: list[int] = []
 
         for row in batch_rows:
             img_id = row["id"]
@@ -197,7 +200,20 @@ def run_embeddings(
                 thumbs_0.append(t)
                 valid_ids.append(img_id)
             except Exception:
+                failed_ids.append(img_id)
                 continue
+
+        if failed_ids:
+            conn.executemany(
+                """
+                UPDATE images
+                SET status = 'skipped',
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                WHERE id = ?
+                """,
+                [(fid,) for fid in failed_ids],
+            )
+            conn.commit()
 
         if not valid_ids:
             continue

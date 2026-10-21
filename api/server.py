@@ -8,12 +8,15 @@ All file moves/deletions are strictly routed through core/ledger.
 from __future__ import annotations
 
 import io
+import json
 import logging
 import os
 from pathlib import Path
 import re
 import shutil
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 from typing import Any, Optional
@@ -114,99 +117,23 @@ def extract_drive_folder_id(link: str) -> str:
     raise HTTPException(status_code=400, detail=f"Invalid Drive folder link or ID: {link}")
 
 
-def _run_pipeline_job(
-    job_id: str,
-    app_state: Any,
-    source_type: str = "local",
-    folder: Path | None = None,
-    drive_folder_id: str | None = None,
-) -> None:
-    """Background sequential pipeline job runner."""
-    job = app_state.jobs.get(job_id)
-    if not job:
-        return
-    db_path = app_state.db_path
-    cfg = app_state.config
-    conn = get_connection(db_path)
+def write_job_state(job_file: Path, data: dict) -> None:
+    """Write job state JSON atomically."""
+    job_file.parent.mkdir(parents=True, exist_ok=True)
+    tmp_file = job_file.with_suffix(f".tmp_{uuid.uuid4().hex[:6]}")
+    data["updated_at"] = time.time()
+    tmp_file.write_text(json.dumps(data, indent=2))
+    os.replace(tmp_file, job_file)
+
+
+def read_job_state(job_file: Path) -> dict | None:
+    """Read job state JSON safely."""
+    if not job_file.is_file():
+        return None
     try:
-        from core.categories import run_categorization
-        from core.cluster import run_stage2_clustering
-        from core.embeddings import run_embeddings
-        from core.quality import run_quality_pipeline
-        from core.stage0 import run_stage0
-        from core.stage1 import run_stage1
-        from core.verify import run_stage3_verification
-
-        job["stage"] = "scan"
-        job["message"] = "Scanning and computing hashes..."
-        job["progress"] = 10
-        job["updated_at"] = time.time()
-
-        if source_type == "drive":
-            from sources.google_drive import GoogleDriveSource
-            source0 = GoogleDriveSource(folder_id=drive_folder_id, conn=conn, stage="stage0")
-            run_stage0(source0, conn, cfg)
-            job["progress"] = 20
-            job["updated_at"] = time.time()
-            source_active = GoogleDriveSource(folder_id=drive_folder_id, conn=conn, stage="stage1")
-            run_stage1(source_active, conn, cfg)
-        else:
-            from sources.local_folder import LocalFolderSource
-            scan_dir = folder or app_state.library_dir
-            source_active = LocalFolderSource(scan_dir)
-            run_stage0(source_active, conn, cfg)
-            job["progress"] = 20
-            job["updated_at"] = time.time()
-            run_stage1(source_active, conn, cfg)
-
-        # Stage 2: Embed
-        job["stage"] = "embed"
-        job["message"] = "Computing CLIP embeddings..."
-        job["progress"] = 35
-        job["updated_at"] = time.time()
-        run_embeddings(source_active, conn, cfg)
-
-        # Stage 2: Cluster
-        job["stage"] = "cluster"
-        job["message"] = "Clustering duplicates..."
-        job["progress"] = 55
-        job["updated_at"] = time.time()
-        run_stage2_clustering(conn, cfg)
-
-        # Stage 3: Verify
-        job["stage"] = "verify"
-        job["message"] = "Geometric verification..."
-        job["progress"] = 70
-        job["updated_at"] = time.time()
-        run_stage3_verification(conn, cfg, source=source_active)
-
-        # Stage 4: Quality
-        job["stage"] = "quality"
-        job["message"] = "Quality evaluation..."
-        job["progress"] = 85
-        job["updated_at"] = time.time()
-        run_quality_pipeline(conn, cfg, source=source_active)
-
-        # Categorize
-        job["stage"] = "categorize"
-        job["message"] = "Semantic categorization..."
-        job["progress"] = 95
-        job["updated_at"] = time.time()
-        run_categorization(conn, cfg)
-
-        job["stage"] = "done"
-        job["progress"] = 100
-        job["status"] = "completed"
-        job["message"] = "Pipeline complete"
-        job["updated_at"] = time.time()
-    except Exception as exc:
-        logger.exception("Pipeline job %s failed: %s", job_id, exc)
-        job["status"] = "failed"
-        job["error"] = str(exc)
-        job["message"] = f"Pipeline failed: {exc}"
-        job["updated_at"] = time.time()
-    finally:
-        conn.close()
+        return json.loads(job_file.read_text())
+    except Exception:
+        return None
 
 
 def launch_pipeline_job(
@@ -215,26 +142,75 @@ def launch_pipeline_job(
     folder: Path | None = None,
     drive_folder_id: str | None = None,
 ) -> str:
+    """
+    Launch pipeline execution in a separate OS process so heavy PyTorch/SIFT
+    computation never starves FastAPI's event loop or request handling.
+    """
     job_id = uuid.uuid4().hex[:12]
-    job_info = {
+    jobs_dir = app.state.jobs_dir
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    job_file = jobs_dir / f"{job_id}.json"
+
+    initial_job_data = {
         "id": job_id,
         "status": "running",
         "stage": "queued",
-        "progress": 0,
+        "stage_display": "Queued",
+        "current_file": 0,
+        "total_files": 0,
+        "progress": 0.0,
         "message": "Job queued",
-        "error": None,
         "source_type": source_type,
+        "target_folder": str(folder) if folder else None,
+        "warnings": [],
+        "error": None,
         "created_at": time.time(),
         "updated_at": time.time(),
     }
-    app.state.jobs[job_id] = job_info
-    worker = getattr(app.state, "pipeline_worker", _run_pipeline_job)
-    t = threading.Thread(
-        target=worker,
-        args=(job_id, app.state, source_type, folder, drive_folder_id),
-        daemon=True,
+    write_job_state(job_file, initial_job_data)
+    app.state.jobs[job_id] = initial_job_data
+
+    # Allow custom in-process worker override for testing
+    custom_worker = getattr(app.state, "pipeline_worker", None)
+    if custom_worker is not None:
+        t = threading.Thread(
+            target=custom_worker,
+            args=(job_id, app.state, source_type, folder, drive_folder_id),
+            daemon=True,
+        )
+        t.start()
+        return job_id
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "core.worker",
+        "--job-id", job_id,
+        "--db", str(app.state.db_path),
+        "--source-type", source_type,
+        "--job-file", str(job_file),
+    ]
+    if folder:
+        cmd.extend(["--folder", str(folder)])
+    if drive_folder_id:
+        cmd.extend(["--drive-folder-id", drive_folder_id])
+    if getattr(app.state, "config_path", None):
+        cmd.extend(["--config", str(app.state.config_path)])
+
+    env = os.environ.copy()
+    env["OMP_NUM_THREADS"] = "1"
+    env["OPENBLAS_NUM_THREADS"] = "2"
+    env["VECLIB_MAXIMUM_THREADS"] = "2"
+    env["NUMEXPR_NUM_THREADS"] = "2"
+    env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+    subprocess.Popen(
+        cmd,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
     )
-    t.start()
     return job_id
 
 
@@ -252,6 +228,8 @@ def create_app(
     db_path: str | Path | None = None,
     trash_dir: str | Path | None = None,
     thumb_cache_dir: str | Path | None = None,
+    library_dir: str | Path | None = None,
+    jobs_dir: str | Path | None = None,
     config: dict | None = None,
     config_path: str | Path | None = None,
 ) -> FastAPI:
@@ -284,8 +262,9 @@ def create_app(
     except OSError:
         pass
 
-    cfg_library = config.get("sources", {}).get("library_dir")
-    library_dir = os.environ.get("ARGUS_LIBRARY_DIR") or cfg_library or (Path.home() / ".argus" / "library")
+    if library_dir is None:
+        cfg_library = config.get("sources", {}).get("library_dir")
+        library_dir = os.environ.get("ARGUS_LIBRARY_DIR") or cfg_library or (Path.home() / ".argus" / "library")
     resolved_library_dir = Path(library_dir).expanduser().resolve()
     try:
         resolved_library_dir.mkdir(parents=True, exist_ok=True)
@@ -308,11 +287,22 @@ def create_app(
         allow_headers=["*"],
     )
 
+    if jobs_dir is None:
+        cfg_jobs = config.get("general", {}).get("jobs_dir")
+        jobs_dir = os.environ.get("ARGUS_JOBS_DIR") or cfg_jobs or (Path.home() / ".argus" / "jobs")
+    resolved_jobs_dir = Path(jobs_dir).expanduser().resolve()
+    try:
+        resolved_jobs_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
     app.state.db_path = resolved_db_path
     app.state.trash_dir = resolved_trash_dir
     app.state.thumb_cache_dir = resolved_thumb_cache_dir
     app.state.library_dir = resolved_library_dir
+    app.state.jobs_dir = resolved_jobs_dir
     app.state.config = config
+    app.state.config_path = config_path
     app.state.jobs = {}
 
     ui_file = Path(__file__).resolve().parent.parent / "ui" / "index.html"
@@ -361,22 +351,10 @@ def create_app(
                 (cid,),
             ).fetchall()
 
-            live_members = []
-            missing_ids = []
-            for m in members:
-                fp = m["file_path"]
-                if not str(fp).startswith("drive://") and not os.path.exists(fp):
-                    missing_ids.append(m["id"])
-                    continue
-                live_members.append(m)
-
-            if missing_ids:
-                try:
-                    conn.executemany("UPDATE images SET status = 'trashed' WHERE id = ?", [(mid,) for mid in missing_ids])
-                    conn.commit()
-                except Exception:
-                    pass
-
+            live_members = [
+                m for m in members
+                if str(m["file_path"]).startswith("drive://") or os.path.exists(m["file_path"])
+            ]
             if len(live_members) < 2:
                 continue
 
@@ -487,21 +465,10 @@ def create_app(
             (cluster_id,),
         ).fetchall()
 
-        live_members = []
-        missing_ids = []
-        for m in members:
-            fp = m["file_path"]
-            if not str(fp).startswith("drive://") and not os.path.exists(fp):
-                missing_ids.append(m["id"])
-                continue
-            live_members.append(m)
-
-        if missing_ids:
-            try:
-                conn.executemany("UPDATE images SET status = 'trashed' WHERE id = ?", [(mid,) for mid in missing_ids])
-                conn.commit()
-            except Exception:
-                pass
+        live_members = [
+            m for m in members
+            if str(m["file_path"]).startswith("drive://") or os.path.exists(m["file_path"])
+        ]
 
         if len(live_members) < 2:
             raise HTTPException(status_code=404, detail=f"Cluster {cluster_id} has fewer than 2 live members on disk")
@@ -816,6 +783,13 @@ def create_app(
         dest_dir = library_base / clean_project
         dest_dir.mkdir(parents=True, exist_ok=True)
 
+        max_batch_files = upload_cfg.get("max_batch_files", 100)
+        if len(files) > max_batch_files:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Upload batch exceeds {max_batch_files} files cap (received {len(files)})",
+            )
+
         allowed_exts = {e.lower().lstrip(".") for e in upload_cfg.get("allowed_extensions", ["jpg", "jpeg", "png", "webp", "heic"])}
         per_file_cap = upload_cfg.get("per_file_cap_mb", 50) * 1024 * 1024
         total_cap = upload_cfg.get("total_cap_mb", 1000) * 1024 * 1024
@@ -1038,12 +1012,44 @@ def create_app(
             "source_type": source_type,
         }
 
+    @app.get("/jobs/active")
+    def get_active_job(
+        request: Request = None,
+    ) -> dict[str, Any]:
+        """Return the currently running or queued pipeline job if one is active."""
+        jobs_dir = request.app.state.jobs_dir
+        if jobs_dir.is_dir():
+            try:
+                files = sorted(jobs_dir.glob("*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
+                for jf in files:
+                    state = read_job_state(jf)
+                    if state and state.get("status") in ("running", "queued"):
+                        return {"active": True, "job": state}
+            except Exception:
+                pass
+
+        for j_id, j_data in sorted(
+            request.app.state.jobs.items(),
+            key=lambda item: item[1].get("created_at", 0),
+            reverse=True,
+        ):
+            if j_data.get("status") in ("running", "queued"):
+                return {"active": True, "job": j_data}
+
+        return {"active": False, "job": None}
+
     @app.get("/jobs/{job_id}")
     def get_job_status(
         job_id: str,
         request: Request = None,
     ) -> dict[str, Any]:
         """Poll the status and progress of a background pipeline job."""
+        jobs_dir = request.app.state.jobs_dir
+        job_file = jobs_dir / f"{job_id}.json"
+        disk_job = read_job_state(job_file)
+        if disk_job:
+            return disk_job
+
         job = request.app.state.jobs.get(job_id)
         if not job:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")

@@ -955,8 +955,22 @@ def align_and_compute_metrics(
     max_features = int(cfg.get("max_features", 2000))
 
     # Load 1024px proxies
-    ref_rgb, _s_ref, ref_dims_detected = load_proxy_rgb(reference_path, proxy_size=proxy_size, source=source)
-    m_rgb, _s_m, m_dims_detected = load_proxy_rgb(member_path, proxy_size=proxy_size, source=source)
+    try:
+        ref_rgb, _s_ref, ref_dims_detected = load_proxy_rgb(reference_path, proxy_size=proxy_size, source=source)
+        m_rgb, _s_m, m_dims_detected = load_proxy_rgb(member_path, proxy_size=proxy_size, source=source)
+    except Exception as exc:
+        logger.warning("Failed to load proxies for %s vs %s: %s", reference_path, member_path, exc)
+        return QualityMetrics(
+            quality_status="unalignable",
+            ssim=None,
+            ssim_color=None,
+            sharpness_ratio=1.0,
+            pixel_ratio=1.0,
+            bytes_ratio=1.0,
+            inlier_count=0,
+            inlier_ratio=0.0,
+            blur_flag=False,
+        )
 
     ref_orig = reference_orig_dims or ref_dims_detected
     m_orig = member_orig_dims or m_dims_detected
@@ -1472,6 +1486,7 @@ def run_quality_pipeline(
                 conn.execute("DELETE FROM clusters WHERE id = ?", (cid,))
             else:
                 conn.execute("UPDATE clusters SET member_count = ? WHERE id = ?", (len(surviving), cid))
+            conn.commit()
 
     conn.commit()
     res.elapsed_seconds = round(time.perf_counter() - t0, 3)

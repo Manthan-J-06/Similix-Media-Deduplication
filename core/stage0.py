@@ -353,6 +353,7 @@ def run_stage0(
             break
 
         updates: list[tuple[str, int]] = []
+        failed_ids: list[int] = []
         for row in batch:
             path_str = row["file_path"]
             try:
@@ -365,6 +366,7 @@ def run_stage0(
             except Exception as exc:
                 result.files_skipped += 1
                 result.skipped_reasons.append((path_str, f"MD5 read failed: {exc}"))
+                failed_ids.append(row["id"])
                 continue
 
         if updates:
@@ -380,6 +382,18 @@ def run_stage0(
             )
             conn.commit()
             result.files_hashed += len(updates)
+
+        if failed_ids:
+            conn.executemany(
+                """
+                UPDATE images
+                SET status = 'skipped',
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                WHERE id = ?
+                """,
+                [(fid,) for fid in failed_ids],
+            )
+            conn.commit()
 
     # Step 3: Flag RAW+JPEG sibling pairs
     result.raw_pairs_marked = _detect_raw_pairs(conn, raw_exts)

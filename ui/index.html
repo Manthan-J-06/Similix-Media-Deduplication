@@ -1601,6 +1601,23 @@
       document.getElementById("history-modal").style.display = "none";
     });
 
+    function setSourceButtonsDisabled(disabled) {
+      const btnSources = document.getElementById("btn-open-sources");
+      const btnRescan = document.getElementById("btn-rescan");
+      if (btnSources) {
+        btnSources.disabled = disabled;
+        btnSources.style.opacity = disabled ? "0.5" : "1.0";
+        btnSources.style.cursor = disabled ? "not-allowed" : "pointer";
+        btnSources.title = disabled ? "Pipeline job is currently running..." : "";
+      }
+      if (btnRescan) {
+        btnRescan.disabled = disabled;
+        btnRescan.style.opacity = disabled ? "0.5" : "1.0";
+        btnRescan.style.cursor = disabled ? "not-allowed" : "pointer";
+        btnRescan.title = disabled ? "Pipeline job is currently running..." : "";
+      }
+    }
+
     // Job progress polling
     let activeJobPollInterval = null;
     function pollJobProgress(jobId) {
@@ -1611,6 +1628,7 @@
 
       banner.style.display = "block";
       fill.style.background = "#2563eb";
+      setSourceButtonsDisabled(true);
       if (activeJobPollInterval) clearInterval(activeJobPollInterval);
 
       activeJobPollInterval = setInterval(async () => {
@@ -1618,13 +1636,23 @@
           const res = await fetch(`/jobs/${jobId}`);
           if (!res.ok) return;
           const data = await res.json();
-          statusText.textContent = `${data.message || data.stage} (${data.stage})`;
-          percentText.textContent = `${data.progress}%`;
-          fill.style.width = `${data.progress}%`;
+          const stageText = data.stage_display || data.stage || "Running";
+          const countText = data.total_files > 0 ? ` (${data.current_file || 0} of ${data.total_files} files)` : "";
+          statusText.textContent = data.message || `${stageText}${countText}`;
+          const pct = Math.round(data.progress || 0);
+          percentText.textContent = `${pct}%`;
+          fill.style.width = `${pct}%`;
 
-          if (data.status === "completed") {
+          if (data.status === "completed" || data.status === "completed_with_warnings") {
             clearInterval(activeJobPollInterval);
-            statusText.textContent = "Pipeline complete!";
+            setSourceButtonsDisabled(false);
+            if (data.status === "completed_with_warnings") {
+              statusText.textContent = data.message || `Pipeline completed with warnings (${(data.warnings || []).length} skipped)`;
+              fill.style.background = "#eab308";
+            } else {
+              statusText.textContent = data.message || "Pipeline completed successfully!";
+              fill.style.background = "#22c55e";
+            }
             percentText.textContent = "100%";
             fill.style.width = "100%";
             setTimeout(() => {
@@ -1632,16 +1660,17 @@
               loadCategories();
               loadClusters();
               if (activeClusterId) selectCluster(activeClusterId);
-            }, 2000);
+            }, 3000);
           } else if (data.status === "failed") {
             clearInterval(activeJobPollInterval);
+            setSourceButtonsDisabled(false);
             statusText.textContent = `Pipeline error: ${data.error || "Job failed"}`;
             fill.style.background = "var(--danger)";
           }
         } catch (err) {
           console.error("Failed to poll job:", err);
         }
-      }, 1000);
+      }, 800);
     }
 
     // Add Sources Modal & Tabs
@@ -1825,9 +1854,24 @@
       }
     });
 
+    // Check if a background job is already running on page load (survives reload)
+    async function checkActiveJob() {
+      try {
+        const res = await fetch("/jobs/active");
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data && data.active && data.job) {
+          pollJobProgress(data.job.id);
+        }
+      } catch (err) {
+        console.error("Failed to check active job on load:", err);
+      }
+    }
+
     // Initial Load
     loadCategories();
     loadClusters();
+    checkActiveJob();
   </script>
 </body>
 </html>

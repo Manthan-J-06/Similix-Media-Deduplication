@@ -84,6 +84,7 @@ def compute_stage1_hashes(
             FROM images
             WHERE phash IS NULL
               AND is_raw_pair = 0
+              AND (status IS NULL OR status != 'skipped')
             LIMIT ?
             """,
             (batch_size,),
@@ -93,6 +94,7 @@ def compute_stage1_hashes(
             break
 
         updates: list[tuple[str, int]] = []
+        failed_ids: list[int] = []
         for row in batch:
             file_id = row["file_path"]
             try:
@@ -103,6 +105,7 @@ def compute_stage1_hashes(
                 if result is not None:
                     result.files_skipped += 1
                     result.skipped_reasons.append((file_id, f"Thumbnail/pHash generation failed: {exc}"))
+                failed_ids.append(row["id"])
                 continue
 
         if updates:
@@ -117,6 +120,18 @@ def compute_stage1_hashes(
             )
             conn.commit()
             hashes_computed += len(updates)
+
+        if failed_ids:
+            conn.executemany(
+                """
+                UPDATE images
+                SET status = 'skipped',
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                WHERE id = ?
+                """,
+                [(fid,) for fid in failed_ids],
+            )
+            conn.commit()
 
     return hashes_computed
 

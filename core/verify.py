@@ -568,8 +568,13 @@ def run_stage3_verification(
             mem_cache[image_id] = (kps, des)
             return mem_cache[image_id]
 
-        proxy = load_proxy_grayscale(file_path, proxy_size=verifier.proxy_size, source=source)
-        kps, des = verifier.extract_features(proxy)
+        try:
+            proxy = load_proxy_grayscale(file_path, proxy_size=verifier.proxy_size, source=source)
+            kps, des = verifier.extract_features(proxy)
+        except Exception as exc:
+            logger.warning("Failed to extract keypoints for %s: %s", file_path, exc)
+            kps, des = [], None
+
         conn.execute(
             "INSERT OR REPLACE INTO keypoint_cache (image_id, keypoints, descriptors) VALUES (?, ?, ?)",
             (image_id, serialize_keypoints(kps), serialize_descriptors(des)),
@@ -704,6 +709,7 @@ def run_stage3_verification(
                 "UPDATE clusters SET member_count = ? WHERE id = ?",
                 (remaining_count, cluster_id),
             )
+        conn.commit()
 
     # ── Re-evaluation of Split Members ─────────────────────────────────────
     # Members split out by Stage 3 must be re-evaluated:
