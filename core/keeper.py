@@ -31,9 +31,32 @@ from pathlib import Path
 import sqlite3
 from typing import Any
 
+import re
 import numpy as np
 
-from core.quality import select_reference_member
+def _select_reference_from_metrics(members: list[dict[str, Any]]) -> dict[str, Any]:
+    """Select reference member purely from stored database metrics (no disk I/O)."""
+    if not members:
+        return {}
+    for m in members:
+        if m.get("quality_status") == "reference":
+            return m
+    for m in members:
+        if m.get("is_keeper") or m.get("is_recommended_keeper"):
+            return m
+
+    def fallback_ref_key(m: dict[str, Any]) -> tuple:
+        w = m.get("width") or 0
+        h = m.get("height") or 0
+        px = w * h
+        sz = m.get("file_size") or 0
+        mtime = m.get("modified_time") or 0.0
+        p = str(m.get("file_path") or "")
+        m_id = m.get("id") or 0
+        is_derived = 1 if re.search(r"(__|_copy|\bcopy\b|\s\(\d+\)|_resave)", Path(p).stem, re.IGNORECASE) else 0
+        return (-px, mtime if mtime > 0 else float("inf"), is_derived, len(p), sz, m_id)
+
+    return min(members, key=fallback_ref_key)
 
 # Default keeper mode limits per specification
 DEFAULT_KEEPER_MODES: dict[str, dict[str, Any]] = {
@@ -192,7 +215,13 @@ def choose_keeper(
             break
 
     if ref_member is None:
-        ref_member = select_reference_member(members)
+        for m in members:
+            if m.get("is_keeper"):
+                ref_member = m
+                break
+
+    if ref_member is None:
+        ref_member = _select_reference_from_metrics(members)
 
     ref_id = ref_member.get("id")
     ref_sz = ref_member.get("file_size") or 0

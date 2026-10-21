@@ -51,6 +51,7 @@ def update_job_file(
     message: str | None = None,
     warnings: list[str] | None = None,
     error: str | None = None,
+    pid: int | None = None,
 ) -> None:
     """Atomically update a job's JSON state file."""
     data: dict[str, Any] = {}
@@ -62,6 +63,8 @@ def update_job_file(
 
     if not data.get("id"):
         data["id"] = job_file.stem
+    if pid is not None:
+        data["pid"] = pid
 
     if status is not None:
         data["status"] = status
@@ -118,6 +121,7 @@ def run_pipeline(
 
         update_job_file(
             job_file,
+            pid=os.getpid(),
             status="running",
             stage="scan",
             stage_display="Scanning files",

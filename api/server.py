@@ -204,13 +204,16 @@ def launch_pipeline_job(
     env["NUMEXPR_NUM_THREADS"] = "2"
     env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-    subprocess.Popen(
+    proc = subprocess.Popen(
         cmd,
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+    initial_job_data["pid"] = proc.pid
+    write_job_state(job_file, initial_job_data)
+    app.state.jobs[job_id] = initial_job_data
     return job_id
 
 
@@ -1017,6 +1020,7 @@ def create_app(
         request: Request = None,
     ) -> dict[str, Any]:
         """Return the currently running or queued pipeline job if one is active."""
+        now = time.time()
         jobs_dir = request.app.state.jobs_dir
         if jobs_dir.is_dir():
             try:
@@ -1024,6 +1028,24 @@ def create_app(
                 for jf in files:
                     state = read_job_state(jf)
                     if state and state.get("status") in ("running", "queued"):
+                        pid = state.get("pid")
+                        is_alive = True
+                        if pid is not None:
+                            try:
+                                os.kill(pid, 0)
+                            except OSError:
+                                is_alive = False
+                        else:
+                            # Stale fallback: if no PID and no update in > 60s, job is dead
+                            if (now - state.get("updated_at", 0)) > 60:
+                                is_alive = False
+
+                        if not is_alive:
+                            state["status"] = "failed"
+                            state["error"] = "Worker process is no longer running"
+                            write_job_state(jf, state)
+                            continue
+
                         job_id = state.get("id") or state.get("job_id") or jf.stem
                         stage = state.get("stage_display") or state.get("stage") or "running"
                         done = int(state.get("current_file", 0))
