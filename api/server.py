@@ -575,6 +575,26 @@ def create_app(
                         if matches:
                             orig_path = matches[0]
 
+                    if orig_path is None:
+                        # Drive thumbnail cache file missing: refetch using stored thumbnailLink or files.get
+                        try:
+                            from sources.google_drive import GoogleDriveSource
+                            gdrive_source = GoogleDriveSource(conn=conn, cache_dir=drive_cache_dir, config=cfg, stage="thumbnail")
+                            thumb_im = gdrive_source.get_thumbnail(file_path_str, size=(size, size))
+                            matches = sorted(drive_cache_dir.glob(f"{drive_id}_*.jpg"))
+                            if not matches:
+                                matches = sorted(drive_cache_dir.glob(f"{drive_id}.jpg"))
+                            if matches:
+                                orig_path = matches[0]
+                            else:
+                                cache_dir = request.app.state.thumb_cache_dir
+                                cache_path = cache_dir / f"{image_id}_{size}.jpg"
+                                cache_dir.mkdir(parents=True, exist_ok=True)
+                                thumb_im.save(str(cache_path), format="JPEG", quality=85)
+                                return FileResponse(str(cache_path), media_type="image/jpeg")
+                        except Exception as exc:
+                            logger.warning(f"Could not refetch Drive thumbnail for image {image_id} ({drive_id}): {exc}")
+
             if orig_path is None:
                 candidate_path = Path(file_path_str)
                 if candidate_path.exists():
@@ -1078,16 +1098,34 @@ def create_app(
                                 os.kill(pid, 0)
                             except OSError:
                                 is_alive = False
-                        else:
-                            # Stale fallback: if no PID and no update in > 60s, job is dead
-                            if (now - state.get("updated_at", 0)) > 60:
-                                is_alive = False
+                        last_heartbeat = state.get("heartbeat_at") or state.get("updated_at", 0)
+                        is_stalled = (now - last_heartbeat) > 60
 
                         if not is_alive:
                             state["status"] = "failed"
                             state["error"] = "Worker process is no longer running"
                             write_job_state(jf, state)
-                            continue
+                            job_id = state.get("id") or state.get("job_id") or jf.stem
+                            return {
+                                "active": False,
+                                "status": "failed",
+                                "job_id": str(job_id),
+                                "error": "Worker process is no longer running",
+                                "message": "Worker process is no longer running",
+                            }
+
+                        if is_stalled:
+                            state["status"] = "stalled"
+                            state["error"] = "Worker heartbeat timed out (>60s)"
+                            write_job_state(jf, state)
+                            job_id = state.get("id") or state.get("job_id") or jf.stem
+                            return {
+                                "active": False,
+                                "status": "stalled",
+                                "job_id": str(job_id),
+                                "error": "Worker heartbeat timed out (>60s)",
+                                "message": "Worker heartbeat timed out (>60s)",
+                            }
 
                         job_id = state.get("id") or state.get("job_id") or jf.stem
                         stage = state.get("stage_display") or state.get("stage") or "running"

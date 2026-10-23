@@ -23,6 +23,7 @@ import concurrent.futures
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import shutil
 import sqlite3
@@ -1371,4 +1372,172 @@ class TestPipelineResumable:
         # Must NOT be placeholder
         from api.server import PLACEHOLDER_JPEG_BYTES
         assert res.content != PLACEHOLDER_JPEG_BYTES, "Drive thumbnail should be loaded from drive_cache, not placeholder"
+
+    def test_drive_thumbnail_refetched_when_cache_missing(self, api_test_env, tmp_path, monkeypatch):
+        """
+        Requirement 5:
+        If the cache file is missing, refetch it using stored thumbnailLink or files.get,
+        instead of returning the gray placeholder.
+        """
+        client = api_test_env["client"]
+        app = api_test_env["app"]
+        db_file = api_test_env["db_file"]
+
+        drive_cache = tmp_path / "drive_cache_refetch"
+        drive_cache.mkdir()
+
+        app.state.config = {
+            "sources": {
+                "google_drive": {
+                    "cache_dir": str(drive_cache)
+                }
+            }
+        }
+
+        conn = sqlite3.connect(db_file)
+        conn.execute(
+            """
+            INSERT INTO images (id, cluster_id, file_path, source, drive_id, modified_time, file_size, width, height, format, md5, is_keeper)
+            VALUES (3001, 1, 'drive://drive_refetch_id/remote.jpg', 'gdrive', 'drive_refetch_id', 1700000000, 1000, 100, 100, 'JPEG', 'md5refetch', 0)
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        # Cache file is initially NOT present
+        assert not list(drive_cache.glob("drive_refetch_id*"))
+
+        # Mock GoogleDriveSource.get_thumbnail to simulate fetching from thumbnailLink
+        def mock_get_thumbnail(self, file_id, size=(256, 256)):
+            cache_file = self.cache_dir / f"drive_refetch_id_1700000000.jpg"
+            _create_test_image(cache_file, color=(10, 200, 100), size=size)
+            im = Image.new("RGB", size, color=(10, 200, 100))
+            return im
+
+        from sources.google_drive import GoogleDriveSource
+        monkeypatch.setattr(GoogleDriveSource, "get_thumbnail", mock_get_thumbnail)
+
+        res = client.get("/thumb/3001?size=64")
+        assert res.status_code == 200
+        assert res.headers["content-type"] == "image/jpeg"
+        from api.server import PLACEHOLDER_JPEG_BYTES
+        assert res.content != PLACEHOLDER_JPEG_BYTES
+        # Cache file should now exist in drive_cache
+        assert list(drive_cache.glob("drive_refetch_id*"))
+
+    def test_stalled_job_detection_when_heartbeat_older_than_60s(self, api_test_env):
+        """
+        Requirement 1:
+        If the worker heartbeat timestamp is older than 60 seconds,
+        GET /jobs/active reports "stalled", records it in the job file,
+        and sets active=False so Add Sources and Rescan re-enable.
+        """
+        client = api_test_env["client"]
+        app = api_test_env["app"]
+        jobs_dir = app.state.jobs_dir
+
+        job_id = "test_stalled_job"
+        job_file = jobs_dir / f"{job_id}.json"
+
+        from core.worker import update_job_file
+        # Heartbeat 80 seconds ago, PID is current running process so PID is alive
+        update_job_file(
+            job_file,
+            pid=os.getpid(),
+            status="running",
+            stage="quality",
+            stage_display="Evaluating quality (cluster 5 of 29, id #14)",
+            current_file=5,
+            total_files=29,
+            progress=86.0,
+            heartbeat_at=time.time() - 80.0,
+        )
+
+        res = client.get("/jobs/active")
+        assert res.status_code == 200
+        data = res.json()
+        assert data.get("active") is False
+        assert data.get("status") == "stalled"
+        assert "heartbeat" in data.get("error", "").lower()
+
+        # Job file status must be updated on disk
+        disk_state = json.loads(job_file.read_text())
+        assert disk_state.get("status") == "stalled"
+
+    def test_failed_job_detection_when_pid_gone(self, api_test_env):
+        """
+        Requirement 1:
+        If worker PID is gone, GET /jobs/active reports "failed", records it in job file,
+        and sets active=False.
+        """
+        client = api_test_env["client"]
+        app = api_test_env["app"]
+        jobs_dir = app.state.jobs_dir
+
+        job_id = "test_pid_gone_job"
+        job_file = jobs_dir / f"{job_id}.json"
+
+        from core.worker import update_job_file
+        # Non-existent PID
+        update_job_file(
+            job_file,
+            pid=9999999,
+            status="running",
+            stage="embed",
+            stage_display="Embedding",
+            heartbeat_at=time.time(),
+        )
+
+        res = client.get("/jobs/active")
+        assert res.status_code == 200
+        data = res.json()
+        assert data.get("active") is False
+        assert data.get("status") == "failed"
+        assert "no longer running" in data.get("error", "").lower()
+
+        disk_state = json.loads(job_file.read_text())
+        assert disk_state.get("status") == "failed"
+
+    def test_pairwise_comparison_cap_for_large_cluster(self, tmp_path):
+        """
+        Requirement 3:
+        For clusters with more than 8 members:
+        - Compute pairwise source-likelihood only among distinct same-resolution candidates.
+        - Cap comparisons per cluster (default 40, or configured).
+        - Mark reference_uncertain when the cap is hit.
+        """
+        from core.quality import compute_source_likelihood_scores, select_reference_member
+
+        # Create 10 distinct images with same resolution (100x100)
+        members = []
+        for i in range(10):
+            p = tmp_path / f"large_cluster_img_{i}.jpg"
+            _create_test_image(p, color=(20 + i * 20, 30 + i * 15, 40 + i * 10), size=(100, 100))
+            members.append({
+                "id": 100 + i,
+                "file_path": str(p),
+                "width": 100,
+                "height": 100,
+                "file_size": 1000 + i * 10,
+                "format": "JPEG",
+                "modified_time": 1000.0 + i,
+                "md5": f"md5_unique_{i}",
+                "jpeg_quality_est": 85,
+            })
+
+        # Test compute_source_likelihood_scores directly with max_comparisons = 5
+        out_info: dict[str, Any] = {}
+        scores = compute_source_likelihood_scores(
+            members,
+            max_comparisons=5,
+            out_info=out_info,
+        )
+        assert out_info.get("cap_hit") is True
+        assert out_info.get("total_comparisons") == 5
+
+        # Test select_reference_member with max_comparisons = 5
+        ref = select_reference_member(members, max_comparisons=5)
+        assert ref.get("reference_uncertain") == 1, (
+            "reference_uncertain must be 1 when comparison cap is hit on >8 members"
+        )
 

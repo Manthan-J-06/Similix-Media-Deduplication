@@ -300,7 +300,8 @@ class GoogleDriveSource(ImageSource):
         self._service = service
         self._credentials = credentials
         self.config = config or {}
-        self.cache_dir = Path(cache_dir or DEFAULT_CACHE_DIR).expanduser()
+        cfg_cache = self.config.get("sources", {}).get("google_drive", {}).get("cache_dir")
+        self.cache_dir = Path(cache_dir or cfg_cache or DEFAULT_CACHE_DIR).expanduser()
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.temp_dir = Path(temp_dir) if temp_dir else None
         self.conn = conn

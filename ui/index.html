@@ -1719,14 +1719,16 @@
               if (activeClusterId) selectCluster(activeClusterId);
             }, 3000);
             return;
-          } else if (data.status === "failed" || data.status === "error") {
+          } else if (data.status === "failed" || data.status === "error" || data.status === "stalled") {
             currentPollingJobId = null;
             if (activeJobPollTimeout) {
               clearTimeout(activeJobPollTimeout);
               activeJobPollTimeout = null;
             }
             setSourceButtonsDisabled(false);
-            statusText.textContent = `Pipeline error: ${data.error || "Job failed"}`;
+            statusText.textContent = data.status === "stalled"
+              ? `Pipeline stalled: ${data.error || "No worker heartbeat in >60s"}`
+              : `Pipeline error: ${data.error || "Job failed"}`;
             fill.style.background = "var(--danger)";
             return;
           }
@@ -1959,6 +1961,19 @@
         const data = await res.json();
         if (data && data.active === true && typeof data.job_id === "string" && data.job_id.trim() !== "" && data.job_id !== "undefined" && data.job_id !== "null") {
           pollJobProgress(data.job_id, data);
+        } else if (data && (data.status === "stalled" || data.status === "failed")) {
+          stopJobPolling();
+          const banner = document.getElementById("job-progress-banner");
+          const statusText = document.getElementById("job-progress-status");
+          const fill = document.getElementById("job-progress-fill");
+          if (banner && statusText && fill) {
+            banner.style.display = "block";
+            statusText.textContent = data.status === "stalled"
+              ? `Pipeline stalled: ${data.error || "No worker heartbeat in >60s"}`
+              : `Pipeline failed: ${data.error || "Worker process is no longer running"}`;
+            fill.style.background = "var(--danger)";
+          }
+          setSourceButtonsDisabled(false);
         } else {
           stopJobPolling();
         }

@@ -32,7 +32,7 @@ import pickle
 import re
 import sqlite3
 import time
-from typing import Any
+from typing import Any, Callable
 
 import cv2
 import numpy as np
@@ -90,6 +90,7 @@ class QualityResult:
     members_unalignable: int = 0
     elapsed_seconds: float = 0.0
     member_records: list[MemberQualityRecord] = field(default_factory=list)
+    slowest_clusters: list[tuple[int, float]] = field(default_factory=list)
 
 
 LOSSLESS_FORMATS = frozenset({"PNG", "TIFF", "TIF", "BMP"})
@@ -411,11 +412,14 @@ def compute_source_likelihood_scores(
     members: list[sqlite3.Row | dict[str, Any]],
     source: ImageSource | None = None,
     proxy_size: int = 1024,
+    max_comparisons: int = 40,
+    out_info: dict[str, Any] | None = None,
 ) -> dict[Any, float | None]:
     """
     Compute source-likelihood score for members:
     For same-resolution lossy members, compute the mean SSIM of each member against the others
     using ~1024px proxies, caching pairwise SSIM results.
+    For clusters with >8 members, caps pairwise comparisons (default 40).
     Returns a mapping from member id (or file_path) to float score (or None if no same-res peers).
     """
     scores: dict[Any, float | None] = {}
@@ -443,6 +447,7 @@ def compute_source_likelihood_scores(
 
     gray_cache: dict[Any, np.ndarray | None] = {}
     ssim_cache: dict[tuple[Any, Any], float] = {}
+    total_comparisons = 0
 
     for (w, h), group in by_res.items():
         lossy_members = [m for m in group if not _is_lossless_member(m)]
@@ -487,19 +492,31 @@ def compute_source_likelihood_scores(
                 scores[mid] = float(existing) if existing is not None else None
 
         if len(valid_lossy) >= 2:
+            cap_hit = False
             for i in range(len(valid_lossy)):
                 id_i, g_i = valid_lossy[i]
                 for j in range(i + 1, len(valid_lossy)):
                     id_j, g_j = valid_lossy[j]
                     cache_key = (id_i, id_j)
                     if cache_key not in ssim_cache:
+                        if len(members) > 8 and total_comparisons >= max_comparisons:
+                            cap_hit = True
+                            if out_info is not None:
+                                out_info["cap_hit"] = True
+                            break
                         sim = _calc_proxy_ssim(g_i, g_j)
                         ssim_cache[(id_i, id_j)] = sim
                         ssim_cache[(id_j, id_i)] = sim
+                        total_comparisons += 1
+                if cap_hit:
+                    break
+
+            if out_info is not None:
+                out_info["total_comparisons"] = total_comparisons
 
             rep_scores: dict[Any, float | None] = {}
             for id_i, _ in valid_lossy:
-                peer_sims = [ssim_cache[(id_i, id_j)] for id_j, _ in valid_lossy if id_j != id_i]
+                peer_sims = [ssim_cache[(id_i, id_j)] for id_j, _ in valid_lossy if (id_i, id_j) in ssim_cache]
                 if peer_sims:
                     rep_scores[id_i] = round(float(np.mean(peer_sims)), 6)
                 else:
@@ -527,11 +544,11 @@ def compute_source_likelihood_scores(
     return scores
 
 
-
 def select_reference_member(
     members: list[sqlite3.Row | dict[str, Any]],
     source: ImageSource | None = None,
     conn: sqlite3.Connection | None = None,
+    max_comparisons: int = 40,
 ) -> dict[str, Any]:
     """
     Select the reference member for a duplicate cluster:
@@ -546,7 +563,7 @@ def select_reference_member(
     9. Deterministic tie-breakers: file_path ascending, ID ascending
 
     If top two candidates' source-likelihood scores differ by < 0.002, or EXIF/mtime
-    contradict the SSIM ranking, sets reference_uncertain = 1 on the cluster.
+    contradict the SSIM ranking, or comparison cap was hit on >8 members, sets reference_uncertain = 1 on the cluster.
     """
     if not members:
         raise ValueError("Cannot select reference from empty member list")
@@ -561,7 +578,13 @@ def select_reference_member(
             pixel_has_lossy[px] = True
 
     # 1. Compute source-likelihood scores
-    sl_scores = compute_source_likelihood_scores(member_dicts, source=source)
+    sl_info: dict[str, Any] = {}
+    sl_scores = compute_source_likelihood_scores(
+        member_dicts,
+        source=source,
+        max_comparisons=max_comparisons,
+        out_info=sl_info,
+    )
     for m in member_dicts:
         mid = m["id"] if ("id" in m.keys() and m["id"] is not None) else m.get("file_path")
         m["source_likelihood"] = sl_scores.get(mid)
@@ -781,6 +804,9 @@ def select_reference_member(
     else:
         ref = min(member_dicts, key=key_fn)
 
+    if sl_info.get("cap_hit"):
+        reference_uncertain = 1
+
     ref["reference_uncertain"] = reference_uncertain
     ref["top_candidate_gap"] = top_candidate_gap
     ref["head_to_head_result"] = head_to_head_result
@@ -874,7 +900,33 @@ def load_proxy_rgb(
         orig_dims = im.size
     else:
         file_path = str(image_or_path)
-        if source is not None:
+        if file_path.startswith("drive://"):
+            drive_id = file_path[8:].split("/")[0]
+            cache_dir = Path.home() / ".argus" / "drive_cache"
+            cached_file = None
+            if cache_dir.is_dir():
+                matches = sorted(cache_dir.glob(f"{drive_id}_*.jpg"))
+                if not matches:
+                    matches = sorted(cache_dir.glob(f"{drive_id}.jpg"))
+                if matches:
+                    cached_file = matches[0]
+
+            if cached_file and cached_file.is_file():
+                with Image.open(cached_file) as raw_im:
+                    im = raw_im.convert("RGB")
+                    orig_dims = im.size
+            elif source is not None and hasattr(source, "get_thumbnail"):
+                im = source.get_thumbnail(file_path, size=(proxy_size, proxy_size)).convert("RGB")
+                orig_dims = im.size
+            else:
+                try:
+                    from sources.google_drive import GoogleDriveSource
+                    gdrive_source = GoogleDriveSource(stage="quality_thumbnail")
+                    im = gdrive_source.get_thumbnail(file_path, size=(proxy_size, proxy_size)).convert("RGB")
+                    orig_dims = im.size
+                except Exception as exc:
+                    raise OSError(f"Drive proxy thumbnail not available for {file_path}: {exc}")
+        elif source is not None:
             im = source.get_thumbnail(file_path, size=(proxy_size, proxy_size)).convert("RGB")
             try:
                 meta = source.get_metadata(file_path)
@@ -1203,6 +1255,7 @@ def run_quality_pipeline(
     conn: sqlite3.Connection,
     config: dict | None = None,
     source: ImageSource | None = None,
+    progress_callback: Callable[[int, int, int], None] | None = None,
 ) -> QualityResult:
     """
     Run quality scoring and geometric alignment across all clusters in SQLite.
@@ -1215,11 +1268,16 @@ def run_quality_pipeline(
     cfg = config or {}
     q_cfg = cfg.get("quality", {})
     min_cluster_match_pct = float(q_cfg.get("min_cluster_match_pct", 75.0))
+    cluster_timeout = float(q_cfg.get("cluster_timeout_seconds", 60.0))
+    max_comparisons = int(q_cfg.get("max_pairwise_comparisons", 40))
 
     # Query all clusters
     clusters = conn.execute("SELECT id FROM clusters ORDER BY id").fetchall()
+    total_clusters = len(clusters)
+    cluster_times: list[tuple[int, float]] = []
 
-    for c in clusters:
+    for idx, c in enumerate(clusters, 1):
+        c_t0 = time.perf_counter()
         cid = c["id"]
         members = conn.execute(
             """
@@ -1232,6 +1290,9 @@ def run_quality_pipeline(
         ).fetchall()
 
         if len(members) < 2:
+            cluster_times.append((cid, time.perf_counter() - c_t0))
+            if progress_callback is not None:
+                progress_callback(idx, total_clusters, cid)
             continue
 
         res.clusters_evaluated += 1
@@ -1286,7 +1347,7 @@ def run_quality_pipeline(
 
             member_rows.append(d)
 
-        ref_member = select_reference_member(member_rows, source=source, conn=conn)
+        ref_member = select_reference_member(member_rows, source=source, conn=conn, max_comparisons=max_comparisons)
         ref_id = ref_member["id"]
         ref_path = ref_member["file_path"]
         ref_orig = (ref_member["width"] or 0, ref_member["height"] or 0)
@@ -1352,9 +1413,20 @@ def run_quality_pipeline(
         )
 
         # Align and evaluate every other member
+        timed_out = False
         for m in member_rows:
             if m["id"] == ref_id:
                 continue
+
+            # Check per-cluster time limit (default 60s)
+            if (time.perf_counter() - c_t0) > cluster_timeout:
+                logger.warning(
+                    "Cluster %s evaluation exceeded time limit of %.1fs; moving on",
+                    cid,
+                    cluster_timeout,
+                )
+                timed_out = True
+                break
 
             mid = m["id"]
             m_path = m["file_path"]
@@ -1491,6 +1563,16 @@ def run_quality_pipeline(
                 conn.execute("UPDATE clusters SET member_count = ? WHERE id = ?", (len(surviving), cid))
             conn.commit()
 
+        c_elapsed = time.perf_counter() - c_t0
+        cluster_times.append((cid, c_elapsed))
+        if progress_callback is not None:
+            progress_callback(idx, total_clusters, cid)
+
     conn.commit()
     res.elapsed_seconds = round(time.perf_counter() - t0, 3)
+    res.slowest_clusters = sorted(cluster_times, key=lambda x: x[1], reverse=True)[:5]
+    if res.slowest_clusters:
+        slowest_str = ", ".join(f"#{cid} ({t:.2f}s)" for cid, t in res.slowest_clusters)
+        print(f"Quality stage slowest 5 clusters: {slowest_str}")
+        logger.info("Quality stage slowest 5 clusters: %s", slowest_str)
     return res

@@ -31,6 +31,7 @@ import json
 import logging
 from pathlib import Path
 import sqlite3
+import threading
 import time
 from typing import Any
 import uuid
@@ -39,6 +40,27 @@ from core.config import load_config
 from db.connection import get_connection, init_db
 
 logger = logging.getLogger("argus.worker")
+
+
+class JobHeartbeatThread(threading.Thread):
+    """Background thread that writes a heartbeat timestamp to the job file every interval seconds."""
+
+    def __init__(self, job_file: Path, interval: float = 5.0):
+        super().__init__(daemon=True, name="JobHeartbeat")
+        self.job_file = job_file
+        self.interval = interval
+        self._stop_event = threading.Event()
+
+    def run(self) -> None:
+        while not self._stop_event.wait(self.interval):
+            try:
+                if self.job_file.is_file():
+                    update_job_file(self.job_file, heartbeat_at=time.time())
+            except Exception:
+                pass
+
+    def stop(self) -> None:
+        self._stop_event.set()
 
 
 def update_job_file(
@@ -53,6 +75,8 @@ def update_job_file(
     warnings: list[str] | None = None,
     error: str | None = None,
     pid: int | None = None,
+    heartbeat_at: float | None = None,
+    slowest_clusters: list[dict[str, Any]] | None = None,
 ) -> None:
     """Atomically update a job's JSON state file."""
     data: dict[str, Any] = {}
@@ -85,8 +109,12 @@ def update_job_file(
         data["warnings"] = warnings
     if error is not None:
         data["error"] = error
+    if slowest_clusters is not None:
+        data["slowest_clusters"] = slowest_clusters
 
-    data["updated_at"] = time.time()
+    now = time.time()
+    data["updated_at"] = now
+    data["heartbeat_at"] = heartbeat_at if heartbeat_at is not None else now
     job_file.parent.mkdir(parents=True, exist_ok=True)
     tmp_file = job_file.with_suffix(f".tmp_{uuid.uuid4().hex[:6]}")
     tmp_file.write_text(json.dumps(data, indent=2))
@@ -169,6 +197,10 @@ def run_pipeline(
     conn = get_connection(db_path)
     all_warnings: list[str] = []
     current_stage = "scan"
+    slowest_5_records: list[dict[str, Any]] = []
+
+    heartbeat = JobHeartbeatThread(job_file, interval=5.0)
+    heartbeat.start()
 
     try:
         from core.categories import run_categorization
@@ -330,14 +362,33 @@ def run_pipeline(
         update_job_file(
             job_file,
             stage="quality",
-            stage_display="Quality evaluation",
+            stage_display=f"Evaluating quality (0 of {cluster_count} clusters)" if cluster_count > 0 else "Quality up-to-date",
             current_file=0,
             total_files=cluster_count,
             progress=85.0,
-            message=f"Evaluating quality ({cluster_count} clusters)",
+            message=f"Evaluating quality (0 of {cluster_count} clusters)" if cluster_count > 0 else "Quality up-to-date",
         )
+
+        def on_quality_progress(cur: int, tot: int, cid: int):
+            pct = 85.0 + 7.0 * (cur / max(1, tot))
+            update_job_file(
+                job_file,
+                stage="quality",
+                stage_display=f"Evaluating quality (cluster {cur} of {tot}, id #{cid})",
+                current_file=cur,
+                total_files=tot,
+                progress=round(pct, 1),
+                message=f"Evaluating quality (cluster {cur} of {tot}, id #{cid})",
+            )
+
         if _stage_needs_quality(conn):
-            run_quality_pipeline(conn, cfg, source=source_active)
+            q_res = run_quality_pipeline(conn, cfg, source=source_active, progress_callback=on_quality_progress)
+            if hasattr(q_res, "slowest_clusters") and q_res.slowest_clusters:
+                slowest_5 = q_res.slowest_clusters[:5]
+                slowest_5_records = [{"cluster_id": cid, "seconds": round(sec, 2)} for cid, sec in slowest_5]
+                slowest_str = ", ".join(f"#{cid} ({sec:.2f}s)" for cid, sec in slowest_5)
+                print(f"Top 5 slowest clusters in quality evaluation: {slowest_str}")
+                logger.info("Top 5 slowest clusters in quality evaluation: %s", slowest_str)
         else:
             logger.info("Stage 4 (quality) already complete — skipping.")
 
@@ -379,6 +430,11 @@ def run_pipeline(
             logger.info("Stage 5 (categorize) already complete — skipping.")
 
         # ── Finalize ──
+        summary_msg = "Pipeline completed successfully"
+        if slowest_5_records:
+            slowest_str = ", ".join(f"#{r['cluster_id']} ({r['seconds']}s)" for r in slowest_5_records)
+            summary_msg += f". Slowest clusters: {slowest_str}"
+
         if all_warnings:
             update_job_file(
                 job_file,
@@ -386,8 +442,9 @@ def run_pipeline(
                 stage="done",
                 stage_display="Completed with warnings",
                 progress=100.0,
-                message=f"Pipeline complete with warnings ({len(all_warnings)} files skipped)",
+                message=f"Pipeline complete with warnings ({len(all_warnings)} files skipped). {summary_msg}",
                 warnings=all_warnings,
+                slowest_clusters=slowest_5_records if slowest_5_records else None,
             )
         else:
             update_job_file(
@@ -396,8 +453,9 @@ def run_pipeline(
                 stage="done",
                 stage_display="Completed",
                 progress=100.0,
-                message="Pipeline completed successfully",
+                message=summary_msg,
                 warnings=[],
+                slowest_clusters=slowest_5_records if slowest_5_records else None,
             )
     except Exception as exc:
         logger.exception("Pipeline failed at stage '%s': %s", current_stage, exc)
@@ -407,8 +465,10 @@ def run_pipeline(
             stage=current_stage,
             error=str(exc),
             message=f"Pipeline failed at stage '{current_stage}': {exc}",
+            slowest_clusters=slowest_5_records if slowest_5_records else None,
         )
     finally:
+        heartbeat.stop()
         conn.close()
 
 
