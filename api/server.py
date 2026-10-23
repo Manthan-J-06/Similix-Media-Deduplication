@@ -3,16 +3,19 @@ api/server.py — FastAPI REST API for Argus.
 
 Binds to 127.0.0.1 only. No CORS for external origins.
 All file moves/deletions are strictly routed through core/ledger.
+Authentication, session management, and per-user isolation enforced.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import io
 import json
 import logging
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import sqlite3
 import subprocess
@@ -30,6 +33,30 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field
+
+from core.auth import (
+    authenticate_user,
+    check_login_rate_limit,
+    create_session,
+    get_session_user,
+    get_user_dirs,
+    hash_password,
+    init_auth_db,
+    invalidate_session,
+    register_user,
+    validate_confined_user_path,
+)
+from core.categories import search_images_by_text
+from core.config import load_config
+from core.keeper import choose_keeper
+from core.ledger import (
+    ensure_ledger_tables,
+    execute,
+    get_history,
+    plan,
+    undo,
+)
+from db.connection import get_connection, init_db
 
 logger = logging.getLogger("argus.api")
 
@@ -56,17 +83,17 @@ def _create_placeholder_jpeg() -> bytes:
 
 PLACEHOLDER_JPEG_BYTES = _create_placeholder_jpeg()
 
-from core.categories import search_images_by_text
-from core.config import load_config
-from core.keeper import choose_keeper
-from core.ledger import (
-    ensure_ledger_tables,
-    execute,
-    get_history,
-    plan,
-    undo,
-)
-from db.connection import get_connection, init_db
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+    model_config = ConfigDict(extra="ignore")
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+    model_config = ConfigDict(extra="ignore")
 
 
 class PlanRequest(BaseModel):
@@ -99,6 +126,36 @@ class DatasetSourceRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
 
+@dataclass
+class UserContext:
+    id: int
+    email: str
+    csrf_token: str
+    root: Path
+    db_path: Path
+    library_dir: Path
+    trash_dir: Path
+    thumb_cache_dir: Path
+    jobs_dir: Path
+    drive_cache_dir: Path
+
+
+def get_user_storage_usage(user_root: Path) -> int:
+    """Calculate total byte size of non-symlink files in user directory tree."""
+    total = 0
+    if not user_root.is_dir():
+        return 0
+    for dirpath, _, filenames in os.walk(user_root):
+        for f in filenames:
+            fp = os.path.join(dirpath, f)
+            if not os.path.islink(fp):
+                try:
+                    total += os.path.getsize(fp)
+                except OSError:
+                    pass
+    return total
+
+
 def extract_drive_folder_id(link: str) -> str:
     """Extract and validate Google Drive folder ID from link or raw ID string."""
     link = link.strip()
@@ -111,7 +168,6 @@ def extract_drive_folder_id(link: str) -> str:
             return m.group(1)
         raise HTTPException(status_code=400, detail=f"Invalid Drive folder link: {link}")
 
-    # Raw ID: Google Drive folder IDs are typically 28-45 alphanumeric/underscore/hyphen characters
     if re.fullmatch(r"[a-zA-Z0-9_-]{20,60}", link):
         return link
     raise HTTPException(status_code=400, detail=f"Invalid Drive folder link or ID: {link}")
@@ -136,41 +192,57 @@ def read_job_state(job_file: Path) -> dict | None:
         return None
 
 
-def launch_pipeline_job(
+def count_active_jobs_global(app: FastAPI) -> tuple[int, int]:
+    """Count running and queued jobs across all users."""
+    running = 0
+    queued = 0
+    now = time.time()
+
+    users_dir = getattr(app.state, "users_dir", None)
+    job_dirs: list[Path] = []
+    if users_dir and users_dir.is_dir():
+        for u in users_dir.iterdir():
+            if u.is_dir():
+                jd = u / "jobs"
+                if jd.is_dir():
+                    job_dirs.append(jd)
+
+    custom_jd = getattr(app.state, "jobs_dir", None)
+    if custom_jd and custom_jd.is_dir() and custom_jd not in job_dirs:
+        job_dirs.append(custom_jd)
+
+    for jd in job_dirs:
+        for jf in jd.glob("*.json"):
+            st = read_job_state(jf)
+            if not st:
+                continue
+            status = st.get("status")
+            if status == "running":
+                pid = st.get("pid")
+                alive = True
+                if pid:
+                    try:
+                        os.kill(pid, 0)
+                    except OSError:
+                        alive = False
+                last_hb = st.get("heartbeat_at") or st.get("updated_at", 0)
+                if alive and (now - last_hb) <= 60:
+                    running += 1
+            elif status == "queued":
+                queued += 1
+
+    return running, queued
+
+
+def _start_job_process(
     app: FastAPI,
-    source_type: str = "local",
-    folder: Path | None = None,
-    drive_folder_id: str | None = None,
-) -> str:
-    """
-    Launch pipeline execution in a separate OS process so heavy PyTorch/SIFT
-    computation never starves FastAPI's event loop or request handling.
-    """
-    job_id = uuid.uuid4().hex[:12]
-    jobs_dir = app.state.jobs_dir
-    jobs_dir.mkdir(parents=True, exist_ok=True)
-    job_file = jobs_dir / f"{job_id}.json"
-
-    initial_job_data = {
-        "id": job_id,
-        "status": "running",
-        "stage": "queued",
-        "stage_display": "Queued",
-        "current_file": 0,
-        "total_files": 0,
-        "progress": 0.0,
-        "message": "Job queued",
-        "source_type": source_type,
-        "target_folder": str(folder) if folder else None,
-        "warnings": [],
-        "error": None,
-        "created_at": time.time(),
-        "updated_at": time.time(),
-    }
-    write_job_state(job_file, initial_job_data)
-    app.state.jobs[job_id] = initial_job_data
-
-    # Allow custom in-process worker override for testing
+    job_id: str,
+    job_file: Path,
+    db_path: Path,
+    source_type: str,
+    folder: Path | None,
+    drive_folder_id: str | None,
+) -> None:
     custom_worker = getattr(app.state, "pipeline_worker", None)
     if custom_worker is not None:
         t = threading.Thread(
@@ -179,14 +251,14 @@ def launch_pipeline_job(
             daemon=True,
         )
         t.start()
-        return job_id
+        return
 
     cmd = [
         sys.executable,
         "-m",
         "core.worker",
         "--job-id", job_id,
-        "--db", str(app.state.db_path),
+        "--db", str(db_path),
         "--source-type", source_type,
         "--job-file", str(job_file),
     ]
@@ -211,16 +283,220 @@ def launch_pipeline_job(
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    initial_job_data["pid"] = proc.pid
-    write_job_state(job_file, initial_job_data)
-    app.state.jobs[job_id] = initial_job_data
+    st = read_job_state(job_file) or {}
+    st["pid"] = proc.pid
+    write_job_state(job_file, st)
+    app.state.jobs[job_id] = st
+
+
+def maybe_start_next_queued_job(app: FastAPI) -> None:
+    """Check if any global worker slot is free and promote the oldest queued job."""
+    with app.state.job_queue_lock:
+        max_concurrent = app.state.config.get("general", {}).get("max_concurrent_jobs", 1)
+        running_count, _ = count_active_jobs_global(app)
+        if running_count >= max_concurrent:
+            return
+
+        users_dir = getattr(app.state, "users_dir", None)
+        job_dirs: list[Path] = []
+        if users_dir and users_dir.is_dir():
+            for u in users_dir.iterdir():
+                if u.is_dir():
+                    jd = u / "jobs"
+                    if jd.is_dir():
+                        job_dirs.append(jd)
+        custom_jd = getattr(app.state, "jobs_dir", None)
+        if custom_jd and custom_jd.is_dir() and custom_jd not in job_dirs:
+            job_dirs.append(custom_jd)
+
+        queued_items = []
+        for jd in job_dirs:
+            for jf in jd.glob("*.json"):
+                st = read_job_state(jf)
+                if st and st.get("status") == "queued":
+                    queued_items.append((st.get("created_at", 0), jf, st))
+
+        queued_items.sort(key=lambda x: x[0])
+        if not queued_items:
+            return
+
+        _, next_jf, next_st = queued_items[0]
+        next_job_id = next_st["id"]
+        next_st["status"] = "running"
+        next_st["stage"] = "queued"
+        next_st["stage_display"] = "Queued"
+        next_st["message"] = "Job starting"
+        write_job_state(next_jf, next_st)
+        app.state.jobs[next_job_id] = next_st
+
+        target_folder = Path(next_st["target_folder"]) if next_st.get("target_folder") else None
+        db_path = Path(next_st.get("db_path", app.state.db_path))
+        _start_job_process(
+            app=app,
+            job_id=next_job_id,
+            job_file=next_jf,
+            db_path=db_path,
+            source_type=next_st.get("source_type", "local"),
+            folder=target_folder,
+            drive_folder_id=next_st.get("drive_folder_id"),
+        )
+
+
+def launch_pipeline_job(
+    app: FastAPI,
+    user: UserContext | None = None,
+    source_type: str = "local",
+    folder: Path | None = None,
+    drive_folder_id: str | None = None,
+) -> str:
+    """
+    Launch pipeline execution in a separate OS process so heavy PyTorch/SIFT
+    computation never starves FastAPI's event loop or request handling.
+    Enforces 1 running job per user and global max concurrent jobs with a queue.
+    """
+    if user is None:
+        overrides = getattr(app.state, "custom_user_overrides", {}).get(1)
+        user_dirs = get_user_dirs(app.state.users_dir, 1, custom_overrides=overrides)
+        jobs_dir = user_dirs["jobs_dir"]
+        db_path = user_dirs["db_path"]
+        user_id = 1
+    else:
+        jobs_dir = user.jobs_dir
+        db_path = user.db_path
+        user_id = user.id
+
+    now = time.time()
+    # Check if user already has an active (running/queued) job
+    if jobs_dir.is_dir():
+        for jf in jobs_dir.glob("*.json"):
+            st = read_job_state(jf)
+            if st and st.get("status") in ("running", "queued"):
+                pid = st.get("pid")
+                alive = True
+                if pid:
+                    try:
+                        os.kill(pid, 0)
+                    except OSError:
+                        alive = False
+                last_hb = st.get("heartbeat_at") or st.get("updated_at", 0)
+                if alive and (now - last_hb) <= 60:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="A pipeline job is already active for this user",
+                    )
+
+    job_id = uuid.uuid4().hex[:12]
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    job_file = jobs_dir / f"{job_id}.json"
+
+    max_concurrent = app.state.config.get("general", {}).get("max_concurrent_jobs", 1)
+    with app.state.job_queue_lock:
+        running_count, queued_count = count_active_jobs_global(app)
+        if running_count < max_concurrent:
+            status = "running"
+            stage = "queued"
+            stage_display = "Queued"
+            msg = "Job queued"
+        else:
+            status = "queued"
+            stage = "queued"
+            queue_pos = queued_count + 1
+            stage_display = f"Queued (position {queue_pos})"
+            msg = f"Queued (position {queue_pos})"
+
+        initial_job_data = {
+            "id": job_id,
+            "user_id": user_id,
+            "status": status,
+            "stage": stage,
+            "stage_display": stage_display,
+            "current_file": 0,
+            "total_files": 0,
+            "progress": 0.0,
+            "message": msg,
+            "source_type": source_type,
+            "target_folder": str(folder) if folder else None,
+            "drive_folder_id": drive_folder_id,
+            "db_path": str(db_path),
+            "warnings": [],
+            "error": None,
+            "created_at": time.time(),
+            "updated_at": time.time(),
+        }
+        write_job_state(job_file, initial_job_data)
+        app.state.jobs[job_id] = initial_job_data
+
+        if status == "running":
+            _start_job_process(
+                app=app,
+                job_id=job_id,
+                job_file=job_file,
+                db_path=db_path,
+                source_type=source_type,
+                folder=folder,
+                drive_folder_id=drive_folder_id,
+            )
+
     return job_id
 
 
-def get_db(request: Request):
-    """Provide a per-request SQLite connection with row_factory enabled."""
-    db_path = request.app.state.db_path
-    conn = get_connection(db_path)
+def get_current_user(request: Request) -> UserContext:
+    """Validate session cookie or Bearer token, enforce CSRF on POST, and resolve user dirs."""
+    token = request.cookies.get("argus_session")
+    if not token:
+        auth_h = request.headers.get("Authorization", "")
+        if auth_h.startswith("Bearer "):
+            token = auth_h[7:].strip()
+
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    auth_conn = getattr(request.app.state, "auth_conn", None)
+    if not auth_conn:
+        raise HTTPException(status_code=500, detail="Auth database connection not available")
+
+    session_data = get_session_user(auth_conn, token)
+    if not session_data:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+
+    # Enforce CSRF token on every POST request except public login/register
+    if request.method == "POST":
+        path = request.url.path
+        if path not in ("/auth/login", "/auth/register", "/auth/csrf"):
+            csrf_header = request.headers.get("X-CSRF-Token") or request.headers.get("x-csrf-token")
+            if not csrf_header or not secrets.compare_digest(csrf_header, session_data["csrf_token"]):
+                raise HTTPException(status_code=403, detail="Invalid or missing CSRF token")
+
+    user_id = session_data["user_id"]
+    overrides = getattr(request.app.state, "custom_user_overrides", {}).get(user_id)
+    user_dirs = get_user_dirs(request.app.state.users_dir, user_id, custom_overrides=overrides)
+
+    db_p = user_dirs["db_path"]
+    if not hasattr(request.app.state, "_initialized_user_dbs"):
+        request.app.state._initialized_user_dbs = set()
+    if db_p not in request.app.state._initialized_user_dbs:
+        uconn = init_db(db_p)
+        ensure_ledger_tables(uconn)
+        uconn.close()
+        request.app.state._initialized_user_dbs.add(db_p)
+
+    return UserContext(
+        id=user_id,
+        email=session_data["email"],
+        csrf_token=session_data["csrf_token"],
+        root=user_dirs["root"],
+        db_path=user_dirs["db_path"],
+        library_dir=user_dirs["library_dir"],
+        trash_dir=user_dirs["trash_dir"],
+        thumb_cache_dir=user_dirs["thumb_cache_dir"],
+        jobs_dir=user_dirs["jobs_dir"],
+        drive_cache_dir=user_dirs["drive_cache_dir"],
+    )
+
+
+def get_db(request: Request, user: UserContext = Depends(get_current_user)):
+    """Provide a per-request SQLite connection for the authenticated user."""
+    conn = get_connection(user.db_path)
     try:
         yield conn
     finally:
@@ -235,30 +511,52 @@ def create_app(
     jobs_dir: str | Path | None = None,
     config: dict | None = None,
     config_path: str | Path | None = None,
+    auth_db_path: str | Path | None = None,
+    users_dir: str | Path | None = None,
 ) -> FastAPI:
-    """Create and configure the Argus FastAPI application."""
+    """Create and configure the Argus FastAPI application with per-user isolation."""
     if config is None:
         try:
             config = load_config(config_path) if config_path else load_config()
         except Exception:
             config = {}
 
-    if db_path is None:
-        db_path = os.environ.get("ARGUS_DB_PATH") or config.get("database", {}).get("path") or "argus.db"
+    explicit_db_path = db_path is not None
+    if not explicit_db_path:
+        db_path = os.environ.get("ARGUS_DB_PATH") or config.get("database", {}).get("path")
+        if not db_path:
+            cand = Path.home() / ".argus" / "argus.db"
+            try:
+                cand.parent.mkdir(parents=True, exist_ok=True)
+                test_f = cand.parent / ".perm_check"
+                test_f.touch()
+                test_f.unlink()
+                db_path = cand
+            except (OSError, PermissionError):
+                db_path = Path("/tmp/argus") / "argus.db"
     resolved_db_path = Path(db_path).expanduser().resolve()
-
-    # Ensure schema and ledger tables are initialized
-    init_conn = init_db(resolved_db_path)
-    ensure_ledger_tables(init_conn)
-    init_conn.close()
 
     if trash_dir is None:
         cfg_trash = config.get("ledger", {}).get("trash_dir")
-        trash_dir = os.environ.get("ARGUS_TRASH_DIR") or cfg_trash or (Path.home() / ".argus" / "trash")
+        trash_dir = os.environ.get("ARGUS_TRASH_DIR") or cfg_trash
+        if not trash_dir:
+            cand = Path.home() / ".argus" / "trash"
+            try:
+                cand.mkdir(parents=True, exist_ok=True)
+                trash_dir = cand
+            except (OSError, PermissionError):
+                trash_dir = Path("/tmp/argus") / "trash"
     resolved_trash_dir = Path(trash_dir).expanduser().resolve()
 
     if thumb_cache_dir is None:
-        thumb_cache_dir = os.environ.get("ARGUS_THUMB_CACHE_DIR") or (Path.home() / ".argus" / "thumbnails")
+        thumb_cache_dir = os.environ.get("ARGUS_THUMB_CACHE_DIR")
+        if not thumb_cache_dir:
+            cand = Path.home() / ".argus" / "thumbnails"
+            try:
+                cand.mkdir(parents=True, exist_ok=True)
+                thumb_cache_dir = cand
+            except (OSError, PermissionError):
+                thumb_cache_dir = Path("/tmp/argus") / "thumbnails"
     resolved_thumb_cache_dir = Path(thumb_cache_dir).expanduser().resolve()
     try:
         resolved_thumb_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -267,16 +565,77 @@ def create_app(
 
     if library_dir is None:
         cfg_library = config.get("sources", {}).get("library_dir")
-        library_dir = os.environ.get("ARGUS_LIBRARY_DIR") or cfg_library or (Path.home() / ".argus" / "library")
+        library_dir = os.environ.get("ARGUS_LIBRARY_DIR") or cfg_library
+        if not library_dir:
+            cand = Path.home() / ".argus" / "library"
+            try:
+                cand.mkdir(parents=True, exist_ok=True)
+                library_dir = cand
+            except (OSError, PermissionError):
+                library_dir = Path("/tmp/argus") / "library"
     resolved_library_dir = Path(library_dir).expanduser().resolve()
     try:
         resolved_library_dir.mkdir(parents=True, exist_ok=True)
     except OSError:
         pass
 
+    if jobs_dir is None:
+        cfg_jobs = config.get("general", {}).get("jobs_dir")
+        jobs_dir = os.environ.get("ARGUS_JOBS_DIR") or cfg_jobs
+        if not jobs_dir:
+            cand = Path.home() / ".argus" / "jobs"
+            try:
+                cand.mkdir(parents=True, exist_ok=True)
+                jobs_dir = cand
+            except (OSError, PermissionError):
+                jobs_dir = Path("/tmp/argus") / "jobs"
+    resolved_jobs_dir = Path(jobs_dir).expanduser().resolve()
+    try:
+        resolved_jobs_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+    # Per-user storage directories root
+    if users_dir is None:
+        cfg_users = config.get("general", {}).get("users_dir")
+        users_dir = os.environ.get("ARGUS_USERS_DIR") or cfg_users
+        if not users_dir:
+            cand = Path.home() / ".argus" / "users"
+            try:
+                cand.mkdir(parents=True, exist_ok=True)
+                users_dir = cand
+            except (OSError, PermissionError):
+                users_dir = Path("/tmp/argus") / "users"
+    resolved_users_dir = Path(users_dir).expanduser().resolve()
+    try:
+        resolved_users_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+    # Auth DB initialization
+    if auth_db_path is None:
+        cfg_auth = config.get("auth", {}).get("db_path")
+        auth_db_path = os.environ.get("ARGUS_AUTH_DB") or cfg_auth
+        if not auth_db_path:
+            cand = Path.home() / ".argus" / "auth.db"
+            try:
+                cand.parent.mkdir(parents=True, exist_ok=True)
+                test_f = cand.parent / ".perm_check"
+                test_f.touch()
+                test_f.unlink()
+                auth_db_path = cand
+            except (OSError, PermissionError):
+                auth_db_path = Path("/tmp/argus") / "auth.db"
+    resolved_auth_db_path = Path(auth_db_path).expanduser().resolve()
+    auth_conn = init_auth_db(resolved_auth_db_path)
+
+    # Initialize default single-user / test DB
+    init_conn = init_db(resolved_db_path)
+    ensure_ledger_tables(init_conn)
+    init_conn.close()
+
     app = FastAPI(title="Argus API", version="0.1.0")
 
-    # Strict local-only CORS: never allow external origins
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[
@@ -290,15 +649,9 @@ def create_app(
         allow_headers=["*"],
     )
 
-    if jobs_dir is None:
-        cfg_jobs = config.get("general", {}).get("jobs_dir")
-        jobs_dir = os.environ.get("ARGUS_JOBS_DIR") or cfg_jobs or (Path.home() / ".argus" / "jobs")
-    resolved_jobs_dir = Path(jobs_dir).expanduser().resolve()
-    try:
-        resolved_jobs_dir.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
-
+    app.state.auth_conn = auth_conn
+    app.state.auth_db_path = resolved_auth_db_path
+    app.state.users_dir = resolved_users_dir
     app.state.db_path = resolved_db_path
     app.state.trash_dir = resolved_trash_dir
     app.state.thumb_cache_dir = resolved_thumb_cache_dir
@@ -307,15 +660,142 @@ def create_app(
     app.state.config = config
     app.state.config_path = config_path
     app.state.jobs = {}
+    app.state.job_queue_lock = threading.Lock()
+    app.state._initialized_user_dbs = {resolved_db_path}
+
+    if explicit_db_path:
+        app.state.custom_user_overrides = {
+            1: {
+                "root": (resolved_db_path.parent if resolved_db_path else resolved_library_dir),
+                "db_path": resolved_db_path,
+                "trash_dir": resolved_trash_dir,
+                "thumb_cache_dir": resolved_thumb_cache_dir,
+                "library_dir": resolved_library_dir,
+                "jobs_dir": resolved_jobs_dir,
+                "drive_cache_dir": resolved_thumb_cache_dir.parent / "drive_cache",
+            }
+        }
+    else:
+        app.state.custom_user_overrides = {}
 
     ui_file = Path(__file__).resolve().parent.parent / "ui" / "index.html"
+    login_file = Path(__file__).resolve().parent.parent / "ui" / "login.html"
+
+    # ==========================
+    # Authentication Endpoints
+    # ==========================
+
+    @app.get("/login")
+    def serve_login():
+        """Serve the standalone login/registration web page (public)."""
+        if not login_file.is_file():
+            raise HTTPException(status_code=404, detail="Login page not found")
+        return FileResponse(str(login_file), media_type="text/html")
+
+    @app.get("/auth/csrf")
+    def get_csrf(request: Request):
+        """Public endpoint returning CSRF token for the active session (if any)."""
+        token = request.cookies.get("argus_session")
+        csrf_tok = ""
+        if token and hasattr(request.app.state, "auth_conn"):
+            s = get_session_user(request.app.state.auth_conn, token)
+            if s:
+                csrf_tok = s["csrf_token"]
+        return {"csrf_token": csrf_tok}
+
+    @app.post("/auth/register")
+    def register(req: RegisterRequest, request: Request):
+        """Register a new user in auth.db (public, unless invite-only configured)."""
+        cfg = getattr(request.app.state, "config", {}) or {}
+        allow_reg = cfg.get("auth", {}).get("allow_registration", True)
+        if cfg.get("invite_only", False) or cfg.get("auth", {}).get("invite_only", False):
+            allow_reg = False
+
+        res = register_user(
+            request.app.state.auth_conn,
+            email=req.email,
+            password=req.password,
+            allow_registration=allow_reg,
+        )
+        return {"status": "registered", "user": res}
+
+    @app.post("/auth/login")
+    def login(req: LoginRequest, request: Request, response: Response):
+        """Authenticate user, set HttpOnly session cookie and return CSRF token (public)."""
+        client_ip = request.client.host if request.client else "127.0.0.1"
+        user_data = authenticate_user(
+            request.app.state.auth_conn,
+            email=req.email,
+            password=req.password,
+            ip=client_ip,
+        )
+        raw_token, csrf_tok = create_session(request.app.state.auth_conn, user_data["id"])
+
+        is_secure = request.url.hostname not in ("127.0.0.1", "localhost", "testserver")
+        response.set_cookie(
+            key="argus_session",
+            value=raw_token,
+            max_age=7 * 24 * 3600,
+            httponly=True,
+            samesite="lax",
+            secure=is_secure,
+        )
+        response.set_cookie(
+            key="argus_csrf",
+            value=csrf_tok,
+            max_age=7 * 24 * 3600,
+            httponly=False,
+            samesite="lax",
+            secure=is_secure,
+        )
+        return {
+            "status": "authenticated",
+            "user": user_data,
+            "token": raw_token,
+            "csrf_token": csrf_tok,
+        }
+
+    @app.post("/auth/logout")
+    def logout(
+        request: Request,
+        response: Response,
+        user: UserContext = Depends(get_current_user),
+    ):
+        """Invalidate session in auth.db and clear auth cookies."""
+        token = request.cookies.get("argus_session")
+        if not token:
+            auth_h = request.headers.get("Authorization", "")
+            if auth_h.startswith("Bearer "):
+                token = auth_h[7:].strip()
+        if token:
+            invalidate_session(request.app.state.auth_conn, token)
+        response.delete_cookie("argus_session")
+        response.delete_cookie("argus_csrf")
+        return {"status": "logged_out"}
+
+    @app.get("/auth/me")
+    def get_me(user: UserContext = Depends(get_current_user)):
+        """Return information about the currently authenticated user."""
+        return {
+            "id": user.id,
+            "email": user.email,
+            "csrf_token": user.csrf_token,
+        }
+
+    # ==========================
+    # Main Application UI
+    # ==========================
 
     @app.get("/")
-    def serve_ui():
-        """Serve the single-file Argus web UI."""
+    def serve_ui(user: UserContext = Depends(get_current_user)):
+        """Serve the single-file Argus web UI (requires authentication)."""
         if not ui_file.is_file():
             raise HTTPException(status_code=404, detail="UI index.html not found")
         return FileResponse(str(ui_file), media_type="text/html")
+
+    # ==========================
+    # Clusters & Images
+    # ==========================
 
     @app.get("/clusters")
     def list_clusters(
@@ -324,6 +804,7 @@ def create_app(
         min_savings: Optional[float] = Query(None),
         sort: str = Query("id"),
         request: Request = None,
+        user: UserContext = Depends(get_current_user),
         conn: sqlite3.Connection = Depends(get_db),
     ) -> list[dict[str, Any]]:
         if mode not in ("conservative", "balanced", "aggressive"):
@@ -382,11 +863,9 @@ def create_app(
             keeper_m = next((m for m in member_dicts if m["id"] == keeper_id), None)
             cluster_cat = c_row["category"] or (keeper_m.get("category_top1") if keeper_m else None)
 
-            # Category filter
             if category is not None and (cluster_cat or "").lower() != category.lower():
                 continue
 
-            # Minimum savings filter
             if min_savings is not None:
                 if 0 < min_savings <= 1.0:
                     if savings_ratio < min_savings:
@@ -414,7 +893,6 @@ def create_app(
                 "swap_proposal": swap_prop,
             })
 
-        # Sorting
         if sort in ("savings", "-savings"):
             results.sort(key=lambda x: x["savings_bytes"], reverse=True)
         elif sort == "+savings":
@@ -439,6 +917,7 @@ def create_app(
         cluster_id: int,
         mode: str = Query("conservative"),
         request: Request = None,
+        user: UserContext = Depends(get_current_user),
         conn: sqlite3.Connection = Depends(get_db),
     ) -> dict[str, Any]:
         if mode not in ("conservative", "balanced", "aggressive"):
@@ -528,9 +1007,10 @@ def create_app(
         image_id: int,
         size: int = Query(256, ge=32, le=2048),
         request: Request = None,
+        user: UserContext = Depends(get_current_user),
         conn: sqlite3.Connection = Depends(get_db),
     ):
-        """Serve a cached JPEG thumbnail for the given image ID. Never accepts file paths."""
+        """Serve a cached JPEG thumbnail for the given image ID. Strictly confined to user data."""
         try:
             row = conn.execute(
                 "SELECT id, file_path, source, drive_id, modified_time FROM images WHERE id = ?",
@@ -542,7 +1022,6 @@ def create_app(
             file_path_str = str(row["file_path"])
             orig_path: Path | None = None
 
-            # Resolve Google Drive virtual path from drive_cache if available
             is_drive = file_path_str.startswith("drive://") or row["source"] == "gdrive" or bool(row["drive_id"])
             if is_drive:
                 drive_id = row["drive_id"]
@@ -553,11 +1032,8 @@ def create_app(
                         drive_id = None
 
                 cfg = getattr(request.app.state, "config", {}) or {}
-                drive_cache_dir = Path(
-                    cfg.get("sources", {})
-                    .get("google_drive", {})
-                    .get("cache_dir", "~/.argus/drive_cache")
-                ).expanduser()
+                configured_drive_cache = cfg.get("sources", {}).get("google_drive", {}).get("cache_dir")
+                drive_cache_dir = Path(configured_drive_cache).expanduser() if configured_drive_cache else user.drive_cache_dir
 
                 if drive_id and drive_cache_dir.is_dir():
                     mtime = row["modified_time"]
@@ -576,7 +1052,6 @@ def create_app(
                             orig_path = matches[0]
 
                     if orig_path is None:
-                        # Drive thumbnail cache file missing: refetch using stored thumbnailLink or files.get
                         try:
                             from sources.google_drive import GoogleDriveSource
                             gdrive_source = GoogleDriveSource(conn=conn, cache_dir=drive_cache_dir, config=cfg, stage="thumbnail")
@@ -587,7 +1062,7 @@ def create_app(
                             if matches:
                                 orig_path = matches[0]
                             else:
-                                cache_dir = request.app.state.thumb_cache_dir
+                                cache_dir = user.thumb_cache_dir
                                 cache_path = cache_dir / f"{image_id}_{size}.jpg"
                                 cache_dir.mkdir(parents=True, exist_ok=True)
                                 thumb_im.save(str(cache_path), format="JPEG", quality=85)
@@ -597,6 +1072,8 @@ def create_app(
 
             if orig_path is None:
                 candidate_path = Path(file_path_str)
+                # Verify that local file is confined strictly to the user boundary
+                validate_confined_user_path(candidate_path, user.root)
                 if candidate_path.exists():
                     orig_path = candidate_path
 
@@ -604,10 +1081,10 @@ def create_app(
                 logger.warning(f"Image {image_id} source file not found on disk: {file_path_str}")
                 return Response(content=PLACEHOLDER_JPEG_BYTES, media_type="image/jpeg", status_code=200)
 
-            cache_dir = request.app.state.thumb_cache_dir
+            cache_dir = user.thumb_cache_dir
+            validate_confined_user_path(cache_dir, user.root)
             cache_path = cache_dir / f"{image_id}_{size}.jpg"
 
-            # Check existing valid cache
             if cache_path.is_file():
                 try:
                     st = cache_path.stat()
@@ -616,10 +1093,8 @@ def create_app(
                 except OSError:
                     pass
 
-            # Concurrency synchronization per (image_id, size)
             lock = _get_thumb_lock(image_id, size)
             with lock:
-                # Re-check inside lock in case another thread just completed generation
                 if cache_path.is_file():
                     try:
                         st = cache_path.stat()
@@ -658,6 +1133,7 @@ def create_app(
         q: str = Query(..., description="Natural language search query"),
         limit: int = Query(10, ge=1, le=100),
         request: Request = None,
+        user: UserContext = Depends(get_current_user),
         conn: sqlite3.Connection = Depends(get_db),
     ) -> list[dict[str, Any]]:
         if not q.strip():
@@ -687,10 +1163,15 @@ def create_app(
         ).fetchall()
         return {r["category_top1"]: r["count"] for r in rows}
 
+    # ==========================
+    # Ledger Planning & Execution
+    # ==========================
+
     @app.post("/plan")
     def create_plan(
         req: PlanRequest,
         request: Request = None,
+        user: UserContext = Depends(get_current_user),
         conn: sqlite3.Connection = Depends(get_db),
     ) -> dict[str, Any]:
         if req.mode not in ("conservative", "balanced", "aggressive"):
@@ -699,7 +1180,8 @@ def create_app(
                 detail="Invalid mode. Must be one of: conservative, balanced, aggressive",
             )
 
-        # Enforce that all excluded_ids are valid members of a cluster
+        validate_confined_user_path(user.trash_dir, user.root)
+
         if req.excluded_ids:
             placeholders = ",".join("?" for _ in req.excluded_ids)
             rows = conn.execute(
@@ -735,10 +1217,14 @@ def create_app(
                 approved_swap_cluster_ids=req.approved_swap_cluster_ids,
                 excluded_ids=req.excluded_ids,
                 config=request.app.state.config,
-                trash_dir=request.app.state.trash_dir,
+                trash_dir=user.trash_dir,
             )
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc))
+
+        for entry in summary.entries:
+            if not str(entry.original_path).startswith("drive://"):
+                validate_confined_user_path(entry.original_path, user.root)
 
         return {
             "batch_id": summary.batch_id,
@@ -764,6 +1250,7 @@ def create_app(
     @app.post("/apply")
     def apply_batch(
         req: ApplyRequest,
+        user: UserContext = Depends(get_current_user),
         conn: sqlite3.Connection = Depends(get_db),
     ) -> dict[str, Any]:
         if not req.confirm:
@@ -784,6 +1271,16 @@ def create_app(
                 detail=f"Batch '{req.batch_id}' has status '{batch['status']}'; only 'planned' batches can be executed",
             )
 
+        entries = conn.execute(
+            "SELECT original_path, trash_path FROM deletion_journal WHERE batch_id = ?",
+            (req.batch_id,),
+        ).fetchall()
+        for e in entries:
+            if not str(e["original_path"]).startswith("drive://"):
+                validate_confined_user_path(e["original_path"], user.root)
+            if e["trash_path"]:
+                validate_confined_user_path(e["trash_path"], user.root)
+
         try:
             res = execute(conn, batch_id=req.batch_id, confirm=True)
         except Exception as exc:
@@ -803,6 +1300,7 @@ def create_app(
     @app.post("/undo")
     def undo_batch(
         req: UndoRequest,
+        user: UserContext = Depends(get_current_user),
         conn: sqlite3.Connection = Depends(get_db),
     ) -> dict[str, Any]:
         batch = conn.execute(
@@ -811,6 +1309,16 @@ def create_app(
         ).fetchone()
         if not batch:
             raise HTTPException(status_code=404, detail=f"Batch '{req.batch_id}' not found in ledger")
+
+        entries = conn.execute(
+            "SELECT original_path, trash_path FROM deletion_journal WHERE batch_id = ?",
+            (req.batch_id,),
+        ).fetchall()
+        for e in entries:
+            if not str(e["original_path"]).startswith("drive://"):
+                validate_confined_user_path(e["original_path"], user.root)
+            if e["trash_path"]:
+                validate_confined_user_path(e["trash_path"], user.root)
 
         try:
             res = undo(conn, batch_id=req.batch_id)
@@ -832,21 +1340,28 @@ def create_app(
     ) -> list[dict[str, Any]]:
         return get_history(conn, limit=limit)
 
+    # ==========================
+    # Sources Ingestion
+    # ==========================
+
     @app.post("/sources/upload")
     async def upload_sources(
         files: list[UploadFile] = File(...),
         project: str = Query("default"),
         request: Request = None,
+        user: UserContext = Depends(get_current_user),
     ) -> dict[str, Any]:
         """
-        Upload images into ~/.argus/library/<project>/ with path sanitization
-        and size caps. Never modifies or removes user original files.
+        Upload images into user's library with path sanitization, 50MB per-file cap,
+        and 2GB per-user quota enforcement. Confined to ~/.argus/users/<id>/library/<project>/.
         """
         clean_project = re.sub(r"[^a-zA-Z0-9_\-]", "_", project.strip()) or "default"
         sources_cfg = request.app.state.config.get("sources", {})
         upload_cfg = sources_cfg.get("upload", {})
-        library_base = request.app.state.library_dir
-        dest_dir = library_base / clean_project
+        quotas_cfg = request.app.state.config.get("quotas", {})
+
+        dest_dir = user.library_dir / clean_project
+        validate_confined_user_path(dest_dir, user.root)
         dest_dir.mkdir(parents=True, exist_ok=True)
 
         max_batch_files = upload_cfg.get("max_batch_files", 100)
@@ -858,46 +1373,56 @@ def create_app(
 
         allowed_exts = {e.lower().lstrip(".") for e in upload_cfg.get("allowed_extensions", ["jpg", "jpeg", "png", "webp", "heic"])}
         per_file_cap = upload_cfg.get("per_file_cap_mb", 50) * 1024 * 1024
-        total_cap = upload_cfg.get("total_cap_mb", 1000) * 1024 * 1024
+        user_storage_cap = quotas_cfg.get("user_storage_cap_mb", 2048) * 1024 * 1024
+
+        current_user_storage = get_user_storage_usage(user.root)
+        if current_user_storage >= user_storage_cap:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Upload exceeds user storage quota ({user_storage_cap // (1024*1024)} MB)",
+            )
 
         saved_files = []
         for upload in files:
             orig_name = upload.filename or ""
-            # Path traversal rejection
             if not orig_name or "/" in orig_name or "\\" in orig_name or ".." in orig_name or orig_name != Path(orig_name).name:
                 raise HTTPException(status_code=400, detail=f"Path traversal rejected: {orig_name}")
 
-            # Non-image extension rejection
             ext = Path(orig_name).suffix.lower().lstrip(".")
             if ext not in allowed_exts:
                 raise HTTPException(status_code=400, detail=f"Non-image rejected: {orig_name}")
 
             dest_path = dest_dir / orig_name
-            total_bytes = 0
+            validate_confined_user_path(dest_path, user.root)
+
+            file_bytes = 0
             with open(dest_path, "wb") as f_out:
                 while True:
                     chunk = await upload.read(65536)
                     if not chunk:
                         break
-                    total_bytes += len(chunk)
-                    if total_bytes > per_file_cap:
+                    file_bytes += len(chunk)
+                    current_user_storage += len(chunk)
+                    if file_bytes > per_file_cap:
                         f_out.close()
                         if dest_path.exists():
                             dest_path.unlink()
-                        raise HTTPException(status_code=400, detail=f"File exceeds {per_file_cap // (1024*1024)} MB cap: {orig_name}")
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"File exceeds {per_file_cap // (1024*1024)} MB cap: {orig_name}",
+                        )
+                    if current_user_storage > user_storage_cap:
+                        f_out.close()
+                        if dest_path.exists():
+                            dest_path.unlink()
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Upload exceeds user storage quota ({user_storage_cap // (1024*1024)} MB)",
+                        )
                     f_out.write(chunk)
             saved_files.append(str(dest_path))
 
-        # Check total directory size against total_cap
-        dir_size = sum(f.stat().st_size for f in dest_dir.glob("*") if f.is_file())
-        if dir_size > total_cap:
-            for sf in saved_files:
-                p = Path(sf)
-                if p.exists():
-                    p.unlink()
-            raise HTTPException(status_code=400, detail=f"Upload exceeds total library cap ({total_cap // (1024*1024)} MB)")
-
-        job_id = launch_pipeline_job(request.app, source_type="local", folder=dest_dir)
+        job_id = launch_pipeline_job(request.app, user=user, source_type="local", folder=dest_dir)
         return {
             "job_id": job_id,
             "uploaded_count": len(saved_files),
@@ -909,14 +1434,11 @@ def create_app(
     def add_drive_source(
         req: DriveSourceRequest,
         request: Request = None,
+        user: UserContext = Depends(get_current_user),
     ) -> dict[str, Any]:
-        """
-        Validate Google Drive link, ensure read-only auth is active,
-        and kick off read-only scan.
-        """
+        """Validate Drive link and start read-only scan under user context."""
         folder_id = extract_drive_folder_id(req.link)
 
-        # Verify Google Drive authentication status
         from sources.google_drive import DEFAULT_TOKEN_PATH, get_drive_credentials
         token_path = Path(request.app.state.config.get("sources", {}).get("google_drive", {}).get("token_path", DEFAULT_TOKEN_PATH)).expanduser()
         if not token_path.exists():
@@ -940,7 +1462,7 @@ def create_app(
                 detail=f"Google Drive authentication error: {exc}. Please run 'argus drive-auth' first.",
             )
 
-        job_id = launch_pipeline_job(request.app, source_type="drive", drive_folder_id=folder_id)
+        job_id = launch_pipeline_job(request.app, user=user, source_type="drive", drive_folder_id=folder_id)
         return {
             "job_id": job_id,
             "folder_id": folder_id,
@@ -951,17 +1473,20 @@ def create_app(
     def add_dataset_source(
         req: DatasetSourceRequest,
         request: Request = None,
+        user: UserContext = Depends(get_current_user),
     ) -> dict[str, Any]:
-        """
-        Download dataset from allow-listed HTTPS host, streaming with size and
-        file-count caps. Rejects non-images and archives with traversal or non-images.
-        """
+        """Download dataset from allow-listed HTTPS host. Disabled in hosted mode."""
+        cfg = getattr(request.app.state, "config", {}) or {}
+        hosted_mode = bool(cfg.get("hosted_mode", False) or cfg.get("general", {}).get("hosted_mode", False))
+        if hosted_mode:
+            raise HTTPException(status_code=403, detail="Dataset download is disabled in hosted mode")
+
         url = req.url.strip()
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme.lower() != "https":
             raise HTTPException(status_code=400, detail="HTTPS only: HTTP and other schemes are rejected")
 
-        dataset_cfg = request.app.state.config.get("sources", {}).get("dataset", {})
+        dataset_cfg = cfg.get("sources", {}).get("dataset", {})
         allowed_hosts = [h.lower().strip() for h in dataset_cfg.get("allowed_hosts", ["huggingface.co"])]
         host = (parsed.netloc.split(":")[0]).lower()
         if not any(host == ah or host.endswith("." + ah) for ah in allowed_hosts):
@@ -989,8 +1514,6 @@ def create_app(
                     raise HTTPException(status_code=400, detail=f"Dataset exceeds {size_cap_bytes // (1024*1024)} MB size cap")
 
                 content_type = (resp.headers.get("Content-Type") or "").lower()
-
-                # Stream with size cap
                 data = bytearray()
                 while True:
                     chunk = resp.read(65536)
@@ -1004,8 +1527,14 @@ def create_app(
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Failed to download dataset: {exc}")
 
+        quotas_cfg = cfg.get("quotas", {})
+        user_storage_cap = quotas_cfg.get("user_storage_cap_mb", 2048) * 1024 * 1024
+        if get_user_storage_usage(user.root) + len(data) > user_storage_cap:
+            raise HTTPException(status_code=400, detail="Dataset download exceeds user storage quota (2 GB)")
+
         clean_project = re.sub(r"[^a-zA-Z0-9_\-]", "_", req.project.strip()) or "default"
-        dest_dir = request.app.state.library_dir / clean_project
+        dest_dir = user.library_dir / clean_project
+        validate_confined_user_path(dest_dir, user.root)
         dest_dir.mkdir(parents=True, exist_ok=True)
 
         is_zip = data.startswith(b"PK\x03\x04") or "zip" in content_type or url.lower().endswith(".zip")
@@ -1038,10 +1567,10 @@ def create_app(
             for e in image_entries:
                 safe_name = Path(e.filename).name
                 out_path = dest_dir / safe_name
+                validate_confined_user_path(out_path, user.root)
                 out_path.write_bytes(zf.read(e))
                 extracted_files.append(str(out_path))
         else:
-            # Direct image file
             try:
                 im = Image.open(io.BytesIO(data))
                 im.verify()
@@ -1053,10 +1582,11 @@ def create_app(
             if "." not in base_name:
                 base_name = f"{base_name}.{fmt}"
             out_path = dest_dir / base_name
+            validate_confined_user_path(out_path, user.root)
             out_path.write_bytes(data)
             extracted_files.append(str(out_path))
 
-        job_id = launch_pipeline_job(request.app, source_type="local", folder=dest_dir)
+        job_id = launch_pipeline_job(request.app, user=user, source_type="local", folder=dest_dir)
         return {
             "job_id": job_id,
             "project": clean_project,
@@ -1066,25 +1596,32 @@ def create_app(
     @app.post("/sources/rescan")
     def rescan_sources(
         request: Request = None,
+        user: UserContext = Depends(get_current_user),
         conn: sqlite3.Connection = Depends(get_db),
     ) -> dict[str, Any]:
-        """Re-run the deduplication pipeline on existing sources."""
+        """Re-run the deduplication pipeline on existing user sources."""
         has_gdrive = conn.execute("SELECT 1 FROM images WHERE source = 'gdrive' LIMIT 1").fetchone() is not None
         source_type = "drive" if has_gdrive else "local"
-        job_id = launch_pipeline_job(request.app, source_type=source_type, folder=request.app.state.library_dir)
+        job_id = launch_pipeline_job(request.app, user=user, source_type=source_type, folder=user.library_dir)
         return {
             "job_id": job_id,
             "status": "queued",
             "source_type": source_type,
         }
 
+    # ==========================
+    # Background Pipeline Jobs
+    # ==========================
+
     @app.get("/jobs/active")
     def get_active_job(
         request: Request = None,
+        user: UserContext = Depends(get_current_user),
     ) -> dict[str, Any]:
-        """Return the currently running or queued pipeline job if one is active."""
+        """Return the currently running or queued pipeline job for the authenticated user."""
+        maybe_start_next_queued_job(request.app)
         now = time.time()
-        jobs_dir = request.app.state.jobs_dir
+        jobs_dir = user.jobs_dir
         if jobs_dir.is_dir():
             try:
                 files = sorted(jobs_dir.glob("*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
@@ -1101,7 +1638,7 @@ def create_app(
                         last_heartbeat = state.get("heartbeat_at") or state.get("updated_at", 0)
                         is_stalled = (now - last_heartbeat) > 60
 
-                        if not is_alive:
+                        if not is_alive and state.get("status") == "running":
                             state["status"] = "failed"
                             state["error"] = "Worker process is no longer running"
                             write_job_state(jf, state)
@@ -1114,7 +1651,7 @@ def create_app(
                                 "message": "Worker process is no longer running",
                             }
 
-                        if is_stalled:
+                        if is_stalled and state.get("status") == "running":
                             state["status"] = "stalled"
                             state["error"] = "Worker heartbeat timed out (>60s)"
                             write_job_state(jf, state)
@@ -1141,42 +1678,22 @@ def create_app(
             except Exception:
                 pass
 
-        for j_id, j_data in sorted(
-            request.app.state.jobs.items(),
-            key=lambda item: item[1].get("created_at", 0),
-            reverse=True,
-        ):
-            if j_data.get("status") in ("running", "queued"):
-                job_id = j_data.get("id") or j_data.get("job_id") or j_id
-                stage = j_data.get("stage_display") or j_data.get("stage") or "running"
-                done = int(j_data.get("current_file", 0))
-                total = int(j_data.get("total_files", 0))
-                return {
-                    "active": True,
-                    "job_id": str(job_id),
-                    "stage": str(stage),
-                    "done": done,
-                    "total": total,
-                }
-
         return {"active": False}
 
     @app.get("/jobs/{job_id}")
     def get_job_status(
         job_id: str,
         request: Request = None,
+        user: UserContext = Depends(get_current_user),
     ) -> dict[str, Any]:
-        """Poll the status and progress of a background pipeline job."""
-        jobs_dir = request.app.state.jobs_dir
+        """Poll the status and progress of a background pipeline job for the current user."""
+        jobs_dir = user.jobs_dir
         job_file = jobs_dir / f"{job_id}.json"
         disk_job = read_job_state(job_file)
         if disk_job:
             return disk_job
 
-        job = request.app.state.jobs.get(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
-        return job
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
 
     return app
 
@@ -1186,4 +1703,3 @@ try:
     app = create_app()
 except Exception:
     app = FastAPI(title="Argus API", version="0.1.0")
-

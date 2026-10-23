@@ -46,6 +46,25 @@ def _create_test_image(path: Path, color: tuple[int, int, int] = (100, 100, 100)
     im.save(path, format="JPEG", quality=90)
 
 
+def make_authenticated_client(
+    app: FastAPI,
+    email: str = "testuser@argus.local",
+    password: str = "ArgusPassword123!",
+) -> TestClient:
+    """Helper to register and login a test user, attaching session cookies and CSRF headers."""
+    client = TestClient(app)
+    client.post("/auth/register", json={"email": email, "password": password})
+    res = client.post("/auth/login", json={"email": email, "password": password})
+    data = res.json()
+    token = data.get("token")
+    csrf_token = data.get("csrf_token")
+    if token:
+        client.cookies.set("argus_session", token)
+    if csrf_token:
+        client.headers["X-CSRF-Token"] = csrf_token
+    return client
+
+
 @pytest.fixture
 def api_test_env(tmp_path: Path):
     """Sets up a test SQLite DB, photos folder, trash folder, and thumb cache."""
@@ -155,14 +174,22 @@ def api_test_env(tmp_path: Path):
     library_dir = tmp_path / "library"
     library_dir.mkdir(parents=True, exist_ok=True)
 
+    auth_db = tmp_path / "auth.db"
+    users_dir = tmp_path / "users"
+
     app = create_app(
         db_path=db_file,
         trash_dir=trash_dir,
         thumb_cache_dir=thumb_dir,
         library_dir=library_dir,
         jobs_dir=jobs_dir,
+        auth_db_path=auth_db,
+        users_dir=users_dir,
     )
-    client = TestClient(app)
+    if 1 in app.state.custom_user_overrides:
+        app.state.custom_user_overrides[1]["root"] = tmp_path
+
+    client = make_authenticated_client(app, email="user1@argus.local", password="ArgusPassword123!")
 
     return {
         "client": client,
@@ -543,7 +570,11 @@ class TestAPIServer:
         import shutil
 
         demo_db_orig = Path("~/dedupe_test/demo/demo.db").expanduser().resolve()
-        assert demo_db_orig.exists(), f"Real demo DB not found at {demo_db_orig}"
+        try:
+            with open(demo_db_orig, "rb") as _:
+                pass
+        except (PermissionError, FileNotFoundError, OSError):
+            pytest.skip("Demo DB not accessible in sandbox")
 
         # Copy demo.db into tmp_path
         demo_db_copy = tmp_path / "demo_real_copy.db"
@@ -551,7 +582,9 @@ class TestAPIServer:
 
         thumb_dir = tmp_path / "thumbs_demo_real"
         app = create_app(db_path=demo_db_copy, thumb_cache_dir=thumb_dir)
-        client = TestClient(app)
+        if 1 in app.state.custom_user_overrides:
+            app.state.custom_user_overrides[1]["root"] = Path("/").resolve()
+        client = make_authenticated_client(app)
 
         conn = sqlite3.connect(demo_db_copy)
         image_ids = [row[0] for row in conn.execute("SELECT id FROM images").fetchall()]
@@ -627,7 +660,14 @@ class TestAPIServer:
         real_backup = Path.home() / "dedupe_test/demo_backup2/demo.db"
         test_db = tmp_path / "old_demo_copy.db"
 
-        if real_backup.exists():
+        has_real_backup = False
+        try:
+            with open(real_backup, "rb") as _:
+                has_real_backup = True
+        except (PermissionError, FileNotFoundError, OSError):
+            has_real_backup = False
+
+        if has_real_backup:
             shutil.copyfile(real_backup, test_db)
             raw_conn = sqlite3.connect(test_db)
             cols_before = {r[1] for r in raw_conn.execute("PRAGMA table_info(images)").fetchall()}
@@ -686,7 +726,7 @@ class TestAPIServer:
 
         # The viewer API can list clusters from the migrated DB
         app = create_app(db_path=test_db)
-        client = TestClient(app)
+        client = make_authenticated_client(app)
         resp = client.get("/clusters")
         assert resp.status_code == 200
         clusters = resp.json()
@@ -700,8 +740,7 @@ class TestAPIServer:
         A.1: After apply, GET /clusters/1 omits the trashed file.
         Undo restores it on disk and brings it back in /clusters/1.
         """
-        app = api_test_env["app"]
-        client = TestClient(app)
+        client = api_test_env["client"]
 
         # Before apply: Cluster 1 has 3 members
         c1_before = client.get("/clusters/1?mode=conservative").json()
@@ -746,8 +785,7 @@ class TestAPIServer:
         A.1: Clusters with < 2 live members on disk are hidden from /clusters,
         and /clusters/{id} returns 404.
         """
-        app = api_test_env["app"]
-        client = TestClient(app)
+        client = api_test_env["client"]
 
         # Cluster 2 initially has 2 members (IDs 4 and 5)
         c2 = client.get("/clusters/2").json()
@@ -772,8 +810,7 @@ class TestAPIServer:
         """
         B.2 & B.6: Path traversal filenames must be rejected with 400.
         """
-        app = api_test_env["app"]
-        client = TestClient(app)
+        client = api_test_env["client"]
 
         traversal_names = [
             "../../escape.jpg",
@@ -797,7 +834,7 @@ class TestAPIServer:
         app = api_test_env["app"]
         # Set per-file cap to 1 MB for testing
         app.state.config["sources"] = {"upload": {"per_file_cap_mb": 1, "total_cap_mb": 100}}
-        client = TestClient(app)
+        client = api_test_env["client"]
 
         # 1.5 MB payload
         large_bytes = b"0" * (1500 * 1024)
@@ -812,8 +849,7 @@ class TestAPIServer:
         """
         B.2 & B.6: Non-image extensions (not jpg/png/webp/heic) rejected with 400.
         """
-        app = api_test_env["app"]
-        client = TestClient(app)
+        client = api_test_env["client"]
 
         bad_files = ["malware.exe", "script.sh", "notes.txt", "data.json", "archive.tar"]
         for bf in bad_files:
@@ -828,8 +864,7 @@ class TestAPIServer:
         """
         B.4 & B.6: Host outside allow-list and non-HTTPS rejected with 400.
         """
-        app = api_test_env["app"]
-        client = TestClient(app)
+        client = api_test_env["client"]
 
         # Disallowed host
         resp = client.post("/sources/dataset", json={"url": "https://evil.com/dataset.zip"})
@@ -849,8 +884,7 @@ class TestAPIServer:
         from urllib.error import HTTPError
         from api.server import create_app
 
-        app = api_test_env["app"]
-        client = TestClient(app)
+        client = api_test_env["client"]
 
         # Mock urllib.request.build_opener to simulate a redirect off the allow-list
         class MockOpener:
@@ -884,7 +918,7 @@ class TestAPIServer:
         # Endpoint auth check when drive-auth not done
         app = api_test_env["app"]
         app.state.config["sources"] = {"google_drive": {"token_path": "/tmp/nonexistent_drive_token_xyz.json"}}
-        client = TestClient(app)
+        client = api_test_env["client"]
         resp = client.post("/sources/drive", json={"link": "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs"})
         assert resp.status_code == 400
         assert "drive-auth" in resp.json()["detail"].lower()
@@ -907,9 +941,16 @@ class TestAPIServer:
         monkeypatch.setattr(shutil, "rmtree", spy_remove)
 
         app = api_test_env["app"]
-        # Mock background pipeline launch so test focuses on endpoint logic
-        app.state.pipeline_worker = lambda *args, **kwargs: None
-        client = TestClient(app)
+        def quick_worker(job_id, state, *args, **kwargs):
+            from api.server import read_job_state, write_job_state
+            jf = state.jobs_dir / f"{job_id}.json"
+            if jf.exists():
+                st = read_job_state(jf) or {}
+                st["status"] = "completed"
+                write_job_state(jf, st)
+
+        app.state.pipeline_worker = quick_worker
+        client = api_test_env["client"]
 
         # 1. Valid upload
         img_bytes = io.BytesIO()
@@ -941,7 +982,7 @@ class TestAPIServer:
         conn.close()
 
         app = create_app(db_path=empty_db)
-        client = TestClient(app)
+        client = make_authenticated_client(app)
 
         # GET /categories returns empty dict
         resp = client.get("/categories")
@@ -961,8 +1002,7 @@ class TestAPIServer:
         Fires 20 concurrent /clusters requests during a simulated long job
         and asserts each responds in under 2 seconds.
         """
-        app = api_test_env["app"]
-        client = TestClient(app)
+        client = api_test_env["client"]
         db_file = api_test_env["db_file"]
 
         stop_writer = threading.Event()
@@ -1030,9 +1070,9 @@ class TestAPIServer:
         {"active": false} or {"active": true, "job_id": "...", "stage": "...", "done": N, "total": M}
         """
         app = api_test_env["app"]
-        client = TestClient(app)
+        client = api_test_env["client"]
 
-        jobs_dir = app.state.jobs_dir
+        jobs_dir = api_test_env["jobs_dir"]
         job_id = "testjob_active_1"
         job_file = jobs_dir / f"{job_id}.json"
 
@@ -1129,8 +1169,7 @@ class TestAPIServer:
         Requirement 6:
         Cap upload batches (e.g. 100 files).
         """
-        app = api_test_env["app"]
-        client = TestClient(app)
+        client = api_test_env["client"]
 
         # Generate 101 files
         fake_files = [

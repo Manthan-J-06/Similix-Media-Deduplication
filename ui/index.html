@@ -798,6 +798,10 @@
       <button type="button" class="btn" id="btn-rescan">🔄 Rescan</button>
       <button type="button" class="btn btn-primary" id="btn-open-sources">➕ Add Sources</button>
       <button type="button" class="btn" id="btn-open-history">📜 History</button>
+      <div id="user-profile-badge" style="display: inline-flex; align-items: center; gap: 8px; margin-left: 8px; padding-left: 8px; border-left: 1px solid var(--border); font-size: 13px;">
+        <span id="user-email-display" style="font-weight: 500; color: var(--text-muted);"></span>
+        <button type="button" class="btn" id="btn-logout" title="Sign out" style="padding: 4px 8px; font-size: 12px;">Sign Out</button>
+      </div>
     </div>
   </header>
 
@@ -1008,6 +1012,61 @@
   </div>
 
   <script>
+    // Authentication & CSRF token helper
+    let currentUser = null;
+    let csrfToken = "";
+
+    function getCookie(name) {
+      const match = document.cookie.match(new RegExp('(^|;\\s*)(' + name + ')=([^;]*)'));
+      return match ? decodeURIComponent(match[3]) : "";
+    }
+
+    // Intercept fetch: inject CSRF token header on mutations and redirect to /login on 401
+    const _origFetch = window.fetch;
+    window.fetch = async function(resource, init = {}) {
+      init.headers = init.headers || {};
+      const method = (init.method || "GET").toUpperCase();
+      if (method === "POST" || method === "PUT" || method === "DELETE" || method === "PATCH") {
+        const token = csrfToken || getCookie("argus_csrf");
+        if (token) {
+          if (init.headers instanceof Headers) {
+            if (!init.headers.has("X-CSRF-Token")) init.headers.set("X-CSRF-Token", token);
+          } else if (Array.isArray(init.headers)) {
+            if (!init.headers.some(([k]) => k.toLowerCase() === "x-csrf-token")) {
+              init.headers.push(["X-CSRF-Token", token]);
+            }
+          } else {
+            if (!init.headers["X-CSRF-Token"] && !init.headers["x-csrf-token"]) {
+              init.headers["X-CSRF-Token"] = token;
+            }
+          }
+        }
+      }
+      const response = await _origFetch(resource, init);
+      if (response.status === 401) {
+        window.location.href = "/login";
+      }
+      return response;
+    };
+
+    async function initAuth() {
+      try {
+        const res = await fetch("/auth/me");
+        if (!res.ok) {
+          window.location.href = "/login";
+          return false;
+        }
+        currentUser = await res.json();
+        csrfToken = currentUser.csrf_token || getCookie("argus_csrf");
+        const emailEl = document.getElementById("user-email-display");
+        if (emailEl) emailEl.textContent = currentUser.email;
+        return true;
+      } catch (err) {
+        window.location.href = "/login";
+        return false;
+      }
+    }
+
     // State management
     let currentMode = "conservative";
     let activeClusterId = null;
@@ -1995,10 +2054,25 @@
       }
     });
 
-    // Initial Load
-    loadCategories();
-    loadClusters();
-    checkActiveJob();
+    // Logout button handler
+    const logoutBtn = document.getElementById("btn-logout");
+    if (logoutBtn) {
+      logoutBtn.addEventListener("click", async () => {
+        try {
+          await fetch("/auth/logout", { method: "POST" });
+        } catch (_) {}
+        window.location.href = "/login";
+      });
+    }
+
+    // Initial Load: check authentication first
+    initAuth().then((authenticated) => {
+      if (authenticated) {
+        loadCategories();
+        loadClusters();
+        checkActiveJob();
+      }
+    });
   </script>
 </body>
 </html>
