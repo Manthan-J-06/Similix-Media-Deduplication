@@ -158,7 +158,7 @@ Hugging Face Spaces allows hosting containerized web applications directly on ma
    - `HOSTED_MODE`: `true` (Disables local directory scanning and dataset URL fetching)
    - `ALLOW_REGISTRATION`: `true` (or `false` for invite-only)
    - `ARGUS_USERS_DIR`: `/data/users`
-   - `ARGUS_AUTH_DB`: `/data/auth.db`
+   - `ARGUS_ACCOUNTS_DB`: `/data/auth.db`
 
 4. **Push Repository to Hugging Face**
    ```bash
@@ -174,4 +174,4 @@ Hugging Face Spaces allows hosting containerized web applications directly on ma
 | Tier | Path | Persistence | Explanation |
 |---|---|---|---|
 | **Free Tier** | `/data` or `/app` | ❌ **Ephemeral** | The container filesystem is ephemeral. Whenever the Space restarts, updates, or goes to sleep after inactivity, **all uploaded images, users, and SQLite databases will be wiped clean**. |
-| **Persistent Storage Tier** | `/data` | ✅ **Persists** | When **Persistent Storage** (Small, Medium, or Large) is purchased and enabled in Space settings, `/data` is backed by network-attached storage. Setting `ARGUS_USERS_DIR=/data/users` and `ARGUS_AUTH_DB=/data/auth.db` guarantees that all users, credentials, image libraries, ledgers, and deduplication states **persist permanently across restarts and rebuilds**. |
+| **Persistent Storage Tier** | `/data` | ✅ **Persists** | When **Persistent Storage** (Small, Medium, or Large) is purchased and enabled in Space settings, `/data` is backed by network-attached storage. Setting `ARGUS_USERS_DIR=/data/users` and `ARGUS_ACCOUNTS_DB=/data/auth.db` guarantees that all users, credentials, image libraries, ledgers, and deduplication states **persist permanently across restarts and rebuilds**. |

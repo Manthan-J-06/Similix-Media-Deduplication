@@ -18,7 +18,7 @@ services:
       - HOSTED_MODE=${HOSTED_MODE:-false}
       - BASE_URL=${BASE_URL:-http://localhost:8000}
       - ARGUS_USERS_DIR=/data/users
-      - ARGUS_AUTH_DB=/data/auth.db
+      - ARGUS_ACCOUNTS_DB=/data/auth.db
       - TMPDIR=/tmp
     volumes:
       # Persistent storage volume for per-user directories, DBs, and library files

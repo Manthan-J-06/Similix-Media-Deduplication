@@ -625,7 +625,7 @@ def create_app(
     # Auth DB initialization
     if auth_db_path is None:
         cfg_auth = config.get("auth", {}).get("db_path")
-        auth_db_path = os.environ.get("ARGUS_AUTH_DB") or cfg_auth
+        auth_db_path = os.environ.get("ARGUS_ACCOUNTS_DB") or os.environ.get("ARGUS_AUTH_DB") or cfg_auth
         if not auth_db_path:
             cand = Path.home() / ".argus" / "auth.db"
             try:
@@ -644,15 +644,20 @@ def create_app(
     ensure_ledger_tables(init_conn)
     init_conn.close()
 
-    # Hosted mode validation: must refuse to start without SECRET_KEY (no default anywhere)
+    # Hosted mode validation: must refuse to start without SECRET_KEY (minimum 32 chars, no default anywhere)
     is_hosted = bool(
         config.get("hosted_mode", False)
         or config.get("general", {}).get("hosted_mode", False)
         or os.environ.get("HOSTED_MODE", "").lower() in ("true", "1", "yes")
     )
     secret_key = os.environ.get("SECRET_KEY") or config.get("auth", {}).get("secret_key")
-    if is_hosted and (not secret_key or not str(secret_key).strip()):
-        raise RuntimeError("Hosted mode requires SECRET_KEY to be set in environment or config. Refusing to start.")
+    if is_hosted:
+        if not secret_key or not str(secret_key).strip():
+            sys.stderr.write("ERROR: Hosted mode requires SECRET_KEY environment variable (minimum 32 characters). Refusing to start.\n")
+            raise RuntimeError("Hosted mode requires SECRET_KEY to be set in environment or config (minimum 32 characters). Refusing to start.")
+        if len(str(secret_key).strip()) < 32:
+            sys.stderr.write(f"ERROR: SECRET_KEY must be at least 32 characters in hosted mode (got {len(str(secret_key).strip())}). Refusing to start.\n")
+            raise RuntimeError(f"SECRET_KEY must be at least 32 characters in hosted mode (got {len(str(secret_key).strip())}). Refusing to start.")
 
     app = FastAPI(title="Argus API", version="0.1.0")
 
@@ -1793,8 +1798,5 @@ def create_app(
     return app
 
 
-# Module-level app instance with protected initialization
-try:
-    app = create_app()
-except Exception:
-    app = FastAPI(title="Argus API", version="0.1.0")
+# Module-level app instance
+app = create_app()

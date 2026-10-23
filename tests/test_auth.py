@@ -529,12 +529,23 @@ class TestConfinementAndQuotas:
                 )
             assert "requires secret_key" in str(exc2.value).lower()
 
-            # 3. With SECRET_KEY provided, startup succeeds cleanly
+            # 3. SECRET_KEY shorter than 32 chars rejected
+            os.environ["SECRET_KEY"] = "too-short-key"
+            with pytest.raises(RuntimeError) as exc3:
+                create_app(
+                    db_path=tmp_path / "h_test3.db",
+                    auth_db_path=tmp_path / "h_auth3.db",
+                    users_dir=tmp_path / "h_users3",
+                    config={"hosted_mode": True},
+                )
+            assert "at least 32 characters" in str(exc3.value).lower()
+
+            # 4. With valid 32+ char SECRET_KEY provided, startup succeeds cleanly
             os.environ["SECRET_KEY"] = "super-secret-production-key-32chars"
             app_ok = create_app(
-                db_path=tmp_path / "h_test3.db",
-                auth_db_path=tmp_path / "h_auth3.db",
-                users_dir=tmp_path / "h_users3",
+                db_path=tmp_path / "h_test4.db",
+                auth_db_path=tmp_path / "h_auth4.db",
+                users_dir=tmp_path / "h_users4",
                 config={"hosted_mode": True},
             )
             assert app_ok is not None
