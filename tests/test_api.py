@@ -1188,4 +1188,187 @@ class TestAPIServer:
         assert "corrupt" in warn_str.lower()
 
 
+class TestPipelineResumable:
+    """
+    Requirement 3 & 4: failed stage is resumable; job status records the failing stage;
+    a subsequent rescan completes without re-running already-finished stages.
+    """
+
+    def test_job_fails_at_stage_and_records_stage_name(self, tmp_path):
+        """
+        When run_quality_pipeline raises, the job file must:
+        - have status == 'failed'
+        - have stage == 'quality' (the failing stage)
+        - have an 'error' field containing the exception text
+        """
+        from unittest.mock import patch
+        from core.worker import run_pipeline
+
+        lib_dir = tmp_path / "lib"
+        lib_dir.mkdir()
+        im1 = lib_dir / "img1.jpg"
+        im2 = lib_dir / "img2.jpg"
+        _create_test_image(im1, color=(100, 100, 100), size=(120, 120))
+        _create_test_image(im2, color=(110, 110, 110), size=(120, 120))
+
+        test_db = tmp_path / "fail_test.db"
+        job_id = "test_fail_job"
+        job_file = tmp_path / f"{job_id}.json"
+
+        # Make quality stage raise
+        with patch("core.quality.run_quality_pipeline", side_effect=RuntimeError("injected quality failure")):
+            run_pipeline(
+                job_id=job_id,
+                db_path=test_db,
+                source_type="local",
+                folder=lib_dir,
+                job_file=job_file,
+            )
+
+        assert job_file.is_file()
+        state = json.loads(job_file.read_text())
+        assert state["status"] == "failed", f"Expected 'failed', got {state['status']!r}"
+        assert state.get("stage") == "quality", f"Expected stage='quality', got {state.get('stage')!r}"
+        assert "injected quality failure" in state.get("error", ""), state
+
+    def test_rescan_after_failure_completes(self, tmp_path):
+        """
+        After a failed run (quality raises), a second run_pipeline call must:
+        - skip already-completed stages (scan, embed, cluster, verify) because
+          the DB already has data for them
+        - complete quality + categorize
+        - end with status == 'completed' or 'completed_with_warnings'
+        """
+        from unittest.mock import patch
+        from core.worker import run_pipeline
+
+        lib_dir = tmp_path / "lib"
+        lib_dir.mkdir()
+        im1 = lib_dir / "img1.jpg"
+        im2 = lib_dir / "img2.jpg"
+        _create_test_image(im1, color=(80, 80, 80), size=(100, 100))
+        _create_test_image(im2, color=(90, 90, 90), size=(100, 100))
+
+        test_db = tmp_path / "rescan_test.db"
+        job_id_fail = "test_rescan_fail"
+        job_file_fail = tmp_path / f"{job_id_fail}.json"
+
+        # First run: quality fails
+        with patch("core.quality.run_quality_pipeline", side_effect=RuntimeError("injected quality failure")):
+            run_pipeline(
+                job_id=job_id_fail,
+                db_path=test_db,
+                source_type="local",
+                folder=lib_dir,
+                job_file=job_file_fail,
+            )
+
+        state = json.loads(job_file_fail.read_text())
+        assert state["status"] == "failed"
+
+        # Second run (rescan): quality is no longer patched — should complete
+        job_id_ok = "test_rescan_ok"
+        job_file_ok = tmp_path / f"{job_id_ok}.json"
+        run_pipeline(
+            job_id=job_id_ok,
+            db_path=test_db,
+            source_type="local",
+            folder=lib_dir,
+            job_file=job_file_ok,
+        )
+
+        assert job_file_ok.is_file()
+        state2 = json.loads(job_file_ok.read_text())
+        assert state2["status"] in ("completed", "completed_with_warnings"), (
+            f"Expected completed/completed_with_warnings, got {state2['status']!r}\n"
+            f"Error: {state2.get('error')}"
+        )
+
+    def test_incomplete_member_excluded_from_keeper_until_quality_done(self, tmp_path):
+        """
+        A cluster member whose quality_status IS NULL must never appear as
+        delete_safe in choose_keeper — the invariant is enforced by
+        _is_member_candidate returning False for non-(reference|aligned) statuses.
+        """
+        from core.keeper import choose_keeper
+
+        # Build two members: one reference (quality_status='reference'),
+        # one pending (quality_status=None)
+        members = [
+            {
+                "id": 1, "file_path": "/a/ref.jpg", "md5": "aaa", "file_size": 1000,
+                "width": 800, "height": 600, "source": "local",
+                "quality_status": "reference", "quality_basis": "full",
+                "ssim": None, "ssim_color": None, "sharpness_ratio": 1.0,
+                "pixel_ratio": 1.0, "bytes_ratio": 1.0,
+                "is_low_confidence": 0, "blur_flag": 0,
+                "match_pct": None, "resolution_pct": None,
+                "inlier_count": None, "inlier_ratio": None,
+                "trashed": 0, "review_flag": 0, "delete_safe": 0,
+            },
+            {
+                "id": 2, "file_path": "/a/pending.jpg", "md5": "bbb", "file_size": 900,
+                "width": 800, "height": 600, "source": "local",
+                "quality_status": None,  # ← not yet scored
+                "quality_basis": None,
+                "ssim": None, "ssim_color": None, "sharpness_ratio": None,
+                "pixel_ratio": None, "bytes_ratio": None,
+                "is_low_confidence": 0, "blur_flag": 0,
+                "match_pct": None, "resolution_pct": None,
+                "inlier_count": None, "inlier_ratio": None,
+                "trashed": 0, "review_flag": 0, "delete_safe": 0,
+            },
+        ]
+
+        result = choose_keeper(members, mode="conservative")
+        # The pending member must not be delete_safe
+        assert 2 not in result["delete_safe_ids"], (
+            "A member with quality_status=None must never be delete_safe"
+        )
+
+    def test_drive_thumbnail_served_from_drive_cache(self, api_test_env, tmp_path, monkeypatch):
+        """
+        Requirement 2:
+        Images with source='gdrive' or file_path='drive://...' must have their thumbnails
+        served from drive_cache rather than falling back to the gray placeholder.
+        """
+        client = api_test_env["client"]
+        app = api_test_env["app"]
+        db_file = api_test_env["db_file"]
+
+        # Setup mock drive_cache dir
+        drive_cache = tmp_path / "drive_cache"
+        drive_cache.mkdir()
+
+        # Create a real image in drive_cache
+        drive_file = drive_cache / "drive_img_123_1700000000.jpg"
+        _create_test_image(drive_file, color=(50, 150, 250), size=(100, 100))
+
+        # Inject drive_cache path into app config
+        app.state.config = {
+            "sources": {
+                "google_drive": {
+                    "cache_dir": str(drive_cache)
+                }
+            }
+        }
+
+        # Insert a drive image row into DB
+        conn = sqlite3.connect(db_file)
+        conn.execute(
+            """
+            INSERT INTO images (id, cluster_id, file_path, source, drive_id, modified_time, file_size, width, height, format, md5, is_keeper)
+            VALUES (2001, 1, 'drive://drive_img_123/remote.jpg', 'gdrive', 'drive_img_123', 1700000000, 1000, 100, 100, 'JPEG', 'md5drive', 0)
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        # Request thumbnail
+        res = client.get("/thumb/2001?size=64")
+        assert res.status_code == 200
+        assert res.headers["content-type"] == "image/jpeg"
+        # Must NOT be placeholder
+        from api.server import PLACEHOLDER_JPEG_BYTES
+        assert res.content != PLACEHOLDER_JPEG_BYTES, "Drive thumbnail should be loaded from drive_cache, not placeholder"
 

@@ -25,6 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import io
+import logging
 import os
 from pathlib import Path
 import pickle
@@ -44,6 +45,8 @@ from core.verify import (
     proxy_matrix_to_full,
 )
 from sources.base import ImageSource
+
+logger = logging.getLogger("argus.quality")
 
 
 @dataclass

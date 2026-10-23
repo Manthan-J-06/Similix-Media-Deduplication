@@ -30,6 +30,7 @@ import argparse
 import json
 import logging
 from pathlib import Path
+import sqlite3
 import time
 from typing import Any
 import uuid
@@ -92,6 +93,60 @@ def update_job_file(
     os.replace(tmp_file, job_file)
 
 
+def _stage_needs_scan(conn: "sqlite3.Connection") -> bool:
+    """Return True if Stage 0/1 (scan+hash) still has work to do."""
+    # If there are images that haven't been hashed yet, or none at all, we need to scan.
+    undiscovered = conn.execute(
+        "SELECT COUNT(*) FROM images WHERE md5 IS NULL AND (status IS NULL OR status != 'skipped')"
+    ).fetchone()[0]
+    total = conn.execute("SELECT COUNT(*) FROM images").fetchone()[0]
+    return undiscovered > 0 or total == 0
+
+
+def _stage_needs_embed(conn: "sqlite3.Connection") -> bool:
+    return conn.execute(
+        """SELECT COUNT(*) FROM images
+           WHERE clip_vector IS NULL AND is_raw_pair = 0
+             AND (status IS NULL OR status != 'skipped')"""
+    ).fetchone()[0] > 0
+
+
+def _stage_needs_cluster(conn: "sqlite3.Connection") -> bool:
+    # Re-cluster whenever there are embedded images not yet in a cluster
+    # (or previously clustered but now needing re-evaluation after new imports)
+    return conn.execute(
+        """SELECT COUNT(*) FROM images
+           WHERE clip_vector IS NOT NULL AND cluster_id IS NULL
+             AND is_raw_pair = 0 AND (status IS NULL OR status != 'skipped')"""
+    ).fetchone()[0] > 0
+
+
+def _stage_needs_verify(conn: "sqlite3.Connection") -> bool:
+    return conn.execute(
+        """SELECT COUNT(*) FROM images
+           WHERE cluster_id IS NOT NULL
+             AND quality_status IS NULL
+             AND (status IS NULL OR status != 'skipped')"""
+    ).fetchone()[0] > 0
+
+
+def _stage_needs_quality(conn: "sqlite3.Connection") -> bool:
+    return conn.execute(
+        """SELECT COUNT(*) FROM images
+           WHERE cluster_id IS NOT NULL
+             AND quality_status IS NULL
+             AND (status IS NULL OR status != 'skipped')"""
+    ).fetchone()[0] > 0
+
+
+def _stage_needs_categorize(conn: "sqlite3.Connection") -> bool:
+    return conn.execute(
+        """SELECT COUNT(*) FROM images
+           WHERE category_top1 IS NULL
+             AND (status IS NULL OR status != 'skipped')"""
+    ).fetchone()[0] > 0
+
+
 def run_pipeline(
     job_id: str,
     db_path: str | Path,
@@ -101,7 +156,11 @@ def run_pipeline(
     drive_folder_id: str | None = None,
     job_file: Path | None = None,
 ) -> None:
-    """Execute the full deduplication pipeline in small batches with progress reporting."""
+    """Execute the full deduplication pipeline in small batches with progress reporting.
+
+    Resumable: each stage is skipped if already complete, so a failed run can be
+    continued by re-invoking run_pipeline with the same arguments.
+    """
     if job_file is None:
         job_file = Path.home() / ".argus" / "jobs" / f"{job_id}.json"
 
@@ -109,6 +168,7 @@ def run_pipeline(
     init_db(db_path)
     conn = get_connection(db_path)
     all_warnings: list[str] = []
+    current_stage = "scan"
 
     try:
         from core.categories import run_categorization
@@ -134,6 +194,7 @@ def run_pipeline(
         # ── Stage 0 & 1: Discovery, MD5, and pHash ──
         if source_type == "drive":
             from sources.google_drive import GoogleDriveSource
+            current_stage = "scan"
             source0 = GoogleDriveSource(folder_id=drive_folder_id, conn=conn, stage="stage0")
             s0_res = run_stage0(source0, conn, cfg)
             for p, r in s0_res.skipped_reasons:
@@ -165,9 +226,18 @@ def run_pipeline(
                 message=f"Scanning (0 of {total_files} files)",
             )
 
-            s0_res = run_stage0(source_active, conn, cfg)
-            for p, r in s0_res.skipped_reasons:
-                all_warnings.append(f"{Path(p).name}: {r}")
+            current_stage = "scan"
+            if _stage_needs_scan(conn) or total_files > conn.execute("SELECT COUNT(*) FROM images").fetchone()[0]:
+                s0_res = run_stage0(source_active, conn, cfg)
+                for p, r in s0_res.skipped_reasons:
+                    all_warnings.append(f"{Path(p).name}: {r}")
+            else:
+                logger.info("Stage 0 (scan) already complete — skipping.")
+                # Reconstruct a dummy result for progress display
+                class _DummyResult:
+                    files_discovered = 0
+                    files_unchanged = total_files
+                s0_res = _DummyResult()
 
             update_job_file(
                 job_file,
@@ -177,11 +247,13 @@ def run_pipeline(
                 message=f"Perceptual hashing (0 of {total_files} files)",
             )
 
+            current_stage = "hash"
             s1_res = run_stage1(source_active, conn, cfg)
             for p, r in s1_res.skipped_reasons:
                 all_warnings.append(f"{Path(p).name}: {r}")
 
         # ── Stage 2: Embeddings ──
+        current_stage = "embed"
         pending_embed = conn.execute(
             """
             SELECT COUNT(*) FROM images
@@ -213,9 +285,13 @@ def run_pipeline(
                 message=f"Embedding ({cur} of {tot} files)",
             )
 
-        run_embeddings(source_active, conn, cfg, progress_callback=on_embed_progress)
+        if pending_embed > 0:
+            run_embeddings(source_active, conn, cfg, progress_callback=on_embed_progress)
+        else:
+            logger.info("Stage 2 (embed) already complete — skipping.")
 
         # ── Stage 2: Clustering ──
+        current_stage = "cluster"
         update_job_file(
             job_file,
             stage="cluster",
@@ -223,9 +299,13 @@ def run_pipeline(
             progress=58.0,
             message="Clustering candidate duplicates...",
         )
-        run_stage2_clustering(conn, cfg)
+        if _stage_needs_cluster(conn):
+            run_stage2_clustering(conn, cfg)
+        else:
+            logger.info("Stage 2 (cluster) already complete — skipping.")
 
         # ── Stage 3: Verification ──
+        current_stage = "verify"
         cand_count = conn.execute(
             "SELECT COUNT(*) FROM images WHERE cluster_id IS NOT NULL"
         ).fetchone()[0]
@@ -239,9 +319,13 @@ def run_pipeline(
             progress=70.0,
             message=f"Geometric verification ({cand_count} candidates)",
         )
-        run_stage3_verification(conn, cfg, source=source_active)
+        if _stage_needs_verify(conn):
+            run_stage3_verification(conn, cfg, source=source_active)
+        else:
+            logger.info("Stage 3 (verify) already complete — skipping.")
 
         # ── Stage 4: Quality & Keeper Selection ──
+        current_stage = "quality"
         cluster_count = conn.execute("SELECT COUNT(*) FROM clusters").fetchone()[0]
         update_job_file(
             job_file,
@@ -252,9 +336,13 @@ def run_pipeline(
             progress=85.0,
             message=f"Evaluating quality ({cluster_count} clusters)",
         )
-        run_quality_pipeline(conn, cfg, source=source_active)
+        if _stage_needs_quality(conn):
+            run_quality_pipeline(conn, cfg, source=source_active)
+        else:
+            logger.info("Stage 4 (quality) already complete — skipping.")
 
         # ── Stage 5: Semantic Categorization ──
+        current_stage = "categorize"
         pending_cat = conn.execute(
             """
             SELECT COUNT(*) FROM images
@@ -285,7 +373,10 @@ def run_pipeline(
                 message=f"Categorizing ({cur} of {tot} files)",
             )
 
-        run_categorization(conn, cfg, force=False, progress_callback=on_cat_progress)
+        if pending_cat > 0:
+            run_categorization(conn, cfg, force=False, progress_callback=on_cat_progress)
+        else:
+            logger.info("Stage 5 (categorize) already complete — skipping.")
 
         # ── Finalize ──
         if all_warnings:
@@ -309,12 +400,13 @@ def run_pipeline(
                 warnings=[],
             )
     except Exception as exc:
-        logger.exception("Pipeline failed: %s", exc)
+        logger.exception("Pipeline failed at stage '%s': %s", current_stage, exc)
         update_job_file(
             job_file,
             status="failed",
+            stage=current_stage,
             error=str(exc),
-            message=f"Pipeline failed: {exc}",
+            message=f"Pipeline failed at stage '{current_stage}': {exc}",
         )
     finally:
         conn.close()

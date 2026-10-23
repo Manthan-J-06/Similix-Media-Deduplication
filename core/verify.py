@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import logging
 import pickle
 import sqlite3
 import time
@@ -34,6 +35,8 @@ import numpy as np
 from PIL import Image
 
 from sources.base import ImageSource
+
+logger = logging.getLogger("argus.verify")
 
 
 @dataclass

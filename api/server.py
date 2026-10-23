@@ -532,13 +532,56 @@ def create_app(
     ):
         """Serve a cached JPEG thumbnail for the given image ID. Never accepts file paths."""
         try:
-            row = conn.execute("SELECT id, file_path FROM images WHERE id = ?", (image_id,)).fetchone()
+            row = conn.execute(
+                "SELECT id, file_path, source, drive_id, modified_time FROM images WHERE id = ?",
+                (image_id,),
+            ).fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail=f"Image {image_id} not found")
 
-            orig_path = Path(row["file_path"])
-            if not orig_path.exists():
-                logger.warning(f"Image {image_id} source file not found on disk: {orig_path}")
+            file_path_str = str(row["file_path"])
+            orig_path: Path | None = None
+
+            # Resolve Google Drive virtual path from drive_cache if available
+            is_drive = file_path_str.startswith("drive://") or row["source"] == "gdrive" or bool(row["drive_id"])
+            if is_drive:
+                drive_id = row["drive_id"]
+                if not drive_id and file_path_str.startswith("drive://"):
+                    try:
+                        drive_id = file_path_str[8:].split("/")[0]
+                    except Exception:
+                        drive_id = None
+
+                cfg = getattr(request.app.state, "config", {}) or {}
+                drive_cache_dir = Path(
+                    cfg.get("sources", {})
+                    .get("google_drive", {})
+                    .get("cache_dir", "~/.argus/drive_cache")
+                ).expanduser()
+
+                if drive_id and drive_cache_dir.is_dir():
+                    mtime = row["modified_time"]
+                    if mtime is not None:
+                        try:
+                            candidate = drive_cache_dir / f"{drive_id}_{int(mtime)}.jpg"
+                            if candidate.is_file():
+                                orig_path = candidate
+                        except Exception:
+                            pass
+                    if orig_path is None:
+                        matches = sorted(drive_cache_dir.glob(f"{drive_id}_*.jpg"))
+                        if not matches:
+                            matches = sorted(drive_cache_dir.glob(f"{drive_id}.jpg"))
+                        if matches:
+                            orig_path = matches[0]
+
+            if orig_path is None:
+                candidate_path = Path(file_path_str)
+                if candidate_path.exists():
+                    orig_path = candidate_path
+
+            if orig_path is None:
+                logger.warning(f"Image {image_id} source file not found on disk: {file_path_str}")
                 return Response(content=PLACEHOLDER_JPEG_BYTES, media_type="image/jpeg", status_code=200)
 
             cache_dir = request.app.state.thumb_cache_dir
