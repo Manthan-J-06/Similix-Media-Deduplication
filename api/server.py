@@ -38,6 +38,7 @@ from core.auth import (
     authenticate_user,
     check_login_rate_limit,
     create_session,
+    delete_user_account,
     get_session_user,
     get_user_dirs,
     hash_password,
@@ -96,6 +97,11 @@ class LoginRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
 
+class DeleteAccountRequest(BaseModel):
+    password: str
+    model_config = ConfigDict(extra="ignore")
+
+
 class PlanRequest(BaseModel):
     mode: str = "conservative"
     approved_swap_cluster_ids: list[int] = Field(default_factory=list)
@@ -138,6 +144,10 @@ class UserContext:
     thumb_cache_dir: Path
     jobs_dir: Path
     drive_cache_dir: Path
+
+    @property
+    def user_id(self) -> int:
+        return self.id
 
 
 def get_user_storage_usage(user_root: Path) -> int:
@@ -634,7 +644,35 @@ def create_app(
     ensure_ledger_tables(init_conn)
     init_conn.close()
 
+    # Hosted mode validation: must refuse to start without SECRET_KEY (no default anywhere)
+    is_hosted = bool(
+        config.get("hosted_mode", False)
+        or config.get("general", {}).get("hosted_mode", False)
+        or os.environ.get("HOSTED_MODE", "").lower() in ("true", "1", "yes")
+    )
+    secret_key = os.environ.get("SECRET_KEY") or config.get("auth", {}).get("secret_key")
+    if is_hosted and (not secret_key or not str(secret_key).strip()):
+        raise RuntimeError("Hosted mode requires SECRET_KEY to be set in environment or config. Refusing to start.")
+
     app = FastAPI(title="Argus API", version="0.1.0")
+
+    @app.middleware("http")
+    async def add_security_headers(request: Request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data:; "
+            "connect-src 'self'; "
+            "frame-ancestors 'none'; "
+            "base-uri 'self'; "
+            "form-action 'self';"
+        )
+        return response
 
     allowed_origins = [
         "http://127.0.0.1",
@@ -796,6 +834,39 @@ def create_app(
             "email": user.email,
             "csrf_token": user.csrf_token,
         }
+
+    @app.post("/auth/delete-account")
+    def delete_account(
+        req: DeleteAccountRequest,
+        request: Request = None,
+        response: Response = None,
+        user: UserContext = Depends(get_current_user),
+    ) -> dict[str, Any]:
+        """Delete user account, isolated directory on disk, and DB rows after password confirmation."""
+        if hasattr(request.app.state, "_initialized_user_dbs"):
+            request.app.state._initialized_user_dbs.discard(user.db_path)
+
+        res = delete_user_account(
+            conn=request.app.state.auth_conn,
+            user_id=user.user_id,
+            password=req.password,
+            users_dir=request.app.state.users_dir,
+        )
+
+        if response is not None:
+            response.delete_cookie("argus_session")
+            response.delete_cookie("argus_csrf")
+        return res
+
+    @app.delete("/auth/me")
+    def delete_account_me(
+        req: DeleteAccountRequest,
+        request: Request = None,
+        response: Response = None,
+        user: UserContext = Depends(get_current_user),
+    ) -> dict[str, Any]:
+        """Alias for /auth/delete-account using HTTP DELETE."""
+        return delete_account(req, request=request, response=response, user=user)
 
     # ==========================
     # Main Application UI
@@ -1452,6 +1523,13 @@ def create_app(
         user: UserContext = Depends(get_current_user),
     ) -> dict[str, Any]:
         """Validate Drive link and start read-only scan under user context."""
+        cfg = getattr(request.app.state, "config", {}) or {}
+        hosted_mode = bool(cfg.get("hosted_mode", False) or cfg.get("general", {}).get("hosted_mode", False))
+        if "HOSTED_MODE" in os.environ:
+            hosted_mode = os.environ.get("HOSTED_MODE", "").lower() in ("true", "1", "yes")
+        if hosted_mode:
+            raise HTTPException(status_code=403, detail="Google Drive sources are disabled in hosted mode")
+
         folder_id = extract_drive_folder_id(req.link)
 
         from sources.google_drive import DEFAULT_TOKEN_PATH, get_drive_credentials

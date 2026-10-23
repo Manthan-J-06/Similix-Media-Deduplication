@@ -6,16 +6,20 @@ services:
     image: argus:latest
     container_name: argus-app
     restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=1g
     ports:
       - "8000:8000"
     environment:
       # Secrets and runtime flags passed from environment (never baked into image)
-      - SECRET_KEY=${SECRET_KEY:-}
+      - SECRET_KEY=${SECRET_KEY}
       - ALLOW_REGISTRATION=${ALLOW_REGISTRATION:-true}
       - HOSTED_MODE=${HOSTED_MODE:-false}
       - BASE_URL=${BASE_URL:-http://localhost:8000}
       - ARGUS_USERS_DIR=/data/users
       - ARGUS_AUTH_DB=/data/auth.db
+      - TMPDIR=/tmp
     volumes:
       # Persistent storage volume for per-user directories, DBs, and library files
       - argus_data:/data

@@ -482,3 +482,138 @@ class TestConfinementAndQuotas:
         resp = client.post("/sources/dataset", json={"url": "https://huggingface.co/dataset.zip"})
         assert resp.status_code == 403
         assert "hosted mode" in resp.json()["detail"].lower()
+
+    def test_hosted_mode_disables_drive_sources(self, auth_test_app):
+        """Hosted-mode config flag disables /sources/drive with 403."""
+        app = auth_test_app["app"]
+        app.state.config["hosted_mode"] = True
+
+        client = TestClient(app)
+        register_and_login(client, "hosted_drive@argus.local")
+
+        resp = client.post(
+            "/sources/drive",
+            json={"link": "https://drive.google.com/drive/folders/1abcxyz"},
+        )
+        assert resp.status_code == 403
+        assert "hosted mode" in resp.json()["detail"].lower()
+
+    def test_hosted_mode_refuses_to_start_without_secret_key(self, auth_test_app):
+        """Hosted mode must refuse to start without SECRET_KEY (no default anywhere)."""
+        tmp_path = auth_test_app["tmp_path"]
+        old_env_hosted = os.environ.get("HOSTED_MODE")
+        old_env_secret = os.environ.get("SECRET_KEY")
+
+        try:
+            # 1. In environment: HOSTED_MODE=true without SECRET_KEY
+            os.environ["HOSTED_MODE"] = "true"
+            os.environ.pop("SECRET_KEY", None)
+
+            with pytest.raises(RuntimeError) as exc1:
+                create_app(
+                    db_path=tmp_path / "h_test1.db",
+                    auth_db_path=tmp_path / "h_auth1.db",
+                    users_dir=tmp_path / "h_users1",
+                    config={"hosted_mode": True},
+                )
+            assert "requires secret_key" in str(exc1.value).lower()
+
+            # 2. In config: hosted_mode=True without SECRET_KEY
+            os.environ.pop("HOSTED_MODE", None)
+            with pytest.raises(RuntimeError) as exc2:
+                create_app(
+                    db_path=tmp_path / "h_test2.db",
+                    auth_db_path=tmp_path / "h_auth2.db",
+                    users_dir=tmp_path / "h_users2",
+                    config={"hosted_mode": True, "auth": {}},
+                )
+            assert "requires secret_key" in str(exc2.value).lower()
+
+            # 3. With SECRET_KEY provided, startup succeeds cleanly
+            os.environ["SECRET_KEY"] = "super-secret-production-key-32chars"
+            app_ok = create_app(
+                db_path=tmp_path / "h_test3.db",
+                auth_db_path=tmp_path / "h_auth3.db",
+                users_dir=tmp_path / "h_users3",
+                config={"hosted_mode": True},
+            )
+            assert app_ok is not None
+        finally:
+            if old_env_hosted is not None:
+                os.environ["HOSTED_MODE"] = old_env_hosted
+            else:
+                os.environ.pop("HOSTED_MODE", None)
+
+            if old_env_secret is not None:
+                os.environ["SECRET_KEY"] = old_env_secret
+            else:
+                os.environ.pop("SECRET_KEY", None)
+
+    def test_security_headers_present_on_responses(self, auth_test_app):
+        """Responses include X-Content-Type-Options, X-Frame-Options, Referrer-Policy, and CSP."""
+        app = auth_test_app["app"]
+        client = TestClient(app)
+
+        for endpoint in ["/healthz", "/login"]:
+            resp = client.get(endpoint)
+            assert resp.headers["X-Content-Type-Options"] == "nosniff"
+            assert resp.headers["X-Frame-Options"] == "DENY"
+            assert resp.headers["Referrer-Policy"] == "strict-origin-when-cross-origin"
+            csp = resp.headers["Content-Security-Policy"]
+            assert "default-src 'self'" in csp
+            assert "frame-ancestors 'none'" in csp
+
+    def test_account_deletion_with_password_confirmation(self, auth_test_app):
+        """Account deletion wipes user directory and auth.db rows after password confirmation."""
+        app = auth_test_app["app"]
+        client = TestClient(app)
+        email = "to_delete@argus.local"
+        password = "UserPassword123!"
+
+        user_info = register_and_login(client, email=email, password=password)
+        user_id = user_info["user_id"]
+        user_root = app.state.users_dir / str(user_id)
+
+        # Upload a test file so the user directory has physical content
+        img_bytes = io.BytesIO()
+        Image.new("RGB", (64, 64), color="blue").save(img_bytes, format="JPEG")
+        img_bytes.seek(0)
+        upload_res = client.post(
+            "/sources/upload",
+            data={"project": "default"},
+            files={"files": ("blue.jpg", img_bytes.getvalue(), "image/jpeg")},
+        )
+        assert upload_res.status_code == 200
+        assert user_root.exists()
+        assert (user_root / "library" / "default" / "blue.jpg").exists()
+
+        # 1. Attempt deletion with incorrect password
+        del_wrong = client.post("/auth/delete-account", json={"password": "WrongPassword123!"})
+        assert del_wrong.status_code == 400
+        assert "incorrect password" in del_wrong.json()["detail"].lower()
+        # Verify user still exists
+        assert user_root.exists()
+        row = app.state.auth_conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
+        assert row is not None
+
+        # 2. Delete with correct password
+        del_ok = client.post("/auth/delete-account", json={"password": password})
+        assert del_ok.status_code == 200
+        assert del_ok.json()["status"] == "deleted"
+
+        # 3. Verify user directory completely removed from disk
+        assert not user_root.exists()
+
+        # 4. Verify auth.db rows removed
+        row_user = app.state.auth_conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
+        assert row_user is None
+        sess_rows = app.state.auth_conn.execute("SELECT id FROM sessions WHERE user_id = ?", (user_id,)).fetchall()
+        assert len(sess_rows) == 0
+
+        # 5. Subsequent request with previous session cookie returns 401
+        me_resp = client.get("/auth/me")
+        assert me_resp.status_code == 401
+
+        # 6. Login with previous credentials returns 401
+        login_again = client.post("/auth/login", json={"email": email, "password": password})
+        assert login_again.status_code == 401

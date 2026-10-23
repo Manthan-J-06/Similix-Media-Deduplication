@@ -9,6 +9,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HOST=0.0.0.0 \
     ARGUS_USERS_DIR=/data/users \
     ARGUS_AUTH_DB=/data/auth.db \
+    TMPDIR=/tmp \
     HF_HOME=/home/argus/.cache/huggingface \
     TORCH_HOME=/home/argus/.cache/torch
 

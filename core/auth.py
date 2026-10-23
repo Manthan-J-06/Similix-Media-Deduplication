@@ -18,6 +18,7 @@ import hashlib
 from pathlib import Path
 import re
 import secrets
+import shutil
 import sqlite3
 import time
 from typing import Any
@@ -421,3 +422,34 @@ def validate_confined_user_path(
         )
 
     return resolved
+
+
+def delete_user_account(
+    conn: sqlite3.Connection,
+    user_id: int,
+    password: str,
+    users_dir: Path | str,
+) -> dict[str, Any]:
+    """Delete a user account, verifying password first, wiping the user's isolated directory and auth DB rows."""
+    row = conn.execute(
+        "SELECT id, email, password_hash FROM users WHERE id = ?",
+        (user_id,),
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if not verify_password(password, row["password_hash"]):
+        raise HTTPException(status_code=400, detail="Incorrect password confirmation")
+
+    # 1. Remove user directory on disk
+    user_path = Path(users_dir).expanduser().resolve() / str(user_id)
+    if user_path.exists():
+        shutil.rmtree(user_path, ignore_errors=True)
+
+    # 2. Delete rows in auth.db
+    with conn:
+        conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM login_attempts WHERE email = ?", (row["email"],))
+        conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+
+    return {"status": "deleted", "user_id": user_id, "email": row["email"]}
