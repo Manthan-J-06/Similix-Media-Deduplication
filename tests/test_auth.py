@@ -100,6 +100,7 @@ class TestAuthenticationAndSessions:
 
         public_paths = {
             "/login",
+            "/healthz",
             "/auth/login",
             "/auth/register",
             "/auth/csrf",
@@ -215,6 +216,13 @@ class TestAuthenticationAndSessions:
         res = client.get("/auth/me")
         assert res.status_code == 401
 
+    def test_healthz_endpoint(self, auth_test_app):
+        """Public health check endpoint returns 200 without authentication."""
+        client = TestClient(auth_test_app["app"])
+        res = client.get("/healthz")
+        assert res.status_code == 200
+        assert res.json() == {"status": "ok", "service": "argus"}
+
 
 class TestPerUserIsolation:
     def test_user_a_cannot_access_user_b_resources(self, auth_test_app):
@@ -298,6 +306,69 @@ class TestPerUserIsolation:
         # 6. User A tries to get User B's job -> 404, NOT 403
         res_job = client_a.get("/jobs/job_b_test")
         assert res_job.status_code == 404, f"Expected 404, got {res_job.status_code}"
+
+    def test_register_two_users_upload_and_confirm_isolation(self, auth_test_app):
+        """
+        Registers two users via the API, uploads an image as each user, and confirms:
+        - Files are written strictly into their respective user directories.
+        - User A cannot view, access, or poll User B's uploaded files or background jobs (404).
+        - User B cannot view, access, or poll User A's uploaded files or background jobs (404).
+        """
+        app = auth_test_app["app"]
+        app.state.pipeline_worker = lambda *args, **kwargs: None  # mock background worker
+
+        # 1. Register User 1
+        client1 = TestClient(app)
+        u1 = register_and_login(client1, "user_one@argus.local")
+        u1_dir = app.state.users_dir / str(u1["user_id"])
+
+        # 2. Register User 2
+        client2 = TestClient(app)
+        u2 = register_and_login(client2, "user_two@argus.local")
+        u2_dir = app.state.users_dir / str(u2["user_id"])
+
+        # 3. User 1 uploads an image
+        img1_buf = io.BytesIO()
+        Image.new("RGB", (64, 64), color=(255, 0, 0)).save(img1_buf, format="JPEG")
+        res1 = client1.post(
+            "/sources/upload",
+            files=[("files", ("image_user1.jpg", img1_buf.getvalue(), "image/jpeg"))],
+        )
+        assert res1.status_code == 200
+        data1 = res1.json()
+        job1_id = data1["job_id"]
+        assert "image_user1.jpg" in data1["files"]
+
+        # 4. User 2 uploads an image
+        img2_buf = io.BytesIO()
+        Image.new("RGB", (64, 64), color=(0, 255, 0)).save(img2_buf, format="JPEG")
+        res2 = client2.post(
+            "/sources/upload",
+            files=[("files", ("image_user2.jpg", img2_buf.getvalue(), "image/jpeg"))],
+        )
+        assert res2.status_code == 200
+        data2 = res2.json()
+        job2_id = data2["job_id"]
+        assert "image_user2.jpg" in data2["files"]
+
+        # 5. Confirm file isolation on disk
+        u1_file = u1_dir / "library" / "default" / "image_user1.jpg"
+        u2_file = u2_dir / "library" / "default" / "image_user2.jpg"
+        assert u1_file.is_file(), f"Expected User 1 file at {u1_file}"
+        assert u2_file.is_file(), f"Expected User 2 file at {u2_file}"
+        assert not (u1_dir / "library" / "default" / "image_user2.jpg").exists()
+        assert not (u2_dir / "library" / "default" / "image_user1.jpg").exists()
+
+        # 6. Confirm job isolation via API
+        # User 1 can see job 1, but gets 404 for job 2
+        assert client1.get(f"/jobs/{job1_id}").status_code == 200
+        res_cross1 = client1.get(f"/jobs/{job2_id}")
+        assert res_cross1.status_code == 404, f"Expected 404 for cross-user job, got {res_cross1.status_code}"
+
+        # User 2 can see job 2, but gets 404 for job 1
+        assert client2.get(f"/jobs/{job2_id}").status_code == 200
+        res_cross2 = client2.get(f"/jobs/{job1_id}")
+        assert res_cross2.status_code == 404, f"Expected 404 for cross-user job, got {res_cross2.status_code}"
 
 
 class TestConfinementAndQuotas:

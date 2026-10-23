@@ -30,8 +30,10 @@ import sqlite3
 import threading
 import time
 
+from typing import Any
+
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from PIL import Image
 

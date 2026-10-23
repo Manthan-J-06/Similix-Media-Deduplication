@@ -9,6 +9,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -800,9 +801,9 @@ def cmd_serve(args: argparse.Namespace) -> None:
         thumb_cache_dir=getattr(args, "thumb_cache_dir", None),
         config=cfg,
     )
-    # Strictly bind to 127.0.0.1 only
-    host = "127.0.0.1"
-    port = getattr(args, "port", 8000) or 8000
+    # Bind host and port, supporting HOST/PORT env vars for container deployments
+    host = getattr(args, "host", None) or os.environ.get("HOST", "127.0.0.1")
+    port = getattr(args, "port", None) or int(os.environ.get("PORT", 8000))
     print(f"Starting Argus API server on http://{host}:{port} (db: {resolved_db})")
     uvicorn.run(app, host=host, port=port)
 
@@ -1038,7 +1039,8 @@ def main(argv: list[str] | None = None) -> None:
     serve_parser = subparsers.add_parser("serve", help="Start the Argus FastAPI server on 127.0.0.1:8000")
     serve_parser.add_argument("folder", nargs="?", default=None, help="Path to image folder or database (optional)")
     serve_parser.add_argument("--db", default=None, help="Path to SQLite database file")
-    serve_parser.add_argument("--port", type=int, default=8000, help="Port to bind (default: 8000)")
+    serve_parser.add_argument("--host", default=None, help="Host to bind (default: 127.0.0.1 or $HOST)")
+    serve_parser.add_argument("--port", type=int, default=None, help="Port to bind (default: 8000 or $PORT)")
     serve_parser.add_argument("--trash-dir", default=None, help="Path to trash directory")
     serve_parser.add_argument("--thumb-cache-dir", default=None, help="Path to thumbnail cache directory")
     serve_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")

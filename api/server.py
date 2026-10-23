@@ -636,14 +636,21 @@ def create_app(
 
     app = FastAPI(title="Argus API", version="0.1.0")
 
+    allowed_origins = [
+        "http://127.0.0.1",
+        "http://127.0.0.1:8000",
+        "http://localhost",
+        "http://localhost:8000",
+    ]
+    base_url = os.environ.get("BASE_URL")
+    if base_url:
+        clean_base = base_url.strip().rstrip("/")
+        if clean_base and clean_base not in allowed_origins:
+            allowed_origins.append(clean_base)
+
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[
-            "http://127.0.0.1",
-            "http://127.0.0.1:8000",
-            "http://localhost",
-            "http://localhost:8000",
-        ],
+        allow_origins=allowed_origins,
         allow_credentials=True,
         allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["*"],
@@ -682,8 +689,13 @@ def create_app(
     login_file = Path(__file__).resolve().parent.parent / "ui" / "login.html"
 
     # ==========================
-    # Authentication Endpoints
+    # Health & Authentication Endpoints
     # ==========================
+
+    @app.get("/healthz")
+    def health_check():
+        """Public health check endpoint for reverse proxies and orchestrators."""
+        return {"status": "ok", "service": "argus"}
 
     @app.get("/login")
     def serve_login():
@@ -710,6 +722,8 @@ def create_app(
         allow_reg = cfg.get("auth", {}).get("allow_registration", True)
         if cfg.get("invite_only", False) or cfg.get("auth", {}).get("invite_only", False):
             allow_reg = False
+        if "ALLOW_REGISTRATION" in os.environ:
+            allow_reg = os.environ.get("ALLOW_REGISTRATION", "").lower() in ("true", "1", "yes")
 
         res = register_user(
             request.app.state.auth_conn,
@@ -731,7 +745,8 @@ def create_app(
         )
         raw_token, csrf_tok = create_session(request.app.state.auth_conn, user_data["id"])
 
-        is_secure = request.url.hostname not in ("127.0.0.1", "localhost", "testserver")
+        proto = request.headers.get("x-forwarded-proto", "").lower()
+        is_secure = (proto == "https") or (request.url.scheme == "https") or (request.url.hostname not in ("127.0.0.1", "localhost", "testserver"))
         response.set_cookie(
             key="argus_session",
             value=raw_token,
@@ -1478,6 +1493,8 @@ def create_app(
         """Download dataset from allow-listed HTTPS host. Disabled in hosted mode."""
         cfg = getattr(request.app.state, "config", {}) or {}
         hosted_mode = bool(cfg.get("hosted_mode", False) or cfg.get("general", {}).get("hosted_mode", False))
+        if "HOSTED_MODE" in os.environ:
+            hosted_mode = os.environ.get("HOSTED_MODE", "").lower() in ("true", "1", "yes")
         if hosted_mode:
             raise HTTPException(status_code=403, detail="Dataset download is disabled in hosted mode")
 

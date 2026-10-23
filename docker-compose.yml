@@ -1,0 +1,31 @@
+services:
+  argus:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: argus:latest
+    container_name: argus-app
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # Secrets and runtime flags passed from environment (never baked into image)
+      - SECRET_KEY=${SECRET_KEY:-}
+      - ALLOW_REGISTRATION=${ALLOW_REGISTRATION:-true}
+      - HOSTED_MODE=${HOSTED_MODE:-false}
+      - BASE_URL=${BASE_URL:-http://localhost:8000}
+      - ARGUS_USERS_DIR=/data/users
+      - ARGUS_AUTH_DB=/data/auth.db
+    volumes:
+      # Persistent storage volume for per-user directories, DBs, and library files
+      - argus_data:/data
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  argus_data:
+    driver: local

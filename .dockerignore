@@ -1,0 +1,52 @@
+# Version control & IDE
+.git
+.gitignore
+.github
+.vscode
+.idea
+.DS_Store
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python caches & build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Testing & linting caches
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+
+# Databases & local user data
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.argus/
+~/.argus/
+data/
+users/
+trash/
+library/
+thumbnails/
+jobs/
+drive_cache/
+bench/results/
+argus_data/
+
+# Secrets & credentials
+.env
+*.pem
+*.key
+client_secret.json
+drive_token.json

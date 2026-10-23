@@ -15,10 +15,10 @@ REPO_ROOT = Path(__file__).parent.parent
 
 
 def test_no_undefined_names_f821():
-    """ruff --select F821 must exit 0 over core/, api/, sources/."""
+    """ruff --select F821 must exit 0 over the whole repository."""
     ruff = Path(sys.executable).parent / "ruff"
     result = subprocess.run(
-        [str(ruff), "check", "--select", "F821", "core/", "api/", "sources/"],
+        [str(ruff), "check", "--select", "F821", "."],
         capture_output=True,
         text=True,
         cwd=REPO_ROOT,
