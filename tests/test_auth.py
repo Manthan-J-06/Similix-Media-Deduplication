@@ -94,12 +94,37 @@ def register_and_login(client: TestClient, email: str, password: str = "ArgusSec
 
 class TestAuthenticationAndSessions:
     def test_every_route_scanned_requires_auth(self, auth_test_app):
-        """Route scanner: scans every route in app.routes and asserts each requires auth (fails if route lacks auth)."""
+        """
+        Route scanner:
+        - Asserts '/' and '/login' are the ONLY HTML routes allowed without auth.
+          ('/' returns 302 redirecting to '/login' when unauthenticated, and 200 text/html when authenticated;
+           '/login' returns 200 text/html).
+        - Asserts every protected API route returns 401 JSON when unauthenticated (fails if any route lacks auth).
+        """
         app = auth_test_app["app"]
         client = TestClient(app)
 
-        public_paths = {
-            "/login",
+        # 1. Unauthenticated GET / redirects (302) to /login
+        resp_root = client.get("/", follow_redirects=False)
+        assert resp_root.status_code == 302, f"Expected 302 for unauthenticated /, got {resp_root.status_code}"
+        assert resp_root.headers.get("location") == "/login"
+
+        # 2. Unauthenticated GET /login serves the login HTML page
+        resp_login = client.get("/login")
+        assert resp_login.status_code == 200
+        assert "text/html" in resp_login.headers.get("content-type", "")
+
+        # 3. Authenticated GET / serves the application UI (index.html)
+        register_and_login(client, "scanner_user@argus.local")
+        resp_root_auth = client.get("/")
+        assert resp_root_auth.status_code == 200
+        assert "text/html" in resp_root_auth.headers.get("content-type", "")
+        assert "Argus" in resp_root_auth.text
+
+        # 4. Route scanner over all app routes
+        unauth_client = TestClient(app)
+        allowed_html_routes = {"/", "/login"}
+        public_api_routes = {
             "/healthz",
             "/auth/login",
             "/auth/register",
@@ -110,12 +135,24 @@ class TestAuthenticationAndSessions:
             "/redoc",
         }
 
+        discovered_html_unauth = set()
         routes_tested = 0
+
         for route in app.routes:
             if not hasattr(route, "methods"):
                 continue
             path = route.path
-            if path in public_paths:
+
+            # Identify any unauthenticated routes that serve or redirect to HTML
+            if "GET" in route.methods:
+                test_get_path = re.sub(r"\{[a-zA-Z0-9_]+\}", "1", path)
+                r_get = unauth_client.get(test_get_path, follow_redirects=False)
+                content_type = r_get.headers.get("content-type", "")
+                location = r_get.headers.get("location", "")
+                if "text/html" in content_type or (r_get.status_code in (301, 302, 307, 308) and "/login" in location):
+                    discovered_html_unauth.add(path)
+
+            if path in allowed_html_routes or path in public_api_routes:
                 continue
 
             test_path = re.sub(r"\{[a-zA-Z0-9_]+\}", "1", path)
@@ -123,11 +160,20 @@ class TestAuthenticationAndSessions:
                 if method in ("OPTIONS", "HEAD"):
                     continue
                 routes_tested += 1
-                resp = client.request(method, test_path)
+                resp = unauth_client.request(method, test_path)
                 assert resp.status_code == 401, (
                     f"Route {method} {path} (evaluated as {test_path}) returned {resp.status_code}, expected 401 Unauthorized"
                 )
+                assert resp.headers.get("content-type", "").startswith("application/json"), (
+                    f"Route {method} {path} returned non-JSON 401: {resp.headers.get('content-type')}"
+                )
+                assert "detail" in resp.json(), (
+                    f"Route {method} {path} missing 'detail' in JSON 401: {resp.text}"
+                )
 
+        assert discovered_html_unauth == allowed_html_routes, (
+            f"Expected '/' and '/login' to be the only HTML routes allowed without auth, but found: {discovered_html_unauth}"
+        )
         assert routes_tested >= 12, f"Expected to test at least 12 protected routes, tested {routes_tested}"
 
     def test_registration_validation_and_invite_only(self, auth_test_app):

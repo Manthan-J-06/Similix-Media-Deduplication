@@ -30,7 +30,7 @@ import zipfile
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -504,6 +504,14 @@ def get_current_user(request: Request) -> UserContext:
     )
 
 
+def get_optional_user(request: Request) -> UserContext | None:
+    """Return UserContext if session is valid, otherwise None without raising HTTPException."""
+    try:
+        return get_current_user(request)
+    except HTTPException:
+        return None
+
+
 def get_db(request: Request, user: UserContext = Depends(get_current_user)):
     """Provide a per-request SQLite connection for the authenticated user."""
     conn = get_connection(user.db_path)
@@ -659,7 +667,13 @@ def create_app(
             sys.stderr.write(f"ERROR: SECRET_KEY must be at least 32 characters in hosted mode (got {len(str(secret_key).strip())}). Refusing to start.\n")
             raise RuntimeError(f"SECRET_KEY must be at least 32 characters in hosted mode (got {len(str(secret_key).strip())}). Refusing to start.")
 
-    app = FastAPI(title="Argus API", version="0.1.0")
+    app = FastAPI(
+        title="Argus API",
+        version="0.1.0",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
 
     @app.middleware("http")
     async def add_security_headers(request: Request, call_next):
@@ -878,8 +892,11 @@ def create_app(
     # ==========================
 
     @app.get("/")
-    def serve_ui(user: UserContext = Depends(get_current_user)):
-        """Serve the single-file Argus web UI (requires authentication)."""
+    def serve_ui(request: Request):
+        """Serve the single-file Argus web UI if authenticated, else redirect to /login (302)."""
+        user = get_optional_user(request)
+        if not user:
+            return RedirectResponse(url="/login", status_code=302)
         if not ui_file.is_file():
             raise HTTPException(status_code=404, detail="UI index.html not found")
         return FileResponse(str(ui_file), media_type="text/html")
