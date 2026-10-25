@@ -308,10 +308,13 @@ class TestAPIServer:
         res = client.get("/thumb/1?size=128")
         assert res.status_code == 200
         assert res.headers["content-type"] == "image/jpeg"
+        assert res.headers.get("Cache-Control") == "private, max-age=3600"
+        assert "ETag" in res.headers
         assert len(res.content) > 0
 
-        cached_file = thumb_dir / "1_128.jpg"
-        assert cached_file.exists()
+        cached_files = list(thumb_dir.glob("1_*_128.jpg"))
+        assert len(cached_files) == 1
+        assert cached_files[0].exists()
 
         # Second request serves from cache
         res2 = client.get("/thumb/1?size=128")
@@ -324,14 +327,14 @@ class TestAPIServer:
         assert "not found" in res_404.json()["detail"].lower()
 
     def test_categories_endpoint(self, api_test_env):
-        """GET /categories returns label counts."""
+        """GET /categories returns visible cluster counts (omits zero-count/unclustered)."""
         client = api_test_env["client"]
         res = client.get("/categories")
         assert res.status_code == 200
         data = res.json()
-        assert data.get("landscape") == 3
-        assert data.get("food") == 2
-        assert data.get("animal") == 1
+        assert data.get("landscape") == 1
+        assert data.get("food") == 1
+        assert "animal" not in data
 
     def test_search_endpoint(self, api_test_env):
         """GET /search?q= accepts text queries."""

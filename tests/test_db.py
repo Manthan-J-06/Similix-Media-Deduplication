@@ -11,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from api.server import create_app
+from tests.test_api import make_authenticated_client
 from db.connection import get_connection, init_db
 
 
@@ -50,7 +51,14 @@ class TestDatabaseMigrations:
         real_backup = Path.home() / "dedupe_test/demo_backup2/demo.db"
         test_db = tmp_path / "old_demo.db"
 
-        if real_backup.exists():
+        has_real_backup = False
+        try:
+            with open(real_backup, "rb") as _:
+                has_real_backup = True
+        except (PermissionError, FileNotFoundError, OSError):
+            has_real_backup = False
+
+        if has_real_backup:
             shutil.copyfile(real_backup, test_db)
             # Verify it has the older schema before init_db
             raw_conn = sqlite3.connect(test_db)
@@ -61,9 +69,13 @@ class TestDatabaseMigrations:
             assert "quality_basis" not in cols_before
         else:
             # Build oldest schema from scratch with clusters and images
+            p1 = tmp_path / "img1.jpg"
+            p2 = tmp_path / "img2.jpg"
+            p1.touch()
+            p2.touch()
             raw_conn = sqlite3.connect(test_db)
             raw_conn.executescript(
-                """
+                f"""
                 CREATE TABLE images (
                     id            INTEGER PRIMARY KEY AUTOINCREMENT,
                     file_path     TEXT NOT NULL UNIQUE,
@@ -91,9 +103,9 @@ class TestDatabaseMigrations:
                 INSERT INTO clusters (id, representative_id, stage_detected, member_count, created_at)
                 VALUES (1, NULL, 0, 2, '2026-01-01T00:00:00Z');
                 INSERT INTO images (id, file_path, file_size, modified_time, width, height, format, md5, status, cluster_id, is_keeper, created_at, updated_at)
-                VALUES (1, '/path/img1.jpg', 1000, 1.0, 100, 100, 'JPEG', 'md5_1', 'clustered', 1, 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                VALUES (1, '{p1}', 1000, 1.0, 100, 100, 'JPEG', 'md5_1', 'clustered', 1, 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
                 INSERT INTO images (id, file_path, file_size, modified_time, width, height, format, md5, status, cluster_id, is_keeper, created_at, updated_at)
-                VALUES (2, '/path/img2.jpg', 1000, 1.0, 100, 100, 'JPEG', 'md5_1', 'clustered', 1, 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                VALUES (2, '{p2}', 1000, 1.0, 100, 100, 'JPEG', 'md5_1', 'clustered', 1, 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
                 """
             )
             raw_conn.commit()
@@ -114,7 +126,7 @@ class TestDatabaseMigrations:
 
         # Verify viewer API can list clusters from the migrated DB
         app = create_app(db_path=test_db)
-        client = TestClient(app)
+        client = make_authenticated_client(app)
         resp = client.get("/clusters")
         assert resp.status_code == 200
         clusters = resp.json()

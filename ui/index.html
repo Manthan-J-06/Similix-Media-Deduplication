@@ -1388,6 +1388,7 @@
               <span style="font-weight:600; color:var(--text);">${formatBytes(m.size)}</span>
             </div>
             <div style="font-size:0.75rem; color:var(--text-muted);">${m.width} &times; ${m.height} &bull; ${m.format}</div>
+            ${m.category ? `<span class="chip chip-category" title="Category">${m.category}</span>` : ""}
             <div class="status-row">
               ${statusHtml}
               ${!m.is_recommended_keeper ? `

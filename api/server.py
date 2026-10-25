@@ -75,6 +75,15 @@ def _get_thumb_lock(image_id: int, size: int) -> threading.Lock:
         return _thumb_locks[key]
 
 
+def _thumb_cache_key(image_id: int, md5: str | None, mtime: float | None, size: int) -> str:
+    """Content-derived cache filename: {image_id}_{md5[:12]}_{mtime_int}_{size}.jpg
+    Falls back to zeros when md5/mtime are absent (e.g., Drive images without metadata).
+    """
+    md5_part = (md5 or "")[:12] or "000000000000"
+    mtime_int = int(mtime or 0)
+    return f"{image_id}_{md5_part}_{mtime_int}_{size}.jpg"
+
+
 def _create_placeholder_jpeg() -> bytes:
     """Generate a small neutral gray JPEG placeholder for failed thumbnails."""
     buf = io.BytesIO()
@@ -900,6 +909,11 @@ def create_app(
             stop_user_jobs(request.app, user.id, user.jobs_dir)
             if hasattr(request.app.state, "_initialized_user_dbs"):
                 request.app.state._initialized_user_dbs.discard(user.db_path)
+            # Clear per-user thumbnail cache
+            try:
+                shutil.rmtree(user.thumb_cache_dir, ignore_errors=True)
+            except Exception:
+                pass
 
         res = delete_user_account(
             conn=request.app.state.auth_conn,
@@ -1030,7 +1044,16 @@ def create_app(
             keeper_m = next((m for m in member_dicts if m["id"] == keeper_id), None)
             cluster_cat = c_row["category"] or (keeper_m.get("category_top1") if keeper_m else None)
 
-            if category is not None and (cluster_cat or "").lower() != category.lower():
+            # Majority-vote display category
+            member_cats = [m["category_top1"] for m in member_dicts if m.get("category_top1")]
+            if member_cats:
+                from collections import Counter
+                most_common, occ = Counter(member_cats).most_common(1)[0]
+                display_category = most_common if occ > len(member_cats) / 2 else "mixed"
+            else:
+                display_category = cluster_cat
+
+            if category is not None and (display_category or "").lower() != category.lower():
                 continue
 
             if min_savings is not None:
@@ -1055,7 +1078,7 @@ def create_app(
                 "member_count": len(member_dicts),
                 "delete_safe_count": len(del_safe_ids),
                 "review_count": len(review_ids),
-                "category": cluster_cat,
+                "category": display_category,
                 "has_swap_proposal": swap_prop is not None,
                 "swap_proposal": swap_prop,
             })
@@ -1160,10 +1183,18 @@ def create_app(
         keeper_m = next((m for m in formatted_members if m["is_recommended_keeper"]), None)
         cluster_cat = c_row["category"] or (keeper_m.get("category") if keeper_m else None)
 
+        member_cats = [m.get("category") for m in formatted_members if m.get("category")]
+        if member_cats:
+            from collections import Counter
+            most_common, occ = Counter(member_cats).most_common(1)[0]
+            display_category = most_common if occ > len(member_cats) / 2 else "mixed"
+        else:
+            display_category = cluster_cat
+
         return {
             "id": c_row["id"],
             "mode": mode,
-            "category": cluster_cat,
+            "category": display_category,
             "reference_uncertain": bool(ref_unc),
             "swap_proposal": keeper_res.get("swap_proposal"),
             "members": formatted_members,
@@ -1180,7 +1211,7 @@ def create_app(
         """Serve a cached JPEG thumbnail for the given image ID. Strictly confined to user data."""
         try:
             row = conn.execute(
-                "SELECT id, file_path, source, drive_id, modified_time FROM images WHERE id = ?",
+                "SELECT id, file_path, source, drive_id, modified_time, md5 FROM images WHERE id = ?",
                 (image_id,),
             ).fetchone()
             if not row:
@@ -1233,7 +1264,11 @@ def create_app(
                                 cache_path = cache_dir / f"{image_id}_{size}.jpg"
                                 cache_dir.mkdir(parents=True, exist_ok=True)
                                 thumb_im.save(str(cache_path), format="JPEG", quality=85)
-                                return FileResponse(str(cache_path), media_type="image/jpeg")
+                                _thumb_headers = {
+                                    "Cache-Control": "private, max-age=3600",
+                                    "ETag": f'"{row["md5"] or image_id}"',
+                                }
+                                return FileResponse(str(cache_path), media_type="image/jpeg", headers=_thumb_headers)
                         except Exception as exc:
                             logger.warning(f"Could not refetch Drive thumbnail for image {image_id} ({drive_id}): {exc}")
 
@@ -1250,13 +1285,29 @@ def create_app(
 
             cache_dir = user.thumb_cache_dir
             validate_confined_user_path(cache_dir, user.root)
-            cache_path = cache_dir / f"{image_id}_{size}.jpg"
+            cache_key = _thumb_cache_key(image_id, row["md5"], row["modified_time"], size)
+            cache_path = cache_dir / cache_key
+
+            # Evict stale thumbnails for the same image_id/size but different content key
+            try:
+                for stale in cache_dir.glob(f"{image_id}_*_{size}.jpg"):
+                    if stale != cache_path:
+                        try:
+                            stale.unlink()
+                        except OSError:
+                            pass
+            except Exception:
+                pass
 
             if cache_path.is_file():
                 try:
                     st = cache_path.stat()
                     if st.st_size > 0 and st.st_mtime >= orig_path.stat().st_mtime:
-                        return FileResponse(str(cache_path), media_type="image/jpeg")
+                        _thumb_headers = {
+                            "Cache-Control": "private, max-age=3600",
+                            "ETag": f'"{row["md5"] or image_id}"',
+                        }
+                        return FileResponse(str(cache_path), media_type="image/jpeg", headers=_thumb_headers)
                 except OSError:
                     pass
 
@@ -1266,7 +1317,11 @@ def create_app(
                     try:
                         st = cache_path.stat()
                         if st.st_size > 0 and st.st_mtime >= orig_path.stat().st_mtime:
-                            return FileResponse(str(cache_path), media_type="image/jpeg")
+                            _thumb_headers = {
+                                "Cache-Control": "private, max-age=3600",
+                                "ETag": f'"{row["md5"] or image_id}"',
+                            }
+                            return FileResponse(str(cache_path), media_type="image/jpeg", headers=_thumb_headers)
                     except OSError:
                         pass
 
@@ -1288,7 +1343,11 @@ def create_app(
                     logger.exception(f"Thumbnail generation failed for image {image_id} ({orig_path}): {exc}")
                     return Response(content=PLACEHOLDER_JPEG_BYTES, media_type="image/jpeg", status_code=200)
 
-                return FileResponse(str(cache_path), media_type="image/jpeg")
+                _thumb_headers = {
+                    "Cache-Control": "private, max-age=3600",
+                    "ETag": f'"{row["md5"] or image_id}"',
+                }
+                return FileResponse(str(cache_path), media_type="image/jpeg", headers=_thumb_headers)
         except HTTPException:
             raise
         except Exception as exc:
@@ -1317,18 +1376,47 @@ def create_app(
 
     @app.get("/categories")
     def get_categories(
+        mode: str = Query("conservative"),
+        user: UserContext = Depends(get_current_user),
         conn: sqlite3.Connection = Depends(get_db),
     ) -> dict[str, int]:
-        rows = conn.execute(
-            """
-            SELECT category_top1, COUNT(*) AS count
-            FROM images
-            WHERE category_top1 IS NOT NULL AND (status IS NULL OR status != 'trashed')
-            GROUP BY category_top1
-            ORDER BY count DESC
-            """
+        """Return cluster counts per category (same visibility rules as /clusters).
+        Only clusters with >=2 live members are counted. Zero-count categories are omitted.
+        """
+        from collections import Counter
+        c_rows = conn.execute(
+            "SELECT id, representative_id, reference_uncertain, category FROM clusters ORDER BY id"
         ).fetchall()
-        return {r["category_top1"]: r["count"] for r in rows}
+
+        cat_counts: Counter = Counter()
+        for c_row in c_rows:
+            cid = c_row["id"]
+            members = conn.execute(
+                """
+                SELECT id, file_path, category_top1
+                FROM images
+                WHERE cluster_id = ? AND (status IS NULL OR status != 'trashed')
+                """,
+                (cid,),
+            ).fetchall()
+            live_members = [
+                m for m in members
+                if str(m["file_path"]).startswith("drive://") or os.path.exists(m["file_path"])
+            ]
+            if len(live_members) < 2:
+                continue
+            # Majority category among live members
+            member_cats = [m["category_top1"] for m in live_members if m["category_top1"]]
+            if member_cats:
+                from collections import Counter as _Counter
+                most_common, occ = _Counter(member_cats).most_common(1)[0]
+                display_cat = most_common if occ > len(member_cats) / 2 else "mixed"
+            else:
+                display_cat = c_row["category"] or "uncategorized"
+            if display_cat:
+                cat_counts[display_cat] += 1
+
+        return {cat: cnt for cat, cnt in sorted(cat_counts.items(), key=lambda x: -x[1]) if cnt > 0}
 
     # ==========================
     # Ledger Planning & Execution
