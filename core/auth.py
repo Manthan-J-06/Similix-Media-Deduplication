@@ -21,7 +21,7 @@ import secrets
 import shutil
 import sqlite3
 import time
-from typing import Any
+from typing import Any, Callable
 
 import bcrypt
 from fastapi import HTTPException
@@ -429,6 +429,7 @@ def delete_user_account(
     user_id: int,
     password: str,
     users_dir: Path | str,
+    on_before_delete: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Delete a user account, verifying password first, wiping the user's isolated directory and auth DB rows."""
     row = conn.execute(
@@ -441,12 +442,16 @@ def delete_user_account(
     if not verify_password(password, row["password_hash"]):
         raise HTTPException(status_code=400, detail="Incorrect password confirmation")
 
+    # If password is correct, execute pre-deletion hook (e.g. stop running/queued jobs)
+    if on_before_delete is not None:
+        on_before_delete()
+
     # 1. Remove user directory on disk
     user_path = Path(users_dir).expanduser().resolve() / str(user_id)
     if user_path.exists():
         shutil.rmtree(user_path, ignore_errors=True)
 
-    # 2. Delete rows in auth.db
+    # 2. Invalidate ALL sessions for this user and delete rows in auth.db
     with conn:
         conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM login_attempts WHERE email = ?", (row["email"],))

@@ -288,7 +288,16 @@
       }
     }
 
+    function checkUrlNotice() {
+      const params = new URLSearchParams(window.location.search);
+      const notice = params.get("notice") || params.get("message");
+      if (notice) {
+        showAlert(notice, true);
+      }
+    }
+
     loadCsrf();
+    checkUrlNotice();
   </script>
 </body>
 </html>

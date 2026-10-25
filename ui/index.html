@@ -800,6 +800,12 @@
       <button type="button" class="btn" id="btn-open-history">📜 History</button>
       <div id="user-profile-badge" style="display: inline-flex; align-items: center; gap: 8px; margin-left: 8px; padding-left: 8px; border-left: 1px solid var(--border); font-size: 13px;">
         <span id="user-email-display" style="font-weight: 500; color: var(--text-muted);"></span>
+        <div class="account-menu-wrap" style="position: relative; display: inline-block;">
+          <button type="button" class="btn" id="btn-account-menu" title="Account settings" style="padding: 4px 8px; font-size: 12px;">Account ▾</button>
+          <div class="dropdown-menu" id="account-dropdown" style="display: none; position: absolute; right: 0; top: 100%; margin-top: 4px; background: var(--panel-bg); border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 4px 12px rgba(0,0,0,0.25); z-index: 1100; min-width: 140px; padding: 4px 0;">
+            <button type="button" class="dropdown-item" id="btn-open-delete-account" style="width: 100%; text-align: left; background: none; border: none; padding: 8px 12px; font-size: 12px; color: var(--danger); cursor: pointer; display: flex; align-items: center; gap: 6px;">Delete account</button>
+          </div>
+        </div>
         <button type="button" class="btn" id="btn-logout" title="Sign out" style="padding: 4px 8px; font-size: 12px;">Sign Out</button>
       </div>
     </div>
@@ -1007,6 +1013,46 @@
         </div>
 
         <div id="source-status-msg" style="display:none; padding:8px 12px; border-radius:6px; font-size:0.82rem;"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Delete Account Confirmation Modal -->
+  <div class="modal-backdrop" id="delete-account-modal">
+    <div class="modal-box" style="max-width: 520px;">
+      <div class="modal-header">
+        <h3 class="modal-title" style="color: var(--danger);">Delete Account</h3>
+        <button type="button" class="btn" id="btn-close-delete-modal">&times;</button>
+      </div>
+      <div class="modal-body" style="display: flex; flex-direction: column; gap: 14px;">
+        <div class="modal-notice" style="border-left: 3px solid var(--danger); background: rgba(239, 68, 68, 0.08); padding: 12px; border-radius: 6px;">
+          <p style="font-weight: 600; color: var(--danger); margin-bottom: 8px;">Warning: This action is permanent and cannot be undone.</p>
+          <ul style="font-size: 0.85rem; line-height: 1.5; padding-left: 18px; color: var(--text); display: flex; flex-direction: column; gap: 6px;">
+            <li><strong>What will be deleted:</strong> all uploaded copies, clusters, trash, thumbnails, job history, and the account itself</li>
+            <li><strong>Irreversible:</strong> that this cannot be undone and the trash is deleted too</li>
+            <li><strong>Safe on your device:</strong> that original files on the user's own devices are never touched</li>
+          </ul>
+        </div>
+
+        <div style="font-size: 0.85rem; display: flex; justify-content: flex-end;">
+          <a href="/auth/export-data" id="link-download-my-data" class="download-data-link" style="color: var(--primary); text-decoration: underline;" download="argus_library.zip">Download my data (zip of library)</a>
+        </div>
+
+        <div id="delete-account-error" style="display: none; color: var(--danger); font-size: 0.85rem; padding: 8px 12px; background: rgba(239, 68, 68, 0.1); border: 1px solid var(--danger); border-radius: 6px;"></div>
+
+        <div class="form-group" style="display: flex; flex-direction: column; gap: 6px;">
+          <label for="delete-account-password" style="font-size: 0.85rem; font-weight: 500;">Enter your password to confirm:</label>
+          <input type="password" id="delete-account-password" class="search-input" style="width: 100%; box-sizing: border-box;" placeholder="Password">
+        </div>
+
+        <label style="display: flex; align-items: center; gap: 8px; font-size: 0.85rem; cursor: pointer; user-select: none;">
+          <input type="checkbox" id="delete-account-confirm-checkbox">
+          <span>I understand this is permanent</span>
+        </label>
+      </div>
+      <div class="modal-footer" style="display: flex; justify-content: flex-end; gap: 10px;">
+        <button type="button" class="btn" id="btn-cancel-delete-modal">Cancel</button>
+        <button type="button" class="btn btn-danger" id="btn-confirm-delete-account" disabled style="background: var(--danger); color: #fff;">Delete account</button>
       </div>
     </div>
   </div>
@@ -2062,6 +2108,132 @@
           await fetch("/auth/logout", { method: "POST" });
         } catch (_) {}
         window.location.href = "/login";
+      });
+    }
+
+    // Account Menu and Delete Account Modal handlers
+    const btnAccountMenu = document.getElementById("btn-account-menu");
+    const accountDropdown = document.getElementById("account-dropdown");
+    const btnOpenDeleteAccount = document.getElementById("btn-open-delete-account");
+    const deleteAccountModal = document.getElementById("delete-account-modal");
+    const btnCloseDeleteModal = document.getElementById("btn-close-delete-modal");
+    const btnCancelDeleteModal = document.getElementById("btn-cancel-delete-modal");
+    const btnConfirmDeleteAccount = document.getElementById("btn-confirm-delete-account");
+    const deleteAccountPassword = document.getElementById("delete-account-password");
+    const deleteAccountCheckbox = document.getElementById("delete-account-confirm-checkbox");
+    const deleteAccountError = document.getElementById("delete-account-error");
+
+    if (btnAccountMenu && accountDropdown) {
+      btnAccountMenu.addEventListener("click", (e) => {
+        e.stopPropagation();
+        accountDropdown.style.display = accountDropdown.style.display === "none" ? "block" : "none";
+      });
+      document.addEventListener("click", (e) => {
+        if (!accountDropdown.contains(e.target) && e.target !== btnAccountMenu) {
+          accountDropdown.style.display = "none";
+        }
+      });
+    }
+
+    function checkDeleteButtonEnabled() {
+      if (!deleteAccountPassword || !deleteAccountCheckbox || !btnConfirmDeleteAccount) return;
+      const hasPassword = deleteAccountPassword.value.trim().length > 0;
+      const isChecked = deleteAccountCheckbox.checked;
+      btnConfirmDeleteAccount.disabled = !(hasPassword && isChecked);
+    }
+
+    function openDeleteModal() {
+      if (accountDropdown) accountDropdown.style.display = "none";
+      if (deleteAccountPassword) deleteAccountPassword.value = "";
+      if (deleteAccountCheckbox) deleteAccountCheckbox.checked = false;
+      if (deleteAccountError) {
+        deleteAccountError.style.display = "none";
+        deleteAccountError.textContent = "";
+      }
+      if (btnConfirmDeleteAccount) btnConfirmDeleteAccount.disabled = true;
+      if (deleteAccountModal) {
+        deleteAccountModal.style.display = "flex";
+        if (deleteAccountPassword) deleteAccountPassword.focus();
+      }
+    }
+
+    function closeDeleteModal() {
+      if (deleteAccountModal) deleteAccountModal.style.display = "none";
+      if (deleteAccountPassword) deleteAccountPassword.value = "";
+      if (deleteAccountCheckbox) deleteAccountCheckbox.checked = false;
+      if (deleteAccountError) {
+        deleteAccountError.style.display = "none";
+        deleteAccountError.textContent = "";
+      }
+    }
+
+    if (btnOpenDeleteAccount) btnOpenDeleteAccount.addEventListener("click", openDeleteModal);
+    if (btnCloseDeleteModal) btnCloseDeleteModal.addEventListener("click", closeDeleteModal);
+    if (btnCancelDeleteModal) btnCancelDeleteModal.addEventListener("click", closeDeleteModal);
+
+    if (deleteAccountPassword) deleteAccountPassword.addEventListener("input", checkDeleteButtonEnabled);
+    if (deleteAccountCheckbox) deleteAccountCheckbox.addEventListener("change", checkDeleteButtonEnabled);
+
+    if (btnConfirmDeleteAccount) {
+      btnConfirmDeleteAccount.addEventListener("click", async () => {
+        const pw = deleteAccountPassword ? deleteAccountPassword.value : "";
+        if (!pw || !deleteAccountCheckbox || !deleteAccountCheckbox.checked) return;
+
+        btnConfirmDeleteAccount.disabled = true;
+        if (deleteAccountError) {
+          deleteAccountError.style.display = "none";
+          deleteAccountError.textContent = "";
+        }
+
+        try {
+          const tok = csrfToken || getCookie("argus_csrf");
+          const headers = {
+            "Content-Type": "application/json",
+          };
+          if (tok) {
+            headers["X-CSRF-Token"] = tok;
+          }
+
+          const res = await fetch("/auth/delete-account", {
+            method: "POST",
+            headers: headers,
+            body: JSON.stringify({ password: pw }),
+          });
+
+          let data = null;
+          try {
+            data = await res.json();
+          } catch (_) {}
+
+          if (res.ok) {
+            try {
+              localStorage.clear();
+              sessionStorage.clear();
+            } catch (_) {}
+            currentUser = null;
+            csrfToken = "";
+            window.location.href = "/login?notice=" + encodeURIComponent("Your account was deleted");
+            return;
+          }
+
+          if (deleteAccountError) {
+            if (res.status === 429) {
+              deleteAccountError.textContent = data?.detail || "Too many attempts. Please try again later.";
+            } else if (res.status === 400 || res.status === 401) {
+              deleteAccountError.textContent = data?.detail || "Incorrect password confirmation";
+            } else {
+              deleteAccountError.textContent = data?.detail || "Failed to delete account. Please try again.";
+            }
+            deleteAccountError.style.display = "block";
+          }
+          checkDeleteButtonEnabled();
+        } catch (err) {
+          if (deleteAccountError) {
+            deleteAccountError.textContent = "Network error: " + (err.message || "Failed to connect to server");
+            deleteAccountError.style.display = "block";
+          }
+          checkDeleteButtonEnabled();
+        }
       });
     }
 

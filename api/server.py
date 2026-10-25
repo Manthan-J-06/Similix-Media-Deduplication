@@ -17,6 +17,7 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -350,6 +351,39 @@ def maybe_start_next_queued_job(app: FastAPI) -> None:
             folder=target_folder,
             drive_folder_id=next_st.get("drive_folder_id"),
         )
+
+
+
+def stop_user_jobs(app: FastAPI, user_id: int, jobs_dir: Path) -> None:
+    """Terminate running worker processes and cancel queued jobs for the user before account deletion."""
+    with app.state.job_queue_lock:
+        if jobs_dir.is_dir():
+            for jf in jobs_dir.glob("*.json"):
+                st = read_job_state(jf)
+                if not st:
+                    continue
+                pid = st.get("pid")
+                if pid:
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except OSError:
+                        pass
+                st["status"] = "canceled"
+                st["stage"] = "canceled"
+                st["message"] = "Canceled due to account deletion"
+                write_job_state(jf, st)
+
+        for jid, st in list(app.state.jobs.items()):
+            if st.get("user_id") == user_id:
+                pid = st.get("pid")
+                if pid:
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except OSError:
+                        pass
+                del app.state.jobs[jid]
+
+    maybe_start_next_queued_job(app)
 
 
 def launch_pipeline_job(
@@ -862,14 +896,17 @@ def create_app(
         user: UserContext = Depends(get_current_user),
     ) -> dict[str, Any]:
         """Delete user account, isolated directory on disk, and DB rows after password confirmation."""
-        if hasattr(request.app.state, "_initialized_user_dbs"):
-            request.app.state._initialized_user_dbs.discard(user.db_path)
+        def _pre_delete():
+            stop_user_jobs(request.app, user.id, user.jobs_dir)
+            if hasattr(request.app.state, "_initialized_user_dbs"):
+                request.app.state._initialized_user_dbs.discard(user.db_path)
 
         res = delete_user_account(
             conn=request.app.state.auth_conn,
             user_id=user.user_id,
             password=req.password,
             users_dir=request.app.state.users_dir,
+            on_before_delete=_pre_delete,
         )
 
         if response is not None:
@@ -886,6 +923,28 @@ def create_app(
     ) -> dict[str, Any]:
         """Alias for /auth/delete-account using HTTP DELETE."""
         return delete_account(req, request=request, response=response, user=user)
+
+    @app.get("/auth/export-data")
+    def export_user_data(user: UserContext = Depends(get_current_user)):
+        """Generate and stream a zip archive of the authenticated user's library directory."""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            if user.library_dir.is_dir():
+                for root, _, files in os.walk(user.library_dir):
+                    for f in files:
+                        fp = Path(root) / f
+                        if not fp.is_symlink():
+                            try:
+                                arcname = fp.relative_to(user.library_dir)
+                                zf.write(fp, arcname=str(arcname))
+                            except Exception:
+                                pass
+        buf.seek(0)
+        return Response(
+            content=buf.getvalue(),
+            media_type="application/zip",
+            headers={"Content-Disposition": 'attachment; filename="argus_library.zip"'},
+        )
 
     # ==========================
     # Main Application UI

@@ -22,15 +22,18 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import sqlite3
+import subprocess
 import time
+import zipfile
 
 from fastapi.testclient import TestClient
 from PIL import Image
 import pytest
 
 from api.server import create_app, read_job_state, write_job_state
-from core.auth import get_session_user, init_auth_db, validate_confined_user_path
+from core.auth import create_session, get_session_user, init_auth_db, validate_confined_user_path
 from core.ledger import ensure_ledger_tables, plan
 from db.connection import init_db
 
@@ -621,17 +624,31 @@ class TestConfinementAndQuotas:
             assert "frame-ancestors 'none'" in csp
 
     def test_account_deletion_with_password_confirmation(self, auth_test_app):
-        """Account deletion wipes user directory and auth.db rows after password confirmation."""
+        """Account deletion stops running jobs, wipes user directory, invalidates all sessions, and leaves User B untouched."""
         app = auth_test_app["app"]
         client = TestClient(app)
         email = "to_delete@argus.local"
         password = "UserPassword123!"
 
+        # 1. Register User A
         user_info = register_and_login(client, email=email, password=password)
         user_id = user_info["user_id"]
         user_root = app.state.users_dir / str(user_id)
 
-        # Upload a test file so the user directory has physical content
+        # Insert a second session for User A directly to verify ALL sessions are wiped on deletion
+        now = time.time()
+        with app.state.auth_conn:
+            app.state.auth_conn.execute(
+                """
+                INSERT INTO sessions (user_id, token_hash, csrf_token, created_at, expires_at, last_active_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, "mock_hash_2", "mock_csrf_2", now, now + 86400, now),
+            )
+        sess_before = app.state.auth_conn.execute("SELECT id FROM sessions WHERE user_id = ?", (user_id,)).fetchall()
+        assert len(sess_before) >= 2, "Expected at least 2 active sessions for User A"
+
+        # Upload a test file so User A directory has physical content
         img_bytes = io.BytesIO()
         Image.new("RGB", (64, 64), color="blue").save(img_bytes, format="JPEG")
         img_bytes.seek(0)
@@ -644,33 +661,135 @@ class TestConfinementAndQuotas:
         assert user_root.exists()
         assert (user_root / "library" / "default" / "blue.jpg").exists()
 
-        # 1. Attempt deletion with incorrect password
-        del_wrong = client.post("/auth/delete-account", json={"password": "WrongPassword123!"})
-        assert del_wrong.status_code == 400
-        assert "incorrect password" in del_wrong.json()["detail"].lower()
-        # Verify user still exists
-        assert user_root.exists()
-        row = app.state.auth_conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
-        assert row is not None
+        # Launch a dummy running background process for User A
+        dummy_proc = subprocess.Popen([os.sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            assert dummy_proc.poll() is None, "Expected dummy process to be running"
+            job_a_id = "job_a_running"
+            job_a_data = {
+                "id": job_a_id,
+                "user_id": user_id,
+                "status": "running",
+                "stage": "quality",
+                "pid": dummy_proc.pid,
+            }
+            (user_root / "jobs").mkdir(parents=True, exist_ok=True)
+            write_job_state(user_root / "jobs" / f"{job_a_id}.json", job_a_data)
+            app.state.jobs[job_a_id] = job_a_data
 
-        # 2. Delete with correct password
-        del_ok = client.post("/auth/delete-account", json={"password": password})
-        assert del_ok.status_code == 200
-        assert del_ok.json()["status"] == "deleted"
+            # 2. Setup User B to verify User B's data is untouched
+            client_b = TestClient(app)
+            user_b = register_and_login(client_b, email="user_b_safe@argus.local", password="Password12345!")
+            user_b_id = user_b["user_id"]
+            user_b_root = app.state.users_dir / str(user_b_id)
+            img_b_bytes = io.BytesIO()
+            Image.new("RGB", (64, 64), color="red").save(img_b_bytes, format="JPEG")
+            img_b_bytes.seek(0)
+            res_b_upload = client_b.post(
+                "/sources/upload",
+                data={"project": "default"},
+                files={"files": ("red.jpg", img_b_bytes.getvalue(), "image/jpeg")},
+            )
+            assert res_b_upload.status_code == 200
+            job_b_id = "job_b_running"
+            job_b_data = {
+                "id": job_b_id,
+                "user_id": user_b_id,
+                "status": "running",
+                "stage": "cluster",
+            }
+            write_job_state(user_b_root / "jobs" / f"{job_b_id}.json", job_b_data)
+            app.state.jobs[job_b_id] = job_b_data
 
-        # 3. Verify user directory completely removed from disk
-        assert not user_root.exists()
+            # 3. Test 'Download my data' endpoint before deletion
+            export_resp = client.get("/auth/export-data")
+            assert export_resp.status_code == 200
+            assert export_resp.headers.get("content-type") == "application/zip"
+            with zipfile.ZipFile(io.BytesIO(export_resp.content)) as zf:
+                names = zf.namelist()
+                assert "default/blue.jpg" in names
 
-        # 4. Verify auth.db rows removed
-        row_user = app.state.auth_conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
-        assert row_user is None
-        sess_rows = app.state.auth_conn.execute("SELECT id FROM sessions WHERE user_id = ?", (user_id,)).fetchall()
-        assert len(sess_rows) == 0
+            # 4. Attempt deletion with incorrect password
+            del_wrong = client.post("/auth/delete-account", json={"password": "WrongPassword123!"})
+            assert del_wrong.status_code == 400
+            assert "incorrect password" in del_wrong.json()["detail"].lower()
+            # Verify User A still exists, job process is still running, sessions intact
+            assert user_root.exists()
+            assert (user_root / "library" / "default" / "blue.jpg").exists()
+            assert dummy_proc.poll() is None, "Dummy process should not be stopped on wrong password"
+            row = app.state.auth_conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
+            assert row is not None
+            sess_still = app.state.auth_conn.execute("SELECT id FROM sessions WHERE user_id = ?", (user_id,)).fetchall()
+            assert len(sess_still) == len(sess_before)
 
-        # 5. Subsequent request with previous session cookie returns 401
-        me_resp = client.get("/auth/me")
-        assert me_resp.status_code == 401
+            # 5. Delete with correct password
+            del_ok = client.post("/auth/delete-account", json={"password": password})
+            assert del_ok.status_code == 200
+            assert del_ok.json()["status"] == "deleted"
 
-        # 6. Login with previous credentials returns 401
-        login_again = client.post("/auth/login", json={"email": email, "password": password})
-        assert login_again.status_code == 401
+            # 6. Verify User A running job was terminated
+            time.sleep(0.1)
+            # Give process a moment to exit from SIGTERM
+            for _ in range(20):
+                if dummy_proc.poll() is not None:
+                    break
+                time.sleep(0.05)
+            assert dummy_proc.poll() is not None, "Expected dummy worker process to be terminated"
+            assert job_a_id not in app.state.jobs
+
+            # 7. Verify User A directory completely removed from disk
+            assert not user_root.exists()
+
+            # 8. Verify all User A auth.db rows and ALL sessions removed
+            row_user = app.state.auth_conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
+            assert row_user is None
+            sess_rows = app.state.auth_conn.execute("SELECT id FROM sessions WHERE user_id = ?", (user_id,)).fetchall()
+            assert len(sess_rows) == 0
+
+            # 9. Subsequent request with previous session cookie returns 401
+            me_resp = client.get("/auth/me")
+            assert me_resp.status_code == 401
+
+            # 10. Login with previous credentials returns 401
+            login_again = client.post("/auth/login", json={"email": email, "password": password})
+            assert login_again.status_code == 401
+
+            # 11. Assert User B's data is completely untouched
+            assert user_b_root.exists()
+            assert (user_b_root / "library" / "default" / "red.jpg").exists()
+            row_b = app.state.auth_conn.execute("SELECT id FROM users WHERE id = ?", (user_b_id,)).fetchone()
+            assert row_b is not None
+            sess_b = app.state.auth_conn.execute("SELECT id FROM sessions WHERE user_id = ?", (user_b_id,)).fetchall()
+            assert len(sess_b) >= 1
+            assert client_b.get("/auth/me").status_code == 200
+            assert job_b_id in app.state.jobs
+        finally:
+            if dummy_proc.poll() is None:
+                dummy_proc.terminate()
+                try:
+                    dummy_proc.wait(timeout=1.0)
+                except Exception:
+                    dummy_proc.kill()
+
+    def test_delete_account_ui_modal_and_confirmation_text(self):
+        """Assert ui/index.html contains the delete account modal ids and exact required confirmation statements."""
+        ui_path = Path(__file__).resolve().parent.parent / "ui" / "index.html"
+        assert ui_path.is_file(), f"Expected UI file at {ui_path}"
+        html = ui_path.read_text()
+
+        # Verify required modal IDs and elements
+        assert 'id="delete-account-modal"' in html
+        assert 'id="btn-account-menu"' in html
+        assert 'id="btn-open-delete-account"' in html
+        assert 'id="delete-account-password"' in html
+        assert 'id="delete-account-confirm-checkbox"' in html
+        assert 'id="btn-confirm-delete-account"' in html
+        assert 'id="delete-account-error"' in html
+        assert 'id="link-download-my-data"' in html
+        assert 'href="/auth/export-data"' in html
+
+        # Verify exact required plain statements from specification
+        assert "all uploaded copies, clusters, trash, thumbnails, job history, and the account itself" in html
+        assert "this cannot be undone and the trash is deleted too" in html
+        assert "original files on the user's own devices are never touched" in html
+        assert "I understand this is permanent" in html
