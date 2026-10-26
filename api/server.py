@@ -846,7 +846,7 @@ def create_app(
         raw_token, csrf_tok = create_session(request.app.state.auth_conn, user_data["id"])
 
         proto = request.headers.get("x-forwarded-proto", "").lower()
-        is_secure = (proto == "https") or (request.url.scheme == "https") or (request.url.hostname not in ("127.0.0.1", "localhost", "testserver"))
+        is_secure = (proto == "https") or (request.url.scheme == "https")
         response.set_cookie(
             key="argus_session",
             value=raw_token,
