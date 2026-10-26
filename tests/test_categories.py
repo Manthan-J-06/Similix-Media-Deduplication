@@ -30,7 +30,7 @@ from core.categories import (
     update_cluster_categories,
 )
 from core.config import load_config
-from core.embeddings import serialize_embedding
+from core.embeddings import is_clip_weights_cached, serialize_embedding
 from db.connection import get_connection, init_db
 
 
@@ -42,9 +42,13 @@ def shared_config() -> dict:
 @pytest.fixture(scope="module")
 def shared_text_cache(shared_config: dict) -> TextEmbeddingCache:
     stage2 = shared_config.get("stage2", {})
+    model_name = stage2.get("clip_model", "ViT-B-32")
+    pretrained = stage2.get("clip_pretrained", "laion2b_s34b_b79k")
+    if not is_clip_weights_cached(model_name, pretrained):
+        pytest.skip(f"CLIP weights ({model_name} / {pretrained}) not cached; skipping in CI to avoid network downloads")
     return TextEmbeddingCache(
-        model_name=stage2.get("clip_model", "ViT-B-32"),
-        pretrained=stage2.get("clip_pretrained", "laion2b_s34b_b79k"),
+        model_name=model_name,
+        pretrained=pretrained,
     )
 
 

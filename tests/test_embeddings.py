@@ -25,6 +25,7 @@ from core.embeddings import (
     CLIPEmbedder,
     deserialize_embedding,
     get_device,
+    is_clip_weights_cached,
     run_embeddings,
     serialize_embedding,
 )
@@ -37,9 +38,13 @@ def shared_embedder() -> CLIPEmbedder:
     """Share embedder model across tests to avoid reloading weights each test."""
     cfg = load_config()
     stage2_cfg = cfg.get("stage2", {})
+    model_name = stage2_cfg.get("clip_model", "ViT-B-32")
+    pretrained = stage2_cfg.get("clip_pretrained", "laion2b_s34b_b79k")
+    if not is_clip_weights_cached(model_name, pretrained):
+        pytest.skip(f"CLIP weights ({model_name} / {pretrained}) not cached; skipping in CI to avoid network downloads")
     return CLIPEmbedder(
-        model_name=stage2_cfg.get("clip_model", "ViT-B-32"),
-        pretrained=stage2_cfg.get("clip_pretrained", "laion2b_s34b_b79k"),
+        model_name=model_name,
+        pretrained=pretrained,
     )
 
 

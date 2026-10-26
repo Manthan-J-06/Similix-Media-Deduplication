@@ -45,6 +45,35 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
+def is_clip_weights_cached(
+    model_name: str = "ViT-B-32",
+    pretrained: str = "laion2b_s34b_b79k",
+) -> bool:
+    """Check if open_clip model weights are available in local cache without network access."""
+    try:
+        import open_clip.pretrained
+        cfg = open_clip.pretrained.get_pretrained_cfg(model_name, pretrained)
+        if not cfg:
+            return False
+        hf_hub = cfg.get("hf_hub")
+        if hf_hub:
+            from huggingface_hub import try_to_load_from_cache
+            repo_id = hf_hub.strip("/")
+            for fname in ("open_clip_model.safetensors", "open_clip_pytorch_model.bin"):
+                res = try_to_load_from_cache(repo_id, fname)
+                if isinstance(res, (str, Path)) and Path(res).exists():
+                    return True
+        url = cfg.get("url")
+        if url:
+            torch_hub = Path(torch.hub.get_dir()) / "checkpoints"
+            fname = Path(url).name
+            if (torch_hub / fname).exists():
+                return True
+    except Exception:
+        pass
+    return False
+
+
 class CLIPEmbedder:
     """Wrapper around open_clip model and preprocessing pipeline."""
 
