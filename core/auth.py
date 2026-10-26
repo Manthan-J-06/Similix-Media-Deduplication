@@ -20,11 +20,15 @@ import re
 import secrets
 import shutil
 import sqlite3
+import threading
 import time
 from typing import Any, Callable
 
 import bcrypt
 from fastapi import HTTPException
+
+# Thread lock for synchronizing operations on shared sqlite3 auth connection
+_auth_lock = threading.RLock()
 
 # Default rate-limiting parameters: 5 failures within 15 minutes (900 seconds)
 DEFAULT_MAX_FAILURES = 5
@@ -122,13 +126,14 @@ def check_login_rate_limit(
     clean_email = email.strip().lower()
     clean_ip = ip.strip()
 
-    row = conn.execute(
-        """
-        SELECT COUNT(*) FROM login_attempts
-        WHERE email = ? AND ip = ? AND attempted_at >= ? AND success = 0
-        """,
-        (clean_email, clean_ip, cutoff),
-    ).fetchone()
+    with _auth_lock:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) FROM login_attempts
+            WHERE email = ? AND ip = ? AND attempted_at >= ? AND success = 0
+            """,
+            (clean_email, clean_ip, cutoff),
+        ).fetchone()
 
     failure_count = row[0] if row else 0
     return failure_count < max_failures
@@ -143,14 +148,15 @@ def record_login_attempt(
     """Record an attempted login in login_attempts audit table."""
     clean_email = email.strip().lower()
     clean_ip = ip.strip()
-    with conn:
-        conn.execute(
-            """
-            INSERT INTO login_attempts (email, ip, attempted_at, success)
-            VALUES (?, ?, ?, ?)
-            """,
-            (clean_email, clean_ip, time.time(), 1 if success else 0),
-        )
+    with _auth_lock:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO login_attempts (email, ip, attempted_at, success)
+                VALUES (?, ?, ?, ?)
+                """,
+                (clean_email, clean_ip, time.time(), 1 if success else 0),
+            )
 
 
 def register_user(
@@ -176,23 +182,24 @@ def register_user(
             detail=f"Password must be at least {MIN_PASSWORD_LENGTH} characters long",
         )
 
-    # Check for existing email
-    existing = conn.execute("SELECT id FROM users WHERE email = ?", (clean_email,)).fetchone()
-    if existing:
-        raise HTTPException(status_code=400, detail="Email is already registered")
+    with _auth_lock:
+        # Check for existing email
+        existing = conn.execute("SELECT id FROM users WHERE email = ?", (clean_email,)).fetchone()
+        if existing:
+            raise HTTPException(status_code=400, detail="Email is already registered")
 
-    pw_hash = hash_password(password)
-    now = time.time()
+        pw_hash = hash_password(password)
+        now = time.time()
 
-    with conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO users (email, password_hash, created_at, is_active)
-            VALUES (?, ?, ?, 1)
-            """,
-            (clean_email, pw_hash, now),
-        )
-        user_id = cursor.lastrowid
+        with conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO users (email, password_hash, created_at, is_active)
+                VALUES (?, ?, ?, 1)
+                """,
+                (clean_email, pw_hash, now),
+            )
+            user_id = cursor.lastrowid
 
     return {
         "id": user_id,
@@ -218,10 +225,11 @@ def authenticate_user(
             detail="Too many failed login attempts. Please try again after 15 minutes.",
         )
 
-    row = conn.execute(
-        "SELECT id, email, password_hash, is_active, created_at FROM users WHERE email = ?",
-        (clean_email,),
-    ).fetchone()
+    with _auth_lock:
+        row = conn.execute(
+            "SELECT id, email, password_hash, is_active, created_at FROM users WHERE email = ?",
+            (clean_email,),
+        ).fetchone()
 
     if not row:
         record_login_attempt(conn, clean_email, clean_ip, success=False)
@@ -257,16 +265,17 @@ def create_session(
     now = time.time()
     expires_at = now + (expiry_days * 24 * 3600)
 
-    with conn:
-        # Rotate on login: invalidate all previous sessions for this user
-        conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
-        conn.execute(
-            """
-            INSERT INTO sessions (user_id, token_hash, csrf_token, created_at, expires_at, last_active_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (user_id, token_h, csrf_tok, now, expires_at, now),
-        )
+    with _auth_lock:
+        with conn:
+            # Rotate on login: invalidate all previous sessions for this user
+            conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+            conn.execute(
+                """
+                INSERT INTO sessions (user_id, token_hash, csrf_token, created_at, expires_at, last_active_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, token_h, csrf_tok, now, expires_at, now),
+            )
 
     return raw_token, csrf_tok
 
@@ -282,30 +291,39 @@ def get_session_user(
     token_h = hash_token(raw_token)
     now = time.time()
 
-    row = conn.execute(
-        """
-        SELECT s.id AS session_id, s.user_id, s.csrf_token, s.expires_at,
-               u.email, u.is_active, u.created_at AS user_created_at
-        FROM sessions s
-        JOIN users u ON u.id = s.user_id
-        WHERE s.token_hash = ?
-        """,
-        (token_h,),
-    ).fetchone()
+    with _auth_lock:
+        row = conn.execute(
+            """
+            SELECT s.id AS session_id, s.user_id, s.csrf_token, s.expires_at, s.last_active_at,
+                   u.email, u.is_active, u.created_at AS user_created_at
+            FROM sessions s
+            JOIN users u ON u.id = s.user_id
+            WHERE s.token_hash = ?
+            """,
+            (token_h,),
+        ).fetchone()
 
-    if not row:
-        return None
+        if not row:
+            return None
 
-    # Check expiration
-    if row["expires_at"] <= now or not row["is_active"]:
-        # Clean up expired session
-        with conn:
-            conn.execute("DELETE FROM sessions WHERE id = ?", (row["session_id"],))
-        return None
+        # Check expiration
+        if row["expires_at"] <= now or not row["is_active"]:
+            # Clean up expired session
+            try:
+                with conn:
+                    conn.execute("DELETE FROM sessions WHERE id = ?", (row["session_id"],))
+            except sqlite3.OperationalError:
+                pass
+            return None
 
-    # Update last_active_at
-    with conn:
-        conn.execute("UPDATE sessions SET last_active_at = ? WHERE id = ?", (now, row["session_id"]))
+        # Update last_active_at (throttled to at most once per 60 seconds to avoid write contention)
+        last_active = row["last_active_at"] if "last_active_at" in row.keys() else 0
+        if now - last_active >= 60:
+            try:
+                with conn:
+                    conn.execute("UPDATE sessions SET last_active_at = ? WHERE id = ?", (now, row["session_id"]))
+            except sqlite3.OperationalError:
+                pass
 
     return {
         "user_id": row["user_id"],
@@ -324,8 +342,9 @@ def invalidate_session(
     if not raw_token:
         return
     token_h = hash_token(raw_token)
-    with conn:
-        conn.execute("DELETE FROM sessions WHERE token_hash = ?", (token_h,))
+    with _auth_lock:
+        with conn:
+            conn.execute("DELETE FROM sessions WHERE token_hash = ?", (token_h,))
 
 
 def get_user_dirs(
@@ -432,29 +451,30 @@ def delete_user_account(
     on_before_delete: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Delete a user account, verifying password first, wiping the user's isolated directory and auth DB rows."""
-    row = conn.execute(
-        "SELECT id, email, password_hash FROM users WHERE id = ?",
-        (user_id,),
-    ).fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="User not found")
+    with _auth_lock:
+        row = conn.execute(
+            "SELECT id, email, password_hash FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found")
 
-    if not verify_password(password, row["password_hash"]):
-        raise HTTPException(status_code=400, detail="Incorrect password confirmation")
+        if not verify_password(password, row["password_hash"]):
+            raise HTTPException(status_code=400, detail="Incorrect password confirmation")
 
-    # If password is correct, execute pre-deletion hook (e.g. stop running/queued jobs)
-    if on_before_delete is not None:
-        on_before_delete()
+        # If password is correct, execute pre-deletion hook (e.g. stop running/queued jobs)
+        if on_before_delete is not None:
+            on_before_delete()
 
-    # 1. Remove user directory on disk
-    user_path = Path(users_dir).expanduser().resolve() / str(user_id)
-    if user_path.exists():
-        shutil.rmtree(user_path, ignore_errors=True)
+        # 1. Remove user directory on disk
+        user_path = Path(users_dir).expanduser().resolve() / str(user_id)
+        if user_path.exists():
+            shutil.rmtree(user_path, ignore_errors=True)
 
-    # 2. Invalidate ALL sessions for this user and delete rows in auth.db
-    with conn:
-        conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
-        conn.execute("DELETE FROM login_attempts WHERE email = ?", (row["email"],))
-        conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        # 2. Invalidate ALL sessions for this user and delete rows in auth.db
+        with conn:
+            conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+            conn.execute("DELETE FROM login_attempts WHERE email = ?", (row["email"],))
+            conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
 
-    return {"status": "deleted", "user_id": user_id, "email": row["email"]}
+        return {"status": "deleted", "user_id": user_id, "email": row["email"]}
