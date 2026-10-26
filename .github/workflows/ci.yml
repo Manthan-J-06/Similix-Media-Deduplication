@@ -19,6 +19,7 @@ jobs:
       HF_HOME: ~/.cache/huggingface
       KMP_DUPLICATE_LIB_OK: "TRUE"
       OMP_NUM_THREADS: "1"
+      ARGUS_DEVICE: "cpu"
 
     steps:
       - name: Check out repository

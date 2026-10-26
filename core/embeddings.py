@@ -40,6 +40,11 @@ from sources.local_folder import LocalFolderSource
 
 def get_device() -> torch.device:
     """Return Apple Silicon MPS device if available and built, else CPU."""
+    dev_str = os.environ.get("ARGUS_DEVICE") or os.environ.get("TORCH_DEVICE")
+    if dev_str:
+        return torch.device(dev_str)
+    if os.environ.get("CI"):
+        return torch.device("cpu")
     if torch.backends.mps.is_available() and torch.backends.mps.is_built():
         return torch.device("mps")
     return torch.device("cpu")

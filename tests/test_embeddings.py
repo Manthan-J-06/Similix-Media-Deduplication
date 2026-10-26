@@ -12,6 +12,7 @@ Requirements verified:
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 
@@ -67,7 +68,11 @@ class TestCLIPEmbedder:
     def test_device_selection(self):
         device = get_device()
         assert isinstance(device, torch.device)
-        if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+        if os.environ.get("ARGUS_DEVICE"):
+            assert device.type == os.environ["ARGUS_DEVICE"]
+        elif os.environ.get("CI"):
+            assert device.type == "cpu"
+        elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
             assert device.type == "mps"
         else:
             assert device.type == "cpu"
