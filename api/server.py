@@ -1074,6 +1074,7 @@ def create_app(
                     "file_path": keeper_m["file_path"] if keeper_m else "",
                     "file_size": keeper_m["file_size"] if keeper_m else 0,
                     "format": keeper_m["format"] if keeper_m else "",
+                    "md5": keeper_m.get("md5", "") if keeper_m else "",
                 },
                 "savings_bytes": savings_bytes,
                 "reclaimable_bytes": savings_bytes,
@@ -1172,6 +1173,7 @@ def create_app(
                 "width": m["width"],
                 "height": m["height"],
                 "format": m["format"],
+                "md5": m.get("md5", ""),
                 "match_pct": m["match_pct"],
                 "resolution_pct": m["resolution_pct"],
                 "confidence": m["confidence"],
@@ -1207,6 +1209,7 @@ def create_app(
     def get_thumbnail(
         image_id: int,
         size: int = Query(256, ge=32, le=2048),
+        v: str | None = None,
         request: Request = None,
         user: UserContext = Depends(get_current_user),
         conn: sqlite3.Connection = Depends(get_db),

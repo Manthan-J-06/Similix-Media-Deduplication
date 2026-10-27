@@ -1218,7 +1218,8 @@
         item.className = `cluster-item ${c.id === activeClusterId ? "active" : ""}`;
         item.dataset.clusterId = c.id;
 
-        const thumbUrl = c.keeper && c.keeper.id ? `/thumb/${c.keeper.id}?size=96` : "";
+        const vParam = c.keeper && c.keeper.md5 ? `&v=${c.keeper.md5.slice(0, 12)}` : "";
+        const thumbUrl = c.keeper && c.keeper.id ? `/thumb/${c.keeper.id}?size=96${vParam}` : "";
         const reclaimableText = formatBytes(c.reclaimable_bytes || c.savings_bytes || 0);
 
         item.innerHTML = `
@@ -1367,10 +1368,11 @@
         const resStr = m.resolution_pct !== null ? `${m.resolution_pct}%` : "100.0%";
 
         const isChecked = selectedImageIds.has(m.id);
+        const vParam = m.md5 ? `&v=${m.md5.slice(0, 12)}` : "";
 
         card.innerHTML = `
           <div class="member-thumb-wrap">
-            <img src="/thumb/${m.id}?size=320" alt="" loading="lazy" onerror="this.onerror=null;this.src=PLACEHOLDER_THUMB;">
+            <img src="/thumb/${m.id}?size=320${vParam}" alt="" loading="lazy" onerror="this.onerror=null;this.src=PLACEHOLDER_THUMB;">
             <div class="card-top-badges">
               ${recHtml}
               ${verifiedHtml}
