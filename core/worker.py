@@ -332,7 +332,8 @@ def run_pipeline(
             message="Clustering candidate duplicates...",
         )
         if _stage_needs_cluster(conn):
-            run_stage2_clustering(conn, cfg)
+            user_index_path = Path(db_path).with_suffix(".faiss")
+            run_stage2_clustering(conn, cfg, index_path=user_index_path)
         else:
             logger.info("Stage 2 (cluster) already complete — skipping.")
 
@@ -459,12 +460,20 @@ def run_pipeline(
             )
     except Exception as exc:
         logger.exception("Pipeline failed at stage '%s': %s", current_stage, exc)
+        err_detail = str(exc)
+        exc_type = type(exc).__name__
+        if not err_detail:
+            err_msg = exc_type
+        elif exc_type in ("KeyError", "IndexError", "ValueError", "TypeError") and not err_detail.startswith(exc_type):
+            err_msg = f"{exc_type}: {err_detail}"
+        else:
+            err_msg = err_detail
         update_job_file(
             job_file,
             status="failed",
             stage=current_stage,
-            error=str(exc),
-            message=f"Pipeline failed at stage '{current_stage}': {exc}",
+            error=err_msg,
+            message=f"Pipeline failed at stage '{current_stage}': {err_msg}",
             slowest_clusters=slowest_5_records if slowest_5_records else None,
         )
     finally:

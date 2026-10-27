@@ -296,13 +296,16 @@ def _start_job_process(
     env["NUMEXPR_NUM_THREADS"] = "2"
     env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
+    log_file_path = job_file.with_suffix(".log")
+    log_f = open(log_file_path, "a", encoding="utf-8")
     proc = subprocess.Popen(
         cmd,
         env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=log_f,
+        stderr=subprocess.STDOUT,
         start_new_session=True,
     )
+    log_f.close()
     st = read_job_state(job_file) or {}
     st["pid"] = proc.pid
     write_job_state(job_file, st)

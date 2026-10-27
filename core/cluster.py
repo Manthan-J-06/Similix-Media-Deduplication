@@ -97,8 +97,18 @@ def run_stage2_clustering(
     hamming_threshold = int(config.get("stage1", {}).get("hamming_threshold", 10))
 
     if index_path is None:
-        db_path = config.get("general", {}).get("db_path", "argus.db")
-        index_path = stage2_cfg.get("faiss_index_path", str(Path(db_path).with_suffix(".faiss")))
+        conn_db_path = None
+        try:
+            db_row = conn.execute("PRAGMA database_list").fetchone()
+            if db_row:
+                file_val = db_row["file"] if "file" in db_row.keys() else db_row[2]
+                if file_val:
+                    conn_db_path = file_val
+        except Exception:
+            pass
+        if not conn_db_path:
+            conn_db_path = config.get("general", {}).get("db_path", "argus.db")
+        index_path = stage2_cfg.get("faiss_index_path") or str(Path(conn_db_path).with_suffix(".faiss"))
 
     # 1. Build or incrementally update the FAISS index
     if index is None:
@@ -129,7 +139,6 @@ def run_stage2_clustering(
     candidate_pairs = retrieve_candidate_pairs(
         index, conn, config, k=k, cosine_threshold=cosine_threshold
     )
-    res.candidates_found = len(candidate_pairs)
 
     # Load all embedded images metadata into memory for fast lookup
     rows = conn.execute(
@@ -156,6 +165,13 @@ def run_stage2_clustering(
                 v_list.append(deserialize_embedding(blob).astype(np.float32))
         if v_list:
             vec_map[img_id] = v_list
+
+    # Defensive check: ensure candidate pairs strictly reference existing images in img_map
+    candidate_pairs = [
+        (id1, id2, sim) for id1, id2, sim in candidate_pairs
+        if id1 in img_map and id2 in img_map
+    ]
+    res.candidates_found = len(candidate_pairs)
 
     def get_sim(id1: int, id2: int) -> float:
         if id1 == id2:
@@ -343,11 +359,12 @@ def run_stage2_clustering(
     # 6. Group remaining unclustered images into new Stage 2 clusters with anti-chaining
     adj: dict[int, set[int]] = defaultdict(set)
     for id1, id2, sim in candidate_pairs:
-        if img_map.get(id1, {}).get("cluster_id") is None and img_map.get(id2, {}).get("cluster_id") is None:
-            adj[id1].add(id2)
-            adj[id2].add(id1)
+        if id1 in img_map and id2 in img_map:
+            if img_map[id1].get("cluster_id") is None and img_map[id2].get("cluster_id") is None:
+                adj[id1].add(id2)
+                adj[id2].add(id1)
 
-    unclustered_pool = {img_id for img_id in adj if img_map[img_id].get("cluster_id") is None}
+    unclustered_pool = {img_id for img_id in adj if img_id in img_map and img_map[img_id].get("cluster_id") is None}
 
     while unclustered_pool:
         # Seed from the candidate with the highest keeper score

@@ -432,3 +432,42 @@ class TestBestMatchingRepresentativeAssignment:
         assert u_row["cluster_id"] == c2
         assert u_row["confidence"] >= 0.99 or u_row["confidence"] >= 99.0
 
+
+class TestStage2ForeignIndexResilience:
+    """
+    Ensure Stage 2 clustering handles external or stale FAISS index IDs gracefully
+    without raising KeyError when candidate pairs contain IDs not present in the current database.
+    """
+
+    def test_stale_index_id_does_not_raise_keyerror(self, tmp_path):
+        db_path = tmp_path / "test_stale.db"
+        conn = init_db(db_path)
+        dim = 512
+        v = np.ones(dim, dtype=np.float32)
+        v /= np.linalg.norm(v)
+
+        # Insert 2 images in this db
+        conn.execute("INSERT INTO images (id, file_path, clip_vector, status) VALUES (1, 'img1.jpg', ?, 'embedded')", (serialize_embedding(v),))
+        conn.execute("INSERT INTO images (id, file_path, clip_vector, status) VALUES (2, 'img2.jpg', ?, 'embedded')", (serialize_embedding(v),))
+        conn.commit()
+
+        # Build an index with a foreign ID 999
+        faiss_path = tmp_path / "test_foreign.faiss"
+        from core.index import FlatIPIndex
+        idx = FlatIPIndex(dim)
+        idx.add([1, 2, 999], np.vstack([v, v, v]))
+        idx.save(faiss_path)
+
+        cfg = {
+            "stage2": {
+                "cosine_threshold": 0.90,
+                "faiss_k": 10,
+                "embedding_dim": dim,
+            }
+        }
+
+        # Should complete without KeyError: 999
+        res = run_stage2_clustering(conn, cfg, index=idx, index_path=faiss_path)
+        assert res.clusters_created >= 1
+
+
