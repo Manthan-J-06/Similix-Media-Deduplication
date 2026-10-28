@@ -44,7 +44,13 @@ Expected output: `OK`
 ### 4. Run the test suite
 
 ```bash
-pytest
+# Unit & integration tests
+pytest --ignore=tests/e2e
+
+# End-to-end browser test (Playwright Chromium)
+pip install playwright pytest-playwright
+playwright install chromium
+pytest tests/e2e/ -v
 ```
 
 ---

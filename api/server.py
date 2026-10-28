@@ -510,6 +510,7 @@ def get_current_user(request: Request) -> UserContext:
             token = auth_h[7:].strip()
 
     if not token:
+        logger.warning("Auth failure (401): No session cookie or Bearer token on %s %s", request.method, request.url.path)
         raise HTTPException(status_code=401, detail="Authentication required")
 
     auth_conn = getattr(request.app.state, "auth_conn", None)
@@ -518,6 +519,7 @@ def get_current_user(request: Request) -> UserContext:
 
     session_data = get_session_user(auth_conn, token)
     if not session_data:
+        logger.warning("Auth failure (401): Invalid or expired session token on %s %s", request.method, request.url.path)
         raise HTTPException(status_code=401, detail="Invalid or expired session")
 
     # Enforce CSRF token on every POST request except public login/register
@@ -526,6 +528,7 @@ def get_current_user(request: Request) -> UserContext:
         if path not in ("/auth/login", "/auth/register", "/auth/csrf"):
             csrf_header = request.headers.get("X-CSRF-Token") or request.headers.get("x-csrf-token")
             if not csrf_header or not secrets.compare_digest(csrf_header, session_data["csrf_token"]):
+                logger.warning("Auth failure (403): Missing or invalid CSRF token on %s %s (has_csrf: %s)", request.method, request.url.path, bool(csrf_header))
                 raise HTTPException(status_code=403, detail="Invalid or missing CSRF token")
 
     user_id = session_data["user_id"]
@@ -696,6 +699,17 @@ def create_app(
             "base-uri 'self'; "
             "form-action 'self';"
         )
+        # Requirement 3: All JSON API responses (/clusters, /clusters/{id}, /categories, /jobs/*,
+        # /history, /auth/me) must send Cache-Control: no-store. Only /thumb may be cached.
+        path = request.url.path
+        if not path.startswith("/thumb/"):
+            content_type = response.headers.get("content-type", "")
+            if (
+                path.startswith(("/clusters", "/categories", "/jobs", "/history", "/auth", "/plan", "/apply", "/undo", "/sources"))
+                or "application/json" in content_type
+            ):
+                response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+                response.headers["Pragma"] = "no-cache"
         return response
 
     allowed_origins = [
@@ -1331,14 +1345,18 @@ def create_app(
             except Exception:
                 pass
 
+            etag = f'"{row["md5"] or image_id}"'
+            _thumb_headers = {
+                "Cache-Control": "private, max-age=3600",
+                "ETag": etag,
+            }
+            if request and request.headers.get("if-none-match") == etag and cache_path.is_file():
+                return Response(status_code=304, headers=_thumb_headers)
+
             if cache_path.is_file():
                 try:
                     st = cache_path.stat()
                     if st.st_size > 0 and st.st_mtime >= orig_path.stat().st_mtime:
-                        _thumb_headers = {
-                            "Cache-Control": "private, max-age=3600",
-                            "ETag": f'"{row["md5"] or image_id}"',
-                        }
                         return FileResponse(str(cache_path), media_type="image/jpeg", headers=_thumb_headers)
                 except OSError:
                     pass
@@ -1905,6 +1923,22 @@ def create_app(
         conn: sqlite3.Connection = Depends(get_db),
     ) -> dict[str, Any]:
         """Re-run the deduplication pipeline on existing user sources."""
+        has_gdrive = conn.execute("SELECT 1 FROM images WHERE source = 'gdrive' LIMIT 1").fetchone() is not None
+        source_type = "drive" if has_gdrive else "local"
+        job_id = launch_pipeline_job(request.app, user=user, source_type=source_type, folder=user.library_dir)
+        return {
+            "job_id": job_id,
+            "status": "queued",
+            "source_type": source_type,
+        }
+
+    @app.post("/categories/run")
+    def run_categorization_job(
+        request: Request = None,
+        user: UserContext = Depends(get_current_user),
+        conn: sqlite3.Connection = Depends(get_db),
+    ) -> dict[str, Any]:
+        """Trigger semantic categorization stage for the user's images."""
         has_gdrive = conn.execute("SELECT 1 FROM images WHERE source = 'gdrive' LIMIT 1").fetchone() is not None
         source_type = "drive" if has_gdrive else "local"
         job_id = launch_pipeline_job(request.app, user=user, source_type=source_type, folder=user.library_dir)

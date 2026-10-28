@@ -467,8 +467,23 @@ def run_pipeline(
             logger.info("Stage 5 (categorize) already complete — skipping.")
 
         # ── Finalize ──
-        images_after = conn.execute("SELECT COUNT(*) FROM images").fetchone()[0]
-        clusters_after = conn.execute("SELECT COUNT(*) FROM clusters").fetchone()[0]
+        conn.commit()
+
+        # Verification step (Requirement 4): Open a fresh connection, verify all writes are committed
+        # and readable from an independent connection before reporting 'completed'.
+        verify_conn = get_connection(db_path)
+        try:
+            verify_conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+            v_images = verify_conn.execute("SELECT COUNT(*) FROM images").fetchone()[0]
+            v_clusters = verify_conn.execute("SELECT COUNT(*) FROM clusters").fetchone()[0]
+            v_categories = verify_conn.execute(
+                "SELECT COUNT(*) FROM images WHERE category_top1 IS NOT NULL AND (status IS NULL OR status != 'skipped')"
+            ).fetchone()[0]
+        finally:
+            verify_conn.close()
+
+        images_after = v_images
+        clusters_after = v_clusters
         images_added = max(0, images_after - images_before)
         clusters_created = max(0, clusters_after - clusters_before)
         skipped_count = len(all_warnings)
@@ -495,6 +510,9 @@ def run_pipeline(
             skipped_files=all_warnings,
             skipped_count=skipped_count,
             total_images=images_after,
+            verified_images=v_images,
+            verified_clusters=v_clusters,
+            verified_categories=v_categories,
         )
     except Exception as exc:
         import traceback
@@ -544,7 +562,10 @@ def run_pipeline(
         )
     finally:
         heartbeat.stop()
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def main():

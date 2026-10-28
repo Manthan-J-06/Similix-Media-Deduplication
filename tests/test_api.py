@@ -994,10 +994,13 @@ class TestAPIServer:
         assert resp.status_code == 200
         assert resp.json() == {}
 
-        # UI index.html contains "Not categorized yet" handling
+        # UI index.html contains explanatory message when categories not computed
         ui_resp = client.get("/")
         assert ui_resp.status_code == 200
-        assert "Not categorized yet" in ui_resp.text
+        assert (
+            "Categories are computed after processing" in ui_resp.text
+            or "Not categorized yet" in ui_resp.text
+        )
 
     def test_concurrent_clusters_requests_during_active_job(self, api_test_env):
         """
@@ -1237,6 +1240,66 @@ class TestAPIServer:
         # Check corrupt files are listed in warnings
         warn_str = " ".join(job_data["warnings"])
         assert "corrupt" in warn_str.lower()
+
+    def test_json_api_cache_control_no_store_headers(self, api_test_env):
+        """
+        All JSON API responses (/clusters, /clusters/{id}, /categories, /jobs/*, /history, /auth/me)
+        must send Cache-Control: no-store. Only /thumb may be cached (private, with ETag).
+        """
+        client = api_test_env["client"]
+
+        endpoints = [
+            "/clusters",
+            "/clusters/1",
+            "/categories",
+            "/jobs/active",
+            "/history",
+            "/auth/me",
+        ]
+        for ep in endpoints:
+            res = client.get(ep)
+            assert res.status_code == 200, f"{ep} returned {res.status_code}: {res.text}"
+            cc = res.headers.get("cache-control", "").lower()
+            assert "no-store" in cc, f"{ep} missing Cache-Control: no-store (got '{cc}')"
+
+        # /thumb/{id} must be cached private with ETag
+        thumb_res = client.get("/thumb/1")
+        assert thumb_res.status_code == 200
+        thumb_cc = thumb_res.headers.get("cache-control", "").lower()
+        assert "private" in thumb_cc, f"/thumb/1 Cache-Control must be private (got '{thumb_cc}')"
+        assert "no-store" not in thumb_cc, f"/thumb/1 must not be no-store (got '{thumb_cc}')"
+        etag = thumb_res.headers.get("etag")
+        assert etag, "/thumb/1 must return an ETag header"
+
+        # Subsequent conditional GET with If-None-Match should return 304
+        cond_res = client.get("/thumb/1", headers={"If-None-Match": etag})
+        assert cond_res.status_code == 304
+        assert "private" in cond_res.headers.get("cache-control", "").lower()
+
+    def test_repeated_mode_switching_20_times(self, api_test_env):
+        """
+        Switch modes repeatedly right after a job completes (or against active user with clusters).
+        Every mode switch must re-fetch the list AND the open cluster, returning 200 consistently.
+        """
+        client = api_test_env["client"]
+        modes = ["conservative", "balanced", "aggressive"]
+
+        for i in range(20):
+            target_mode = modes[i % len(modes)]
+            # Re-fetch list
+            res_list = client.get(f"/clusters?mode={target_mode}")
+            assert res_list.status_code == 200, f"Iteration {i} mode {target_mode} /clusters failed: {res_list.text}"
+            data_list = res_list.json()
+            assert len(data_list) >= 1
+
+            # Re-fetch open cluster
+            cluster_id = data_list[0]["id"]
+            res_detail = client.get(f"/clusters/{cluster_id}?mode={target_mode}")
+            assert res_detail.status_code == 200, f"Iteration {i} mode {target_mode} /clusters/{cluster_id} failed: {res_detail.text}"
+            data_detail = res_detail.json()
+            assert data_detail["id"] == cluster_id
+            assert data_detail["mode"] == target_mode
+            assert len(data_detail["members"]) >= 2
 
 
 def _patch_fake_embedder(monkeypatch):

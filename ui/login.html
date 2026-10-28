@@ -3,7 +3,10 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Argus — Authentication</title>
+  <title>Argus — Sign In</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M2 16C5.5 8.5 13 5 16 5C19 5 26.5 8.5 30 16C26.5 23.5 19 27 16 27C13 27 5.5 23.5 2 16Z' stroke='%232DD4BF' stroke-width='2.5' fill='none'/%3E%3Ccircle cx='16' cy='16' r='6.5' fill='%230B1B3A' stroke='%232DD4BF' stroke-width='1.2'/%3E%3Crect x='13.5' y='13.5' width='2' height='2' rx='0.4' fill='%232DD4BF'/%3E%3Crect x='16.5' y='13.5' width='2' height='2' rx='0.4' fill='%23FFFFFF'/%3E%3Crect x='13.5' y='16.5' width='2' height='2' rx='0.4' fill='%23FFFFFF'/%3E%3Crect x='16.5' y='16.5' width='2' height='2' rx='0.4' fill='%232DD4BF'/%3E%3C/svg%3E">
+  <link rel="icon" type="image/png" sizes="32x32" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAwElEQVR4nGNgGAWjYBSMdMBIimLdK/v/E6Puso4j0eYyUstSch3DSIrFyIahy+OTw+cQRkKWo2uEyd1zr0bRo7SzFa96XI5gxGU5NsUgOXSL0QHIIbj0YjOXiVjLKQUwM9Gjh4lYy9F9DwtyEPjy5CicDVKDK+FicwQTuT5CdgyPjDW5xjCQ7QBqASZyNSIHO3J0kAoYkTmkpgNScgEu85mISanUALg8x4hP8YAURIOiKB4UlRG9quNRMApGwSgAAGs1jtJamNHRAAAAAElFTkSuQmCC">
+  <link rel="apple-touch-icon" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAwElEQVR4nGNgGAWjYBSMdMBIimLdK/v/E6Puso4j0eYyUstSch3DSIrFyIahy+OTw+cQRkKWo2uEyd1zr0bRo7SzFa96XI5gxGU5NsUgOXSL0QHIIbj0YjOXiVjLKQUwM9Gjh4lYy9F9DwtyEPjy5CicDVKDK+FicwQTuT5CdgyPjDW5xjCQ7QBqASZyNSIHO3J0kAoYkTmkpgNScgEu85mISanUALg8x4hP8YAURIOiKB4UlRG9quNRMApGwSgAAGs1jtJamNHRAAAAAElFTkSuQmCC">
   <style>
     :root {
       --bg: #0f172a;
@@ -60,16 +63,28 @@
     .brand {
       text-align: center;
       margin-bottom: 2rem;
+      display: flex;
+      justify-content: center;
+      align-items: center;
     }
-    .brand h1 {
-      font-size: 1.75rem;
-      font-weight: 700;
-      letter-spacing: -0.025em;
-      margin-bottom: 0.35rem;
+    .argus-logo {
+      height: 36px;
+      display: inline-block;
+      vertical-align: middle;
     }
-    .brand p {
-      font-size: 0.875rem;
-      color: var(--text-muted);
+    .eye-pupil {
+      fill: #0B1B3A;
+    }
+    .argus-wordmark {
+      fill: #0B1B3A;
+    }
+    @media (prefers-color-scheme: dark) {
+      .eye-pupil {
+        fill: #1E293B;
+      }
+      .argus-wordmark {
+        fill: #F8FAFC;
+      }
     }
     .tabs {
       display: flex;
@@ -165,8 +180,15 @@
 <body>
   <div class="auth-card">
     <div class="brand">
-      <h1>Argus</h1>
-      <p>Local-First Image Deduplication</p>
+      <svg class="argus-logo" viewBox="0 0 128 32" height="36" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="ARGUS">
+        <path d="M3 16C7 8.5 16 4.5 24 4.5C32 4.5 41 8.5 45 16C41 23.5 32 27.5 24 27.5C16 27.5 7 23.5 3 16Z" stroke="#2DD4BF" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="24" cy="16" r="6.5" class="eye-pupil" fill="#0B1B3A" stroke="#2DD4BF" stroke-width="1.2"/>
+        <rect x="21.5" y="13.5" width="2" height="2" rx="0.4" fill="#2DD4BF"/>
+        <rect x="24.5" y="13.5" width="2" height="2" rx="0.4" fill="#FFFFFF"/>
+        <rect x="21.5" y="16.5" width="2" height="2" rx="0.4" fill="#FFFFFF"/>
+        <rect x="24.5" y="16.5" width="2" height="2" rx="0.4" fill="#2DD4BF"/>
+        <text x="54" y="23" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="20" font-weight="800" letter-spacing="0.14em" class="argus-wordmark" fill="#0B1B3A">ARGUS</text>
+      </svg>
     </div>
 
     <div class="tabs">

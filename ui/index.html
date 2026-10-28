@@ -3,7 +3,10 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Argus — Image Deduplication</title>
+  <title>Argus — Duplicate Media Cleaner</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M2 16C5.5 8.5 13 5 16 5C19 5 26.5 8.5 30 16C26.5 23.5 19 27 16 27C13 27 5.5 23.5 2 16Z' stroke='%232DD4BF' stroke-width='2.5' fill='none'/%3E%3Ccircle cx='16' cy='16' r='6.5' fill='%230B1B3A' stroke='%232DD4BF' stroke-width='1.2'/%3E%3Crect x='13.5' y='13.5' width='2' height='2' rx='0.4' fill='%232DD4BF'/%3E%3Crect x='16.5' y='13.5' width='2' height='2' rx='0.4' fill='%23FFFFFF'/%3E%3Crect x='13.5' y='16.5' width='2' height='2' rx='0.4' fill='%23FFFFFF'/%3E%3Crect x='16.5' y='16.5' width='2' height='2' rx='0.4' fill='%232DD4BF'/%3E%3C/svg%3E">
+  <link rel="icon" type="image/png" sizes="32x32" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAwElEQVR4nGNgGAWjYBSMdMBIimLdK/v/E6Puso4j0eYyUstSch3DSIrFyIahy+OTw+cQRkKWo2uEyd1zr0bRo7SzFa96XI5gxGU5NsUgOXSL0QHIIbj0YjOXiVjLKQUwM9Gjh4lYy9F9DwtyEPjy5CicDVKDK+FicwQTuT5CdgyPjDW5xjCQ7QBqASZyNSIHO3J0kAoYkTmkpgNScgEu85mISanUALg8x4hP8YAURIOiKB4UlRG9quNRMApGwSgAAGs1jtJamNHRAAAAAElFTkSuQmCC">
+  <link rel="apple-touch-icon" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAwElEQVR4nGNgGAWjYBSMdMBIimLdK/v/E6Puso4j0eYyUstSch3DSIrFyIahy+OTw+cQRkKWo2uEyd1zr0bRo7SzFa96XI5gxGU5NsUgOXSL0QHIIbj0YjOXiVjLKQUwM9Gjh4lYy9F9DwtyEPjy5CicDVKDK+FicwQTuT5CdgyPjDW5xjCQ7QBqASZyNSIHO3J0kAoYkTmkpgNScgEu85mISanUALg8x4hP8YAURIOiKB4UlRG9quNRMApGwSgAAGs1jtJamNHRAAAAAElFTkSuQmCC">
   <style>
     :root {
       --bg: #f8fafc;
@@ -77,20 +80,25 @@
       display: flex;
       align-items: center;
       gap: 10px;
-      font-weight: 700;
-      font-size: 1.15rem;
-      letter-spacing: -0.5px;
     }
-    .brand-icon {
-      width: 26px;
-      height: 26px;
-      background: var(--primary);
-      border-radius: 6px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      color: #fff;
-      font-size: 14px;
+    .argus-logo {
+      height: 28px;
+      display: inline-block;
+      vertical-align: middle;
+    }
+    .eye-pupil {
+      fill: #0B1B3A;
+    }
+    .argus-wordmark {
+      fill: #0B1B3A;
+    }
+    @media (prefers-color-scheme: dark) {
+      .eye-pupil {
+        fill: #1E293B;
+      }
+      .argus-wordmark {
+        fill: #F8FAFC;
+      }
     }
 
     /* Mode Slider / Switcher */
@@ -126,12 +134,29 @@
       cursor: pointer;
       transition: all 0.15s ease;
     }
-    .mode-btn:hover { color: var(--text); }
+    .mode-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .mode-btn:hover:not(:disabled) { color: var(--text); }
     .mode-btn.active {
       background: var(--panel-bg);
       color: var(--primary);
       font-weight: 600;
       box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+    .spinner-inline {
+      display: inline-block;
+      width: 14px;
+      height: 14px;
+      border: 2px solid var(--border);
+      border-top-color: var(--primary);
+      border-radius: 50%;
+      animation: spin 0.6s linear infinite;
+      vertical-align: middle;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
     }
 
     /* Header Actions */
@@ -780,8 +805,15 @@
   <!-- Top App Header -->
   <header>
     <div class="brand">
-      <div class="brand-icon">A</div>
-      <span>ARGUS</span>
+      <svg class="argus-logo" viewBox="0 0 128 32" height="28" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="ARGUS">
+        <path d="M3 16C7 8.5 16 4.5 24 4.5C32 4.5 41 8.5 45 16C41 23.5 32 27.5 24 27.5C16 27.5 7 23.5 3 16Z" stroke="#2DD4BF" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="24" cy="16" r="6.5" class="eye-pupil" fill="#0B1B3A" stroke="#2DD4BF" stroke-width="1.2"/>
+        <rect x="21.5" y="13.5" width="2" height="2" rx="0.4" fill="#2DD4BF"/>
+        <rect x="24.5" y="13.5" width="2" height="2" rx="0.4" fill="#FFFFFF"/>
+        <rect x="21.5" y="16.5" width="2" height="2" rx="0.4" fill="#FFFFFF"/>
+        <rect x="24.5" y="16.5" width="2" height="2" rx="0.4" fill="#2DD4BF"/>
+        <text x="54" y="23" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="20" font-weight="800" letter-spacing="0.14em" class="argus-wordmark" fill="#0B1B3A">ARGUS</text>
+      </svg>
     </div>
 
     <!-- Mode Slider (Conservative / Balanced / Aggressive) -->
@@ -792,6 +824,7 @@
         <button type="button" class="mode-btn" data-mode="balanced" id="mode-balanced">Balanced</button>
         <button type="button" class="mode-btn" data-mode="aggressive" id="mode-aggressive">Aggressive</button>
       </div>
+      <span id="mode-spinner" class="spinner-inline" style="display: none; margin-left: 4px; margin-right: 4px;" title="Loading mode..."></span>
     </div>
 
     <div class="header-actions">
@@ -820,6 +853,7 @@
     <div style="width: 100%; background: var(--border); height: 6px; border-radius: 3px; overflow: hidden;">
       <div id="job-progress-fill" style="width: 0%; height: 100%; background: #2563eb; transition: width 0.3s;"></div>
     </div>
+    <div id="job-summary-details" style="display: none; margin-top: 6px; font-size: 12px; color: var(--text-muted);"></div>
   </div>
 
   <!-- Main View -->
@@ -841,6 +875,9 @@
             <option value="count">Sort: Copies</option>
             <option value="id">Sort: Cluster ID</option>
           </select>
+        </div>
+        <div id="categorize-now-wrap" style="display: none; margin-top: 4px; margin-bottom: 4px;">
+          <button type="button" class="btn btn-secondary btn-sm" id="btn-categorize-now" style="width: 100%; font-size: 11px; padding: 5px 8px; font-weight: 500;">Categorize now</button>
         </div>
         <div class="filter-row">
           <label class="checkbox-label">
@@ -1141,74 +1178,71 @@
       return parts[parts.length - 1];
     }
 
-    // Load Categories for filter
-    async function loadCategories() {
-      try {
-        const res = await fetch("/categories");
-        if (!res.ok) return;
-        const cats = await res.json();
-        const sel = document.getElementById("category-filter");
-        const entries = Object.entries(cats);
-        if (entries.length === 0) {
-          sel.innerHTML = '<option value="" disabled selected>Not categorized yet</option>';
-          return;
+    function escapeHtml(str) {
+      if (str === null || str === undefined) return "";
+      return String(str)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+    }
+
+    function renderCategoriesDropdown(cats) {
+      const sel = document.getElementById("category-filter");
+      const catWrap = document.getElementById("categorize-now-wrap");
+      const prevVal = sel.value;
+      const entries = Object.entries(cats || {});
+
+      if (entries.length === 0) {
+        // Not categorized yet: show explanatory message and Categorize now button
+        sel.innerHTML = '<option value="" disabled selected>Categories are computed after processing</option>';
+        if (catWrap) catWrap.style.display = "block";
+        return;
+      }
+
+      if (catWrap) catWrap.style.display = "none";
+      sel.innerHTML = '<option value="">All Categories</option>';
+      let foundPrev = false;
+      for (const [name, count] of entries) {
+        const opt = document.createElement("option");
+        opt.value = name;
+        opt.textContent = `${name} (${count})`;
+        if (name === prevVal) {
+          opt.selected = true;
+          foundPrev = true;
         }
-        sel.innerHTML = '<option value="">All Categories</option>';
-        for (const [name, count] of entries) {
-          const opt = document.createElement("option");
-          opt.value = name;
-          opt.textContent = `${name} (${count})`;
-          sel.appendChild(opt);
-        }
-      } catch (err) {
-        console.error("Failed to load categories:", err);
+        sel.appendChild(opt);
+      }
+      if (!foundPrev && prevVal) {
+        sel.value = "";
       }
     }
 
-    // Load Cluster List
-    async function loadClusters() {
-      const cat = document.getElementById("category-filter").value;
-      const sort = document.getElementById("sort-select").value;
-      const hasSavings = document.getElementById("has-savings-toggle").checked;
+    function showClusterListError(message, retryFn) {
+      const container = document.getElementById("cluster-list");
+      container.innerHTML = `
+        <div style="padding:24px 16px; text-align:center; color:var(--danger); font-size:0.85rem;">
+          <p style="margin-bottom:8px;">Failed to load clusters: ${escapeHtml(message)}</p>
+          <button type="button" class="btn btn-secondary btn-sm" id="btn-retry-list">Retry</button>
+        </div>
+      `;
+      const retryBtn = document.getElementById("btn-retry-list");
+      if (retryBtn && retryFn) retryBtn.addEventListener("click", retryFn);
+    }
 
-      let url = `/clusters?mode=${encodeURIComponent(currentMode)}&sort=${encodeURIComponent(sort)}`;
-      if (cat) url += `&category=${encodeURIComponent(cat)}`;
-
-      try {
-        const res = await fetch(url);
-        if (!res.ok) throw new Error("Failed to load clusters");
-        const totalHeader = res.headers.get("X-Total-Images");
-        if (totalHeader) window._totalImagesCount = parseInt(totalHeader, 10);
-        let clusters = await res.json();
-
-        if (hasSavings) {
-          clusters = clusters.filter(c => (c.reclaimable_bytes || c.savings_bytes || 0) > 0);
-        }
-
-        clustersData = clusters;
-        renderClusterList(clusters, window._totalImagesCount);
-
-        // If no active cluster or active is not in list, pick first
-        if (clusters.length > 0) {
-          if (!activeClusterId || !clusters.some(c => c.id === activeClusterId)) {
-            selectCluster(clusters[0].id);
-          } else {
-            // Re-fetch current active cluster live
-            selectCluster(activeClusterId);
-          }
-        } else {
-          activeClusterId = null;
-          const countMsg = (window._totalImagesCount !== undefined && window._totalImagesCount !== null && !isNaN(window._totalImagesCount))
-            ? ` in ${window._totalImagesCount} images`
-            : "";
-          const emptyEl = document.getElementById("detail-empty");
-          emptyEl.style.display = "flex";
-          emptyEl.innerHTML = `<p style="color:var(--text-muted); font-size:1.1rem;">No duplicate clusters found${countMsg}.</p>`;
-          document.getElementById("detail-content").style.display = "none";
-        }
-      } catch (err) {
-        console.error("Failed to fetch clusters:", err);
-      }
+    function showClusterDetailError(message, retryFn) {
+      document.getElementById("detail-content").style.display = "none";
+      const emptyEl = document.getElementById("detail-empty");
+      emptyEl.style.display = "flex";
+      emptyEl.innerHTML = `
+        <div style="text-align:center; color:var(--danger); padding:20px;">
+          <p style="margin-bottom:8px; font-size:1rem;">Failed to load cluster details: ${escapeHtml(message)}</p>
+          <button type="button" class="btn btn-secondary" id="btn-retry-detail">Retry</button>
+        </div>
+      `;
+      const retryBtn = document.getElementById("btn-retry-detail");
+      if (retryBtn && retryFn) retryBtn.addEventListener("click", retryFn);
     }
 
     // Render left sidebar clusters
@@ -1216,14 +1250,22 @@
       const container = document.getElementById("cluster-list");
       container.innerHTML = "";
 
-      if (clusters.length === 0) {
-        const countMsg = (totalCount !== undefined && totalCount !== null && !isNaN(totalCount))
-          ? ` in ${totalCount} images`
-          : "";
-        container.innerHTML = `<div style="padding:24px; text-align:center; color:var(--text-muted); font-size:0.85rem;">No duplicate clusters found${countMsg}.</div>`;
+      const catVal = document.getElementById("category-filter").value;
+      const searchVal = document.getElementById("search-input").value.trim();
+
+      if (!clusters || clusters.length === 0) {
+        if (catVal || searchVal) {
+          container.innerHTML = `<div style="padding:24px; text-align:center; color:var(--text-muted); font-size:0.85rem;">No clusters match the selected category or filter.</div>`;
+        } else {
+          const countMsg = (totalCount !== undefined && totalCount !== null && !isNaN(totalCount))
+            ? ` in ${totalCount} images`
+            : "";
+          container.innerHTML = `<div style="padding:24px; text-align:center; color:var(--text-muted); font-size:0.85rem;">No duplicate clusters found${countMsg}.</div>`;
+        }
         return;
       }
 
+      const fragment = document.createDocumentFragment();
       clusters.forEach(c => {
         const item = document.createElement("div");
         item.className = `cluster-item ${c.id === activeClusterId ? "active" : ""}`;
@@ -1233,7 +1275,7 @@
         const thumbUrl = c.keeper && c.keeper.id ? `/thumb/${c.keeper.id}?size=96${vParam}` : "";
         const reclaimableText = formatBytes(c.reclaimable_bytes || c.savings_bytes || 0);
         const catBadge = c.category
-          ? `<span class="chip chip-category" ${c.category === 'Needs label' ? 'style="background:rgba(234,179,8,0.15);color:#eab308;border-color:rgba(234,179,8,0.4);"' : ''}>${c.category}</span>`
+          ? `<span class="chip chip-category" ${c.category === 'Needs label' ? 'style="background:rgba(234,179,8,0.15);color:#eab308;border-color:rgba(234,179,8,0.4);"' : ''}>${escapeHtml(c.category)}</span>`
           : "";
 
         item.innerHTML = `
@@ -1255,12 +1297,17 @@
         `;
 
         item.addEventListener("click", () => selectCluster(c.id));
-        container.appendChild(item);
+        fragment.appendChild(item);
       });
+      container.replaceChildren(fragment);
     }
 
+    let currentRefreshSeq = 0;
+    let currentClusterSelectSeq = 0;
+
     // Select and load active cluster
-    async function selectCluster(clusterId) {
+    async function selectCluster(clusterId, expectedRefreshSeq) {
+      const selSeq = ++currentClusterSelectSeq;
       activeClusterId = clusterId;
 
       // Update active highlight in left list
@@ -1270,15 +1317,115 @@
 
       try {
         const res = await fetch(`/clusters/${clusterId}?mode=${encodeURIComponent(currentMode)}`);
-        if (!res.ok) throw new Error("Failed to load cluster details");
+        if (expectedRefreshSeq !== undefined && expectedRefreshSeq !== currentRefreshSeq) return;
+        if (selSeq !== currentClusterSelectSeq) return;
+        if (!res.ok) throw new Error("HTTP " + res.status);
         const data = await res.json();
+        if (expectedRefreshSeq !== undefined && expectedRefreshSeq !== currentRefreshSeq) return;
+        if (selSeq !== currentClusterSelectSeq) return;
         currentClusterData = data;
         renderClusterDetail(data);
       } catch (err) {
-        console.error("Failed to load cluster:", err);
-        document.getElementById("detail-content").style.display = "none";
-        document.getElementById("detail-empty").style.display = "flex";
-        activeClusterId = null;
+        if (expectedRefreshSeq !== undefined && expectedRefreshSeq !== currentRefreshSeq) return;
+        if (selSeq !== currentClusterSelectSeq) return;
+        console.error("Failed to load cluster details:", err);
+        showClusterDetailError(err.message || "Failed to load cluster", () => selectCluster(clusterId, expectedRefreshSeq));
+      }
+    }
+
+    // Single unified refresh path for Argus UI
+    async function refreshAll(options = {}) {
+      const seq = ++currentRefreshSeq;
+      const preserveActiveCluster = options.preserveActiveCluster !== false;
+      const canRetry = options.retryOnNetworkError !== false;
+
+      async function doFetch(isRetry = false) {
+        try {
+          // Step 1: Categories
+          const catRes = await fetch(`/categories?mode=${encodeURIComponent(currentMode)}`);
+          if (seq !== currentRefreshSeq) return;
+          if (!catRes.ok) throw new Error("Failed to load categories: HTTP " + catRes.status);
+          const cats = await catRes.json();
+          if (seq !== currentRefreshSeq) return;
+          renderCategoriesDropdown(cats);
+
+          // Step 2: Cluster List
+          const catVal = document.getElementById("category-filter").value;
+          const sortVal = document.getElementById("sort-select").value;
+          const hasSavings = document.getElementById("has-savings-toggle").checked;
+
+          let url = `/clusters?mode=${encodeURIComponent(currentMode)}&sort=${encodeURIComponent(sortVal)}`;
+          if (catVal) url += `&category=${encodeURIComponent(catVal)}`;
+
+          const clRes = await fetch(url);
+          if (seq !== currentRefreshSeq) return;
+          if (!clRes.ok) throw new Error("Failed to load clusters: HTTP " + clRes.status);
+
+          const totalHeader = clRes.headers.get("X-Total-Images");
+          if (totalHeader) window._totalImagesCount = parseInt(totalHeader, 10);
+
+          let clusters = await clRes.json();
+          if (seq !== currentRefreshSeq) return;
+
+          if (hasSavings) {
+            clusters = clusters.filter(c => (c.reclaimable_bytes || c.savings_bytes || 0) > 0);
+          }
+          clustersData = clusters;
+          renderClusterList(clusters, window._totalImagesCount);
+
+          // Step 3: Open Cluster
+          if (clusters.length > 0) {
+            let targetId = clusters[0].id;
+            if (preserveActiveCluster && activeClusterId && clusters.some(c => c.id === activeClusterId)) {
+              targetId = activeClusterId;
+            }
+            await selectCluster(targetId, seq);
+          } else {
+            activeClusterId = null;
+            document.getElementById("detail-content").style.display = "none";
+            const emptyEl = document.getElementById("detail-empty");
+            emptyEl.style.display = "flex";
+            const countMsg = (window._totalImagesCount !== undefined && window._totalImagesCount !== null && !isNaN(window._totalImagesCount))
+              ? ` in ${window._totalImagesCount} images`
+              : "";
+            emptyEl.innerHTML = `<p style="color:var(--text-muted); font-size:1.1rem;">No duplicate clusters found${countMsg}.</p>`;
+          }
+        } catch (err) {
+          if (seq !== currentRefreshSeq) return;
+          if (!isRetry && canRetry) {
+            console.warn("Network error during refreshAll, retrying once...", err);
+            return await doFetch(true);
+          }
+          console.error("refreshAll failed:", err);
+          showClusterListError(err.message || "Failed to load clusters", () => refreshAll(options));
+        }
+      }
+
+      return await doFetch(false);
+    }
+
+    // Progressive cluster updates during background jobs without disrupting active selection
+    async function loadClustersProgressive() {
+      const catVal = document.getElementById("category-filter").value;
+      const sortVal = document.getElementById("sort-select").value;
+      const hasSavings = document.getElementById("has-savings-toggle").checked;
+
+      let url = `/clusters?mode=${encodeURIComponent(currentMode)}&sort=${encodeURIComponent(sortVal)}`;
+      if (catVal) url += `&category=${encodeURIComponent(catVal)}`;
+
+      try {
+        const res = await fetch(url);
+        if (!res.ok) return;
+        const totalHeader = res.headers.get("X-Total-Images");
+        if (totalHeader) window._totalImagesCount = parseInt(totalHeader, 10);
+        let clusters = await res.json();
+        if (hasSavings) {
+          clusters = clusters.filter(c => (c.reclaimable_bytes || c.savings_bytes || 0) > 0);
+        }
+        clustersData = clusters;
+        renderClusterList(clusters, window._totalImagesCount);
+      } catch (err) {
+        console.debug("Progressive clusters fetch:", err);
       }
     }
 
@@ -1330,8 +1477,7 @@
                 catEl.style.background = "";
                 catEl.style.color = "";
                 catEl.style.borderColor = "";
-                await loadCategories();
-                await loadClusters();
+                await refreshAll({ preserveActiveCluster: true });
               } else {
                 const errData = await resp.json();
                 alert(`Failed to set category: ${errData.detail || "Error"}`);
@@ -1604,10 +1750,7 @@
         document.getElementById("apply-success-box").style.display = "block";
 
         // Refresh clusters and current view
-        await loadClusters();
-        if (activeClusterId) {
-          await selectCluster(activeClusterId);
-        }
+        await refreshAll({ preserveActiveCluster: true });
       } catch (err) {
         console.error("Failed to call /apply:", err);
         alert("Failed to execute move: " + err);
@@ -1628,10 +1771,7 @@
         if (!res.ok) throw new Error("Undo failed");
         alert("Batch successfully undone! Files have been restored.");
         document.getElementById("confirm-modal").style.display = "none";
-        await loadClusters();
-        if (activeClusterId) {
-          await selectCluster(activeClusterId);
-        }
+        await refreshAll({ preserveActiveCluster: true });
       } catch (err) {
         alert("Undo failed: " + err);
       }
@@ -1646,19 +1786,66 @@
     };
 
     // Mode slider switches
+    async function switchMode(newMode) {
+      if (currentMode === newMode) return;
+      const buttons = document.querySelectorAll(".mode-btn");
+      const spinner = document.getElementById("mode-spinner");
+      buttons.forEach(b => b.disabled = true);
+      if (spinner) spinner.style.display = "inline-block";
+
+      const prevMode = currentMode;
+      currentMode = newMode;
+      buttons.forEach(b => b.classList.toggle("active", b.dataset.mode === newMode));
+
+      try {
+        await refreshAll({ preserveActiveCluster: true, retryOnNetworkError: true });
+      } catch (err) {
+        console.error("Failed to switch mode:", err);
+        currentMode = prevMode;
+        buttons.forEach(b => b.classList.toggle("active", b.dataset.mode === prevMode));
+        alert("Failed to switch mode: " + (err.message || err));
+      } finally {
+        buttons.forEach(b => b.disabled = false);
+        if (spinner) spinner.style.display = "none";
+      }
+    }
+
     document.querySelectorAll(".mode-btn").forEach(btn => {
-      btn.addEventListener("click", () => {
-        document.querySelectorAll(".mode-btn").forEach(b => b.classList.remove("active"));
-        btn.classList.add("active");
-        currentMode = btn.dataset.mode;
-        loadClusters();
-      });
+      btn.addEventListener("click", () => switchMode(btn.dataset.mode));
     });
 
     // Filter and Sort change handlers
-    document.getElementById("category-filter").addEventListener("change", loadClusters);
-    document.getElementById("sort-select").addEventListener("change", loadClusters);
-    document.getElementById("has-savings-toggle").addEventListener("change", loadClusters);
+    document.getElementById("category-filter").addEventListener("change", () => refreshAll({ preserveActiveCluster: true }));
+    document.getElementById("sort-select").addEventListener("change", () => refreshAll({ preserveActiveCluster: true }));
+    document.getElementById("has-savings-toggle").addEventListener("change", () => refreshAll({ preserveActiveCluster: true }));
+
+    // Categorize now button handler
+    const btnCatNow = document.getElementById("btn-categorize-now");
+    if (btnCatNow) {
+      btnCatNow.addEventListener("click", async () => {
+        btnCatNow.disabled = true;
+        btnCatNow.textContent = "Queueing...";
+        try {
+          const res = await fetch("/categories/run", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+          });
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.detail || "Failed to start categorization");
+          }
+          const data = await res.json();
+          if (data && data.job_id) {
+            pollJobProgress(data.job_id);
+          }
+        } catch (err) {
+          alert("Categorization error: " + (err.message || err));
+        } finally {
+          btnCatNow.disabled = false;
+          btnCatNow.textContent = "Categorize now";
+        }
+      });
+    }
 
     // Search Box handler
     const searchInput = document.getElementById("search-input");
@@ -1671,7 +1858,7 @@
       clearTimeout(searchDebounce);
       searchDebounce = setTimeout(async () => {
         if (!q) {
-          loadClusters();
+          refreshAll({ preserveActiveCluster: true });
           return;
         }
         try {
@@ -1691,7 +1878,7 @@
     searchClear.addEventListener("click", () => {
       searchInput.value = "";
       searchClear.style.display = "none";
-      loadClusters();
+      refreshAll({ preserveActiveCluster: true });
     });
 
     // History Modal
@@ -1743,10 +1930,7 @@
               if (!uRes.ok) throw new Error("Undo failed");
               alert(`Batch ${bId} restored successfully!`);
               openHistoryModal();
-              await loadClusters();
-              if (activeClusterId) {
-                await selectCluster(activeClusterId);
-              }
+              await refreshAll({ preserveActiveCluster: true });
             } catch (err) {
               alert("Undo failed: " + err);
             }
@@ -1830,6 +2014,8 @@
       fill.style.background = "#2563eb";
       setSourceButtonsDisabled(true);
 
+      let lastProgressivePoll = Date.now();
+
       // If activeInfo provided from /jobs/active: read stage, done, total
       if (activeInfo && typeof activeInfo === "object") {
         const stage = activeInfo.stage || "Running";
@@ -1847,6 +2033,13 @@
         if (document.hidden) {
           // Stop polling when page is hidden
           return;
+        }
+
+        // Progressive cluster polling every 3s during active jobs (Requirement B.6)
+        const now = Date.now();
+        if (now - lastProgressivePoll >= 3000) {
+          lastProgressivePoll = now;
+          loadClustersProgressive();
         }
 
         try {
@@ -1874,7 +2067,8 @@
 
             const added = data.images_added !== undefined ? data.images_added : 0;
             const clustersCreated = data.clusters_created !== undefined ? data.clusters_created : 0;
-            const skipped = data.skipped_count !== undefined ? data.skipped_count : (data.warnings || []).length;
+            const skippedList = data.skipped_files || data.warnings || [];
+            const skipped = data.skipped_count !== undefined ? data.skipped_count : skippedList.length;
             const reportMsg = `${added} images added, ${clustersCreated} duplicate clusters found${skipped > 0 ? ` (${skipped} skipped)` : ''}`;
 
             if (data.status === "completed_with_warnings") {
@@ -1887,16 +2081,26 @@
             percentText.textContent = "100%";
             fill.style.width = "100%";
 
+            const summaryDetails = document.getElementById("job-summary-details");
+            if (summaryDetails) {
+              if (skippedList.length > 0) {
+                summaryDetails.innerHTML = `<span style="font-weight:600;">Skipped files:</span> ` +
+                  skippedList.map(s => `<span style="display:inline-block; margin-right:8px;">${escapeHtml(s)}</span>`).join("");
+                summaryDetails.style.display = "block";
+              } else {
+                summaryDetails.style.display = "none";
+              }
+            }
+
             // Reset stale category filter and reload cluster list and categories immediately
             const catFilter = document.getElementById("category-filter");
             if (catFilter) catFilter.value = "";
-            loadCategories();
-            loadClusters();
-            if (activeClusterId) selectCluster(activeClusterId);
+            await refreshAll({ preserveActiveCluster: true });
 
             setTimeout(() => {
               banner.style.display = "none";
-            }, 3000);
+              if (summaryDetails) summaryDetails.style.display = "none";
+            }, 5000);
             return;
           } else if (data.status === "failed" || data.status === "error" || data.status === "stalled") {
             currentPollingJobId = null;
@@ -2006,7 +2210,7 @@
           body: formData,
         });
         if (!res.ok) {
-          const err = await res.json();
+          const err = await res.json().catch(() => ({}));
           throw new Error(err.detail || "Upload failed");
         }
         const data = await res.json();
@@ -2016,6 +2220,7 @@
         btnStartUpload.style.display = "none";
         btnStartUpload.disabled = false;
         btnStartUpload.textContent = "Upload & Run Pipeline";
+        refreshAll({ preserveActiveCluster: true });
         if (data && typeof data.job_id === "string" && data.job_id.trim()) {
           pollJobProgress(data.job_id);
         } else {
@@ -2046,13 +2251,18 @@
           body: JSON.stringify({ link }),
         });
         if (!res.ok) {
-          const err = await res.json();
-          throw new Error(err.detail || "Google Drive scan failed");
+          const err = await res.json().catch(() => ({}));
+          const detail = err.detail || "";
+          if (res.status === 403 || detail.toLowerCase().includes("hosted mode")) {
+            throw new Error("Disabled in hosted mode");
+          }
+          throw new Error(detail || "Google Drive scan failed");
         }
         const data = await res.json();
         sourcesModal.style.display = "none";
         btn.disabled = false;
         btn.textContent = "Scan Drive (Read-Only)";
+        refreshAll({ preserveActiveCluster: true });
         if (data && typeof data.job_id === "string" && data.job_id.trim()) {
           pollJobProgress(data.job_id);
         } else {
@@ -2065,7 +2275,8 @@
         msg.style.display = "block";
         msg.style.background = "rgba(239, 68, 68, 0.1)";
         msg.style.color = "var(--danger)";
-        msg.textContent = err.message;
+        const txt = (err.message && err.message.toLowerCase().includes("hosted mode")) ? "Disabled in hosted mode" : err.message;
+        msg.textContent = txt;
       }
     });
 
@@ -2083,13 +2294,18 @@
           body: JSON.stringify({ url }),
         });
         if (!res.ok) {
-          const err = await res.json();
-          throw new Error(err.detail || "Dataset import failed");
+          const err = await res.json().catch(() => ({}));
+          const detail = err.detail || "";
+          if (res.status === 403 || detail.toLowerCase().includes("hosted mode")) {
+            throw new Error("Disabled in hosted mode");
+          }
+          throw new Error(detail || "Dataset import failed");
         }
         const data = await res.json();
         sourcesModal.style.display = "none";
         btn.disabled = false;
         btn.textContent = "Import Dataset";
+        refreshAll({ preserveActiveCluster: true });
         if (data && typeof data.job_id === "string" && data.job_id.trim()) {
           pollJobProgress(data.job_id);
         } else {
@@ -2102,7 +2318,8 @@
         msg.style.display = "block";
         msg.style.background = "rgba(239, 68, 68, 0.1)";
         msg.style.color = "var(--danger)";
-        msg.textContent = err.message;
+        const txt = (err.message && err.message.toLowerCase().includes("hosted mode")) ? "Disabled in hosted mode" : err.message;
+        msg.textContent = txt;
       }
     });
 
@@ -2113,11 +2330,12 @@
       try {
         const res = await fetch("/sources/rescan", { method: "POST" });
         if (!res.ok) {
-          const err = await res.json();
+          const err = await res.json().catch(() => ({}));
           throw new Error(err.detail || "Rescan failed");
         }
         const data = await res.json();
         btn.disabled = false;
+        refreshAll({ preserveActiveCluster: true });
         if (data && typeof data.job_id === "string" && data.job_id.trim()) {
           pollJobProgress(data.job_id);
         } else {
@@ -2314,8 +2532,7 @@
     // Initial Load: check authentication first
     initAuth().then((authenticated) => {
       if (authenticated) {
-        loadCategories();
-        loadClusters();
+        refreshAll();
         checkActiveJob();
       }
     });
