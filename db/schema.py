@@ -53,6 +53,8 @@ CREATE TABLE IF NOT EXISTS images (
     quality_basis TEXT,                                  -- 'thumbnail' | 'full'
     category_top1 TEXT,                          -- top-1 predicted category or 'uncertain'
     category_top1_prob REAL,                     -- probability of top-1 category (0.0 - 1.0)
+    category_top2 TEXT,                          -- top-2 predicted category
+    category_top2_prob REAL,                     -- probability of top-2 category (0.0 - 1.0)
     category_top3 TEXT,                          -- JSON array of [{"label": ..., "prob": ...}, ...]
     created_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
     updated_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
@@ -85,6 +87,7 @@ CREATE TABLE IF NOT EXISTS clusters (
     member_count      INTEGER NOT NULL DEFAULT 0,
     reference_uncertain INTEGER NOT NULL DEFAULT 0, -- 1 = reference uncertain (SSIM tie <0.002 or EXIF/mtime conflict)
     category          TEXT,                          -- cluster-level category (from keeper or majority vote)
+    manual_category   TEXT,                          -- manual user override category
     created_at        TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 """

@@ -142,6 +142,11 @@ class DatasetSourceRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
 
+class ClusterCategoryRequest(BaseModel):
+    category: str
+    model_config = ConfigDict(extra="ignore")
+
+
 @dataclass
 class UserContext:
     id: int
@@ -585,113 +590,67 @@ def create_app(
         except Exception:
             config = {}
 
+    raw_data_dir = os.environ.get("ARGUS_DATA_DIR") or config.get("general", {}).get("data_dir")
+    if raw_data_dir:
+        data_root = Path(raw_data_dir).expanduser().resolve()
+        data_root.mkdir(parents=True, exist_ok=True)
+    else:
+        cand = Path.home() / ".argus"
+        try:
+            cand.mkdir(parents=True, exist_ok=True)
+            test_f = cand / ".perm_check"
+            test_f.touch()
+            test_f.unlink()
+            data_root = cand.resolve()
+        except (OSError, PermissionError):
+            data_root = Path.cwd() / ".argus"
+            data_root.mkdir(parents=True, exist_ok=True)
+
     explicit_db_path = db_path is not None
     if not explicit_db_path:
-        db_path = os.environ.get("ARGUS_DB_PATH") or config.get("database", {}).get("path")
-        if not db_path:
-            cand = Path.home() / ".argus" / "argus.db"
-            try:
-                cand.parent.mkdir(parents=True, exist_ok=True)
-                test_f = cand.parent / ".perm_check"
-                test_f.touch()
-                test_f.unlink()
-                db_path = cand
-            except (OSError, PermissionError):
-                db_path = Path("/tmp/argus") / "argus.db"
+        db_path = os.environ.get("ARGUS_DB_PATH") or config.get("database", {}).get("path") or (data_root / "argus.db")
     resolved_db_path = Path(db_path).expanduser().resolve()
 
     if trash_dir is None:
         cfg_trash = config.get("ledger", {}).get("trash_dir")
-        trash_dir = os.environ.get("ARGUS_TRASH_DIR") or cfg_trash
-        if not trash_dir:
-            cand = Path.home() / ".argus" / "trash"
-            try:
-                cand.mkdir(parents=True, exist_ok=True)
-                trash_dir = cand
-            except (OSError, PermissionError):
-                trash_dir = Path("/tmp/argus") / "trash"
+        trash_dir = os.environ.get("ARGUS_TRASH_DIR") or cfg_trash or (data_root / "trash")
     resolved_trash_dir = Path(trash_dir).expanduser().resolve()
+    resolved_trash_dir.mkdir(parents=True, exist_ok=True)
 
     if thumb_cache_dir is None:
-        thumb_cache_dir = os.environ.get("ARGUS_THUMB_CACHE_DIR")
-        if not thumb_cache_dir:
-            cand = Path.home() / ".argus" / "thumbnails"
-            try:
-                cand.mkdir(parents=True, exist_ok=True)
-                thumb_cache_dir = cand
-            except (OSError, PermissionError):
-                thumb_cache_dir = Path("/tmp/argus") / "thumbnails"
+        thumb_cache_dir = os.environ.get("ARGUS_THUMB_CACHE_DIR") or (data_root / "thumbnails")
     resolved_thumb_cache_dir = Path(thumb_cache_dir).expanduser().resolve()
-    try:
-        resolved_thumb_cache_dir.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
+    resolved_thumb_cache_dir.mkdir(parents=True, exist_ok=True)
 
     if library_dir is None:
         cfg_library = config.get("sources", {}).get("library_dir")
-        library_dir = os.environ.get("ARGUS_LIBRARY_DIR") or cfg_library
-        if not library_dir:
-            cand = Path.home() / ".argus" / "library"
-            try:
-                cand.mkdir(parents=True, exist_ok=True)
-                library_dir = cand
-            except (OSError, PermissionError):
-                library_dir = Path("/tmp/argus") / "library"
+        library_dir = os.environ.get("ARGUS_LIBRARY_DIR") or cfg_library or (data_root / "library")
     resolved_library_dir = Path(library_dir).expanduser().resolve()
-    try:
-        resolved_library_dir.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
+    resolved_library_dir.mkdir(parents=True, exist_ok=True)
 
     if jobs_dir is None:
         cfg_jobs = config.get("general", {}).get("jobs_dir")
-        jobs_dir = os.environ.get("ARGUS_JOBS_DIR") or cfg_jobs
-        if not jobs_dir:
-            cand = Path.home() / ".argus" / "jobs"
-            try:
-                cand.mkdir(parents=True, exist_ok=True)
-                jobs_dir = cand
-            except (OSError, PermissionError):
-                jobs_dir = Path("/tmp/argus") / "jobs"
+        jobs_dir = os.environ.get("ARGUS_JOBS_DIR") or cfg_jobs or (data_root / "jobs")
     resolved_jobs_dir = Path(jobs_dir).expanduser().resolve()
-    try:
-        resolved_jobs_dir.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
+    resolved_jobs_dir.mkdir(parents=True, exist_ok=True)
 
     # Per-user storage directories root
     if users_dir is None:
         cfg_users = config.get("general", {}).get("users_dir")
-        users_dir = os.environ.get("ARGUS_USERS_DIR") or cfg_users
-        if not users_dir:
-            cand = Path.home() / ".argus" / "users"
-            try:
-                cand.mkdir(parents=True, exist_ok=True)
-                users_dir = cand
-            except (OSError, PermissionError):
-                users_dir = Path("/tmp/argus") / "users"
+        users_dir = os.environ.get("ARGUS_USERS_DIR") or cfg_users or (data_root / "users")
     resolved_users_dir = Path(users_dir).expanduser().resolve()
-    try:
-        resolved_users_dir.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
+    resolved_users_dir.mkdir(parents=True, exist_ok=True)
 
     # Auth DB initialization
     if auth_db_path is None:
         cfg_auth = config.get("auth", {}).get("db_path")
-        auth_db_path = os.environ.get("ARGUS_ACCOUNTS_DB") or os.environ.get("ARGUS_AUTH_DB") or cfg_auth
-        if not auth_db_path:
-            cand = Path.home() / ".argus" / "auth.db"
-            try:
-                cand.parent.mkdir(parents=True, exist_ok=True)
-                test_f = cand.parent / ".perm_check"
-                test_f.touch()
-                test_f.unlink()
-                auth_db_path = cand
-            except (OSError, PermissionError):
-                auth_db_path = Path("/tmp/argus") / "auth.db"
+        auth_db_path = os.environ.get("ARGUS_ACCOUNTS_DB") or os.environ.get("ARGUS_AUTH_DB") or cfg_auth or (data_root / "auth.db")
     resolved_auth_db_path = Path(auth_db_path).expanduser().resolve()
+    resolved_auth_db_path.parent.mkdir(parents=True, exist_ok=True)
     auth_conn = init_auth_db(resolved_auth_db_path)
+
+    logger.info("Argus fixed data root: %s", data_root)
+    logger.info("Auth DB: %s, Users dir: %s", resolved_auth_db_path, resolved_users_dir)
 
     # Initialize default single-user / test DB
     init_conn = init_db(resolved_db_path)
@@ -759,6 +718,7 @@ def create_app(
         allow_headers=["*"],
     )
 
+    app.state.data_root = data_root
     app.state.auth_conn = auth_conn
     app.state.auth_db_path = resolved_auth_db_path
     app.state.users_dir = resolved_users_dir
@@ -988,6 +948,7 @@ def create_app(
         min_savings: Optional[float] = Query(None),
         sort: str = Query("id"),
         request: Request = None,
+        response: Response = None,
         user: UserContext = Depends(get_current_user),
         conn: sqlite3.Connection = Depends(get_db),
     ) -> list[dict[str, Any]]:
@@ -997,8 +958,14 @@ def create_app(
                 detail="Invalid mode. Must be one of: conservative, balanced, aggressive",
             )
 
+        total_images = conn.execute(
+            "SELECT COUNT(*) FROM images WHERE status IS NULL OR status != 'trashed'"
+        ).fetchone()[0]
+        if response is not None:
+            response.headers["X-Total-Images"] = str(total_images)
+
         c_rows = conn.execute(
-            "SELECT id, representative_id, reference_uncertain, category FROM clusters ORDER BY id"
+            "SELECT id, representative_id, reference_uncertain, category, manual_category FROM clusters ORDER BY id"
         ).fetchall()
 
         results: list[dict[str, Any]] = []
@@ -1011,7 +978,8 @@ def create_app(
                        is_keeper, is_low_confidence, ssim, ssim_color, sharpness_ratio,
                        pixel_ratio, bytes_ratio, quality_status, review_flag, delete_safe,
                        reason, source_likelihood, jpeg_quality_est, category_top1,
-                       category_top1_prob, match_pct, resolution_pct, confidence, status
+                       category_top1_prob, category_top2, category_top2_prob, match_pct,
+                       resolution_pct, confidence, status
                 FROM images
                 WHERE cluster_id = ? AND (status IS NULL OR status != 'trashed')
                 ORDER BY id
@@ -1044,20 +1012,33 @@ def create_app(
             total_bytes = sum(m["file_size"] or 0 for m in member_dicts)
             savings_ratio = round(savings_bytes / total_bytes, 4) if total_bytes > 0 else 0.0
 
-            keeper_m = next((m for m in member_dicts if m["id"] == keeper_id), None)
-            cluster_cat = c_row["category"] or (keeper_m.get("category_top1") if keeper_m else None)
-
-            # Majority-vote display category
-            member_cats = [m["category_top1"] for m in member_dicts if m.get("category_top1")]
-            if member_cats:
-                from collections import Counter
-                most_common, occ = Counter(member_cats).most_common(1)[0]
-                display_category = most_common if occ > len(member_cats) / 2 else "mixed"
+            manual_cat = c_row["manual_category"] if "manual_category" in c_row.keys() else None
+            if manual_cat:
+                display_category = manual_cat
             else:
-                display_category = cluster_cat
+                keeper_m = next((m for m in member_dicts if m["id"] == keeper_id), None)
+                cluster_cat = c_row["category"] or (keeper_m.get("category_top1") if keeper_m else None)
 
-            if category is not None and (display_category or "").lower() != category.lower():
-                continue
+                # Majority-vote display category
+                member_cats = [m["category_top1"] for m in member_dicts if m.get("category_top1")]
+                if member_cats:
+                    from collections import Counter
+                    most_common, occ = Counter(member_cats).most_common(1)[0]
+                    display_category = most_common if occ > len(member_cats) / 2 else "mixed"
+                else:
+                    display_category = cluster_cat
+
+            if display_category in ("uncertain", "Needs label"):
+                display_category = "Needs label"
+
+            if category is not None:
+                cat_norm = category.strip().lower()
+                disp_norm = (display_category or "").strip().lower()
+                if cat_norm in ("needs label", "uncertain", "needs_label"):
+                    if disp_norm not in ("needs label", "uncertain"):
+                        continue
+                elif disp_norm != cat_norm:
+                    continue
 
             if min_savings is not None:
                 if 0 < min_savings <= 1.0:
@@ -1083,6 +1064,7 @@ def create_app(
                 "delete_safe_count": len(del_safe_ids),
                 "review_count": len(review_ids),
                 "category": display_category,
+                "manual_category": manual_cat,
                 "has_swap_proposal": swap_prop is not None,
                 "swap_proposal": swap_prop,
             })
@@ -1121,7 +1103,7 @@ def create_app(
             )
 
         c_row = conn.execute(
-            "SELECT id, representative_id, reference_uncertain, category FROM clusters WHERE id = ?",
+            "SELECT id, representative_id, reference_uncertain, category, manual_category FROM clusters WHERE id = ?",
             (cluster_id,),
         ).fetchone()
         if not c_row:
@@ -1133,7 +1115,8 @@ def create_app(
                    is_keeper, is_low_confidence, ssim, ssim_color, sharpness_ratio,
                    pixel_ratio, bytes_ratio, quality_status, review_flag, delete_safe,
                    reason, source_likelihood, jpeg_quality_est, category_top1,
-                   category_top1_prob, match_pct, resolution_pct, confidence, status
+                   category_top1_prob, category_top2, category_top2_prob, match_pct,
+                   resolution_pct, confidence, status
             FROM images
             WHERE cluster_id = ? AND (status IS NULL OR status != 'trashed')
             ORDER BY id
@@ -1166,6 +1149,11 @@ def create_app(
         formatted_members = []
         for m in member_dicts:
             mid = m["id"]
+            top1 = m.get("category_top1")
+            top1_prob = m.get("category_top1_prob")
+            top2 = m.get("category_top2")
+            top2_prob = m.get("category_top2_prob")
+            cat_label = "Needs label" if top1 in ("uncertain", "Needs label") else top1
             formatted_members.append({
                 "id": mid,
                 "file_path": m["file_path"],
@@ -1177,32 +1165,70 @@ def create_app(
                 "match_pct": m["match_pct"],
                 "resolution_pct": m["resolution_pct"],
                 "confidence": m["confidence"],
-                "category": m["category_top1"],
-                "category_prob": m["category_top1_prob"],
+                "category": cat_label,
+                "category_prob": top1_prob,
+                "category_top1": top1,
+                "category_top1_prob": top1_prob,
+                "category_top2": top2,
+                "category_top2_prob": top2_prob,
                 "is_recommended_keeper": mid == keeper_id,
                 "delete_safe": mid in del_safe_ids,
                 "review": mid in review_ids,
                 "reason": reasons.get(mid, ""),
             })
 
-        keeper_m = next((m for m in formatted_members if m["is_recommended_keeper"]), None)
-        cluster_cat = c_row["category"] or (keeper_m.get("category") if keeper_m else None)
-
-        member_cats = [m.get("category") for m in formatted_members if m.get("category")]
-        if member_cats:
-            from collections import Counter
-            most_common, occ = Counter(member_cats).most_common(1)[0]
-            display_category = most_common if occ > len(member_cats) / 2 else "mixed"
+        manual_cat = c_row["manual_category"] if "manual_category" in c_row.keys() else None
+        if manual_cat:
+            display_category = manual_cat
         else:
-            display_category = cluster_cat
+            keeper_m = next((m for m in formatted_members if m["is_recommended_keeper"]), None)
+            cluster_cat = c_row["category"] or (keeper_m.get("category") if keeper_m else None)
+
+            member_cats = [m.get("category") for m in formatted_members if m.get("category")]
+            if member_cats:
+                from collections import Counter
+                most_common, occ = Counter(member_cats).most_common(1)[0]
+                display_category = most_common if occ > len(member_cats) / 2 else "mixed"
+            else:
+                display_category = cluster_cat
+
+        if display_category in ("uncertain", "Needs label"):
+            display_category = "Needs label"
 
         return {
             "id": c_row["id"],
             "mode": mode,
             "category": display_category,
+            "manual_category": manual_cat,
             "reference_uncertain": bool(ref_unc),
             "swap_proposal": keeper_res.get("swap_proposal"),
             "members": formatted_members,
+        }
+
+    @app.post("/clusters/{cluster_id}/category")
+    def set_cluster_category(
+        cluster_id: int,
+        req: ClusterCategoryRequest,
+        user: UserContext = Depends(get_current_user),
+        conn: sqlite3.Connection = Depends(get_db),
+    ) -> dict[str, Any]:
+        c_row = conn.execute("SELECT id FROM clusters WHERE id = ?", (cluster_id,)).fetchone()
+        if not c_row:
+            raise HTTPException(status_code=404, detail=f"Cluster {cluster_id} not found")
+
+        clean_cat = req.category.strip()
+        if not clean_cat:
+            raise HTTPException(status_code=400, detail="Category label cannot be empty")
+
+        conn.execute(
+            "UPDATE clusters SET manual_category = ?, category = ? WHERE id = ?",
+            (clean_cat, clean_cat, cluster_id),
+        )
+        conn.commit()
+        return {
+            "cluster_id": cluster_id,
+            "category": clean_cat,
+            "manual_category": clean_cat,
         }
 
     @app.get("/thumb/{image_id}")
@@ -1391,7 +1417,7 @@ def create_app(
         """
         from collections import Counter
         c_rows = conn.execute(
-            "SELECT id, representative_id, reference_uncertain, category FROM clusters ORDER BY id"
+            "SELECT id, representative_id, reference_uncertain, category, manual_category FROM clusters ORDER BY id"
         ).fetchall()
 
         cat_counts: Counter = Counter()
@@ -1411,14 +1437,23 @@ def create_app(
             ]
             if len(live_members) < 2:
                 continue
-            # Majority category among live members
-            member_cats = [m["category_top1"] for m in live_members if m["category_top1"]]
-            if member_cats:
-                from collections import Counter as _Counter
-                most_common, occ = _Counter(member_cats).most_common(1)[0]
-                display_cat = most_common if occ > len(member_cats) / 2 else "mixed"
+
+            manual_cat = c_row["manual_category"] if "manual_category" in c_row.keys() else None
+            if manual_cat:
+                display_cat = manual_cat
             else:
-                display_cat = c_row["category"] or "uncategorized"
+                # Majority category among live members
+                member_cats = [m["category_top1"] for m in live_members if m["category_top1"]]
+                if member_cats:
+                    from collections import Counter as _Counter
+                    most_common, occ = _Counter(member_cats).most_common(1)[0]
+                    display_cat = most_common if occ > len(member_cats) / 2 else "mixed"
+                else:
+                    display_cat = c_row["category"] or "uncategorized"
+
+            if display_cat in ("uncertain", "Needs label"):
+                display_cat = "Needs label"
+
             if display_cat:
                 cat_counts[display_cat] += 1
 

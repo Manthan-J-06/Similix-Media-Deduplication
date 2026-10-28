@@ -7,6 +7,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PORT=8000 \
     HOST=0.0.0.0 \
+    ARGUS_DATA_DIR=/data \
     ARGUS_USERS_DIR=/data/users \
     ARGUS_ACCOUNTS_DB=/data/auth.db \
     TMPDIR=/tmp \

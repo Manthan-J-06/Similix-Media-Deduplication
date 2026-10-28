@@ -17,6 +17,7 @@ services:
       - ALLOW_REGISTRATION=${ALLOW_REGISTRATION:-true}
       - HOSTED_MODE=${HOSTED_MODE:-false}
       - BASE_URL=${BASE_URL:-http://localhost:8000}
+      - ARGUS_DATA_DIR=/data
       - ARGUS_USERS_DIR=/data/users
       - ARGUS_ACCOUNTS_DB=/data/auth.db
       - TMPDIR=/tmp

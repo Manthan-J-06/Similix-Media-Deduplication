@@ -459,3 +459,38 @@ class TestCategoryEvaluationAndCLI:
         assert "sample.jpg" in content
         assert "category confidence: 92.0%" in content
 
+    def test_two_level_labels_and_top2_storage(self, tmp_path: Path, shared_config: dict):
+        """Verify two-level (scene & subject) labels parsing and top-2 label & score storage in DB."""
+        cat_cfg = parse_category_config(shared_config)
+        assert len(cat_cfg.scene_labels) >= 3
+        assert "indoor" in cat_cfg.scene_labels or "landscape" in cat_cfg.scene_labels
+        assert len(cat_cfg.subject_labels) >= 5
+        assert "portrait" in cat_cfg.subject_labels or "document" in cat_cfg.subject_labels
+
+        db_path = tmp_path / "top2_test.db"
+        conn = init_db(db_path)
+        # Check table columns exist
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(images)").fetchall()}
+        assert "category_top1" in cols
+        assert "category_top1_prob" in cols
+        assert "category_top2" in cols
+        assert "category_top2_prob" in cols
+
+    def test_manual_category_override_in_cluster_updates(self, tmp_path: Path, shared_config: dict):
+        """Verify that manual_category set by user is respected and never overwritten by automatic vote."""
+        db_path = tmp_path / "manual_cat.db"
+        conn = init_db(db_path)
+
+        # Create 1 cluster with manual category
+        conn.execute("INSERT INTO clusters (id, stage_detected, category, manual_category) VALUES (1, 2, 'landscape', 'User Custom')")
+        # Images with top-1 landscape
+        conn.execute("INSERT INTO images (id, file_path, cluster_id, category_top1, is_keeper) VALUES (1, 'a.jpg', 1, 'landscape', 1)")
+        conn.execute("INSERT INTO images (id, file_path, cluster_id, category_top1, is_keeper) VALUES (2, 'b.jpg', 1, 'landscape', 0)")
+        conn.commit()
+
+        update_cluster_categories(conn)
+
+        row = conn.execute("SELECT category, manual_category FROM clusters WHERE id = 1").fetchone()
+        assert row["manual_category"] == "User Custom"
+        assert row["category"] == "User Custom"
+

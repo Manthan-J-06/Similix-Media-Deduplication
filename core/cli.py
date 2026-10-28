@@ -790,10 +790,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
             db_path = str(target.parent / f"{target.name}.db")
         else:
             db_path = str(target)
-    if not db_path:
-        db_path = cfg.get("general", {}).get("db_path", "argus.db")
-
-    resolved_db = str(Path(db_path).expanduser().resolve())
+    resolved_db = str(Path(db_path).expanduser().resolve()) if db_path else None
 
     app = create_app(
         db_path=resolved_db,
@@ -804,7 +801,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
     # Bind host and port, supporting HOST/PORT env vars for container deployments
     host = getattr(args, "host", None) or os.environ.get("HOST", "127.0.0.1")
     port = getattr(args, "port", None) or int(os.environ.get("PORT", 8000))
-    print(f"Starting Argus API server on http://{host}:{port} (db: {resolved_db})")
+    print(f"Starting Argus API server on http://{host}:{port} (data root: {app.state.data_root}, auth db: {app.state.auth_db_path}, users: {app.state.users_dir})")
     uvicorn.run(app, host=host, port=port)
 
 

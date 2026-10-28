@@ -865,9 +865,10 @@
         <!-- Detail Header -->
         <div class="detail-header">
           <div class="detail-meta">
-            <div class="detail-title">
+            <div class="detail-title" style="display:flex; align-items:center; gap:8px;">
               <span id="detail-cluster-title">Cluster #1</span>
               <span class="chip chip-category" id="detail-cluster-category">Landscape</span>
+              <button type="button" class="btn" id="btn-edit-cluster-cat" style="padding:2px 8px; font-size:0.75rem; background:transparent; border:1px solid var(--border); border-radius:4px; cursor:pointer;" title="Set manual category">✎ Edit Label</button>
             </div>
             <div class="detail-subtitle">
               <span id="detail-member-count">6 copies</span> &bull; 
@@ -1176,6 +1177,8 @@
       try {
         const res = await fetch(url);
         if (!res.ok) throw new Error("Failed to load clusters");
+        const totalHeader = res.headers.get("X-Total-Images");
+        if (totalHeader) window._totalImagesCount = parseInt(totalHeader, 10);
         let clusters = await res.json();
 
         if (hasSavings) {
@@ -1183,7 +1186,7 @@
         }
 
         clustersData = clusters;
-        renderClusterList(clusters);
+        renderClusterList(clusters, window._totalImagesCount);
 
         // If no active cluster or active is not in list, pick first
         if (clusters.length > 0) {
@@ -1195,7 +1198,12 @@
           }
         } else {
           activeClusterId = null;
-          document.getElementById("detail-empty").style.display = "flex";
+          const countMsg = (window._totalImagesCount !== undefined && window._totalImagesCount !== null && !isNaN(window._totalImagesCount))
+            ? ` in ${window._totalImagesCount} images`
+            : "";
+          const emptyEl = document.getElementById("detail-empty");
+          emptyEl.style.display = "flex";
+          emptyEl.innerHTML = `<p style="color:var(--text-muted); font-size:1.1rem;">No duplicate clusters found${countMsg}.</p>`;
           document.getElementById("detail-content").style.display = "none";
         }
       } catch (err) {
@@ -1204,12 +1212,15 @@
     }
 
     // Render left sidebar clusters
-    function renderClusterList(clusters) {
+    function renderClusterList(clusters, totalCount) {
       const container = document.getElementById("cluster-list");
       container.innerHTML = "";
 
       if (clusters.length === 0) {
-        container.innerHTML = '<div style="padding:24px; text-align:center; color:var(--text-muted); font-size:0.85rem;">No duplicate clusters found.</div>';
+        const countMsg = (totalCount !== undefined && totalCount !== null && !isNaN(totalCount))
+          ? ` in ${totalCount} images`
+          : "";
+        container.innerHTML = `<div style="padding:24px; text-align:center; color:var(--text-muted); font-size:0.85rem;">No duplicate clusters found${countMsg}.</div>`;
         return;
       }
 
@@ -1221,6 +1232,9 @@
         const vParam = c.keeper && c.keeper.md5 ? `&v=${c.keeper.md5.slice(0, 12)}` : "";
         const thumbUrl = c.keeper && c.keeper.id ? `/thumb/${c.keeper.id}?size=96${vParam}` : "";
         const reclaimableText = formatBytes(c.reclaimable_bytes || c.savings_bytes || 0);
+        const catBadge = c.category
+          ? `<span class="chip chip-category" ${c.category === 'Needs label' ? 'style="background:rgba(234,179,8,0.15);color:#eab308;border-color:rgba(234,179,8,0.4);"' : ''}>${c.category}</span>`
+          : "";
 
         item.innerHTML = `
           <div class="cluster-thumb-box">
@@ -1234,7 +1248,7 @@
             <div class="cluster-reclaimable">Reclaimable now: ${reclaimableText}</div>
             <div class="cluster-badges">
               ${c.review_count > 0 ? `<span class="chip chip-review">${c.review_count} need review</span>` : ""}
-              ${c.category ? `<span class="chip chip-category">${c.category}</span>` : ""}
+              ${catBadge}
               ${c.has_swap_proposal ? `<span class="chip chip-swap">⚡ Swap</span>` : ""}
             </div>
           </div>
@@ -1279,8 +1293,54 @@
       if (data.category) {
         catEl.textContent = data.category;
         catEl.style.display = "inline-flex";
+        if (data.category === "Needs label") {
+          catEl.style.background = "rgba(234, 179, 8, 0.15)";
+          catEl.style.color = "#eab308";
+          catEl.style.borderColor = "rgba(234, 179, 8, 0.4)";
+        } else {
+          catEl.style.background = "";
+          catEl.style.color = "";
+          catEl.style.borderColor = "";
+        }
       } else {
         catEl.style.display = "none";
+      }
+
+      const editCatBtn = document.getElementById("btn-edit-cluster-cat");
+      if (editCatBtn) {
+        editCatBtn.onclick = async () => {
+          const currentVal = (data.category && data.category !== "Needs label") ? data.category : "";
+          const newCat = prompt(`Enter category label for Cluster #${data.id}:`, currentVal);
+          if (newCat !== null && newCat.trim()) {
+            try {
+              const csrf = getCsrfToken();
+              const resp = await fetch(`/clusters/${data.id}/category`, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  "X-CSRF-Token": csrf,
+                },
+                body: JSON.stringify({ category: newCat.trim() }),
+              });
+              if (resp.ok) {
+                data.category = newCat.trim();
+                data.manual_category = newCat.trim();
+                catEl.textContent = data.category;
+                catEl.style.display = "inline-flex";
+                catEl.style.background = "";
+                catEl.style.color = "";
+                catEl.style.borderColor = "";
+                await loadCategories();
+                await loadClusters();
+              } else {
+                const errData = await resp.json();
+                alert(`Failed to set category: ${errData.detail || "Error"}`);
+              }
+            } catch (err) {
+              alert(`Error: ${err.message}`);
+            }
+          }
+        };
       }
 
       document.getElementById("detail-member-count").textContent = `${data.members.length} copies`;
@@ -1390,7 +1450,7 @@
               <span style="font-weight:600; color:var(--text);">${formatBytes(m.size)}</span>
             </div>
             <div style="font-size:0.75rem; color:var(--text-muted);">${m.width} &times; ${m.height} &bull; ${m.format}</div>
-            ${m.category ? `<span class="chip chip-category" title="Category">${m.category}</span>` : ""}
+            ${m.category ? `<span class="chip chip-category" ${m.category === 'Needs label' ? 'style="background:rgba(234,179,8,0.15);color:#eab308;border-color:rgba(234,179,8,0.4);"' : ''} title="Top-1: ${m.category_top1 || m.category} (${Math.round((m.category_top1_prob || m.category_prob || 0) * 100)}%)${m.category_top2 ? ` | Top-2: ${m.category_top2} (${Math.round((m.category_top2_prob || 0) * 100)}%)` : ''}">${m.category}</span>` : ""}
             <div class="status-row">
               ${statusHtml}
               ${!m.is_recommended_keeper ? `
@@ -1811,20 +1871,31 @@
               activeJobPollTimeout = null;
             }
             setSourceButtonsDisabled(false);
+
+            const added = data.images_added !== undefined ? data.images_added : 0;
+            const clustersCreated = data.clusters_created !== undefined ? data.clusters_created : 0;
+            const skipped = data.skipped_count !== undefined ? data.skipped_count : (data.warnings || []).length;
+            const reportMsg = `${added} images added, ${clustersCreated} duplicate clusters found${skipped > 0 ? ` (${skipped} skipped)` : ''}`;
+
             if (data.status === "completed_with_warnings") {
-              statusText.textContent = data.message || `Pipeline completed with warnings (${(data.warnings || []).length} skipped)`;
+              statusText.textContent = data.message || `Pipeline complete with warnings: ${reportMsg}`;
               fill.style.background = "#eab308";
             } else {
-              statusText.textContent = data.message || "Pipeline completed successfully!";
+              statusText.textContent = data.message || `Pipeline completed: ${reportMsg}`;
               fill.style.background = "#22c55e";
             }
             percentText.textContent = "100%";
             fill.style.width = "100%";
+
+            // Reset stale category filter and reload cluster list and categories immediately
+            const catFilter = document.getElementById("category-filter");
+            if (catFilter) catFilter.value = "";
+            loadCategories();
+            loadClusters();
+            if (activeClusterId) selectCluster(activeClusterId);
+
             setTimeout(() => {
               banner.style.display = "none";
-              loadCategories();
-              loadClusters();
-              if (activeClusterId) selectCluster(activeClusterId);
             }, 3000);
             return;
           } else if (data.status === "failed" || data.status === "error" || data.status === "stalled") {

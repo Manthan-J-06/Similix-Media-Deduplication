@@ -77,6 +77,15 @@ def update_job_file(
     pid: int | None = None,
     heartbeat_at: float | None = None,
     slowest_clusters: list[dict[str, Any]] | None = None,
+    images_added: int | None = None,
+    clusters_created: int | None = None,
+    skipped_files: list[str] | None = None,
+    skipped_count: int | None = None,
+    total_images: int | None = None,
+    actionable_advice: str | None = None,
+    failed_stage: str | None = None,
+    failed_file: str | None = None,
+    **extra: Any,
 ) -> None:
     """Atomically update a job's JSON state file."""
     data: dict[str, Any] = {}
@@ -111,6 +120,26 @@ def update_job_file(
         data["error"] = error
     if slowest_clusters is not None:
         data["slowest_clusters"] = slowest_clusters
+    if images_added is not None:
+        data["images_added"] = images_added
+    if clusters_created is not None:
+        data["clusters_created"] = clusters_created
+    if skipped_files is not None:
+        data["skipped_files"] = skipped_files
+    if skipped_count is not None:
+        data["skipped_count"] = skipped_count
+    if total_images is not None:
+        data["total_images"] = total_images
+    if actionable_advice is not None:
+        data["actionable_advice"] = actionable_advice
+    if failed_stage is not None:
+        data["failed_stage"] = failed_stage
+    if failed_file is not None:
+        data["failed_file"] = failed_file
+
+    for k, v in extra.items():
+        if v is not None:
+            data[k] = v
 
     now = time.time()
     data["updated_at"] = now
@@ -192,11 +221,18 @@ def run_pipeline(
     if job_file is None:
         job_file = Path.home() / ".argus" / "jobs" / f"{job_id}.json"
 
+    resolved_db = Path(db_path).resolve()
+    logger.info("Worker targeting per-user database: %s", resolved_db)
+    print(f"Worker targeting per-user database: {resolved_db}")
     cfg = load_config(config_path) if config_path else load_config()
     init_db(db_path)
     conn = get_connection(db_path)
+    images_before = conn.execute("SELECT COUNT(*) FROM images").fetchone()[0]
+    clusters_before = conn.execute("SELECT COUNT(*) FROM clusters").fetchone()[0]
+
     all_warnings: list[str] = []
     current_stage = "scan"
+    current_file_path: str | None = None
     slowest_5_records: list[dict[str, Any]] = []
 
     heartbeat = JobHeartbeatThread(job_file, interval=5.0)
@@ -431,34 +467,39 @@ def run_pipeline(
             logger.info("Stage 5 (categorize) already complete — skipping.")
 
         # ── Finalize ──
-        summary_msg = "Pipeline completed successfully"
+        images_after = conn.execute("SELECT COUNT(*) FROM images").fetchone()[0]
+        clusters_after = conn.execute("SELECT COUNT(*) FROM clusters").fetchone()[0]
+        images_added = max(0, images_after - images_before)
+        clusters_created = max(0, clusters_after - clusters_before)
+        skipped_count = len(all_warnings)
+
+        summary_msg = f"{images_added} images added, {clusters_created} duplicate clusters found"
+        if skipped_count > 0:
+            summary_msg += f" ({skipped_count} skipped)"
         if slowest_5_records:
             slowest_str = ", ".join(f"#{r['cluster_id']} ({r['seconds']}s)" for r in slowest_5_records)
             summary_msg += f". Slowest clusters: {slowest_str}"
 
-        if all_warnings:
-            update_job_file(
-                job_file,
-                status="completed_with_warnings",
-                stage="done",
-                stage_display="Completed with warnings",
-                progress=100.0,
-                message=f"Pipeline complete with warnings ({len(all_warnings)} files skipped). {summary_msg}",
-                warnings=all_warnings,
-                slowest_clusters=slowest_5_records if slowest_5_records else None,
-            )
-        else:
-            update_job_file(
-                job_file,
-                status="completed",
-                stage="done",
-                stage_display="Completed",
-                progress=100.0,
-                message=summary_msg,
-                warnings=[],
-                slowest_clusters=slowest_5_records if slowest_5_records else None,
-            )
+        final_status = "completed_with_warnings" if all_warnings else "completed"
+        update_job_file(
+            job_file,
+            status=final_status,
+            stage="done",
+            stage_display="Completed with warnings" if all_warnings else "Completed",
+            progress=100.0,
+            message=f"Pipeline complete: {summary_msg}",
+            warnings=all_warnings,
+            slowest_clusters=slowest_5_records if slowest_5_records else None,
+            images_added=images_added,
+            clusters_created=clusters_created,
+            skipped_files=all_warnings,
+            skipped_count=skipped_count,
+            total_images=images_after,
+        )
     except Exception as exc:
+        import traceback
+        print(f"PIPELINE EXCEPTION at stage '{current_stage}': {type(exc).__name__}: {exc}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
         logger.exception("Pipeline failed at stage '%s': %s", current_stage, exc)
         err_detail = str(exc)
         exc_type = type(exc).__name__
@@ -468,12 +509,37 @@ def run_pipeline(
             err_msg = f"{exc_type}: {err_detail}"
         else:
             err_msg = err_detail
+
+        # Actionable advice construction
+        advice_parts = []
+        if current_stage in ("scan", "hash"):
+            advice_parts.append("Check file permissions, verify that paths are valid images, and ensure files are not corrupted or empty.")
+        elif current_stage == "embed":
+            advice_parts.append("Check system memory and verify CLIP model cache is accessible.")
+        elif current_stage in ("cluster", "verify"):
+            advice_parts.append("Check feature matching parameters and database integrity.")
+        elif current_stage == "quality":
+            advice_parts.append("Verify original image files are accessible on disk for quality analysis.")
+        elif current_stage == "categorize":
+            advice_parts.append("Check category configuration in config.toml.")
+
+        if source_type == "drive":
+            advice_parts.append("Verify Google Drive folder permissions, credentials, and network connectivity.")
+
+        actionable_advice = " ".join(advice_parts) if advice_parts else "Review error logs and retry the operation."
+
+        file_info = f" on file '{current_file_path}'" if current_file_path else ""
+        formatted_message = f"Pipeline failed at stage '{current_stage}'{file_info}: {err_msg}. Action: {actionable_advice}"
+
         update_job_file(
             job_file,
             status="failed",
             stage=current_stage,
             error=err_msg,
-            message=f"Pipeline failed at stage '{current_stage}': {err_msg}",
+            message=formatted_message,
+            failed_stage=current_stage,
+            failed_file=current_file_path,
+            actionable_advice=actionable_advice,
             slowest_clusters=slowest_5_records if slowest_5_records else None,
         )
     finally:

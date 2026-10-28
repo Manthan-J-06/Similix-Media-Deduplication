@@ -26,6 +26,28 @@ import torch
 from core.embeddings import CLIPEmbedder, deserialize_embedding, get_device
 
 
+DEFAULT_SCENE_LABELS = [
+    "indoor",
+    "landscape",
+    "architecture",
+    "workplace",
+    "studio",
+]
+
+DEFAULT_SUBJECT_LABELS = [
+    "portrait",
+    "animal",
+    "food",
+    "vehicle",
+    "document",
+    "screenshot",
+    "technology",
+    "artifact",
+    "people_working",
+    "other",
+]
+
+
 @dataclass
 class CategoryConfig:
     temperature: float = 0.05
@@ -33,14 +55,22 @@ class CategoryConfig:
     min_top_prob: float = 0.20
     labels: list[str] = field(default_factory=list)
     templates: dict[str, list[str]] = field(default_factory=dict)
+    scene_labels: list[str] = field(default_factory=list)
+    subject_labels: list[str] = field(default_factory=list)
 
 
 def parse_category_config(config: dict) -> CategoryConfig:
-    """Parse [categories] section from config.toml with zero hard-coded label defaults."""
+    """Parse [categories] section from config.toml with support for two-level scene & subject labels."""
     cat_cfg = config.get("categories", {})
     temperature = float(cat_cfg.get("temperature", 0.05))
     uncertain_margin = float(cat_cfg.get("uncertain_margin", 0.05))
     min_top_prob = float(cat_cfg.get("min_top_prob", 0.20))
+
+    scene_cfg = cat_cfg.get("scene_labels")
+    scene_labels = [str(s) for s in scene_cfg] if isinstance(scene_cfg, list) else list(DEFAULT_SCENE_LABELS)
+
+    subject_cfg = cat_cfg.get("subject_labels")
+    subject_labels = [str(s) for s in subject_cfg] if isinstance(subject_cfg, list) else list(DEFAULT_SUBJECT_LABELS)
 
     templates_cfg = cat_cfg.get("templates")
     labels_cfg = cat_cfg.get("labels")
@@ -62,7 +92,13 @@ def parse_category_config(config: dict) -> CategoryConfig:
     if isinstance(labels_cfg, list):
         labels = [str(l) for l in labels_cfg]
     else:
-        labels = list(templates.keys())
+        # Merge scene labels, subject labels, and any custom templates preserving order
+        seen = set()
+        labels = []
+        for l in scene_labels + subject_labels + list(templates.keys()):
+            if l not in seen:
+                seen.add(l)
+                labels.append(l)
 
     return CategoryConfig(
         temperature=temperature,
@@ -70,6 +106,8 @@ def parse_category_config(config: dict) -> CategoryConfig:
         min_top_prob=min_top_prob,
         labels=labels,
         templates=templates,
+        scene_labels=scene_labels,
+        subject_labels=subject_labels,
     )
 
 
@@ -239,10 +277,14 @@ class CategorizeResult:
 def update_cluster_categories(conn: sqlite3.Connection) -> int:
     """
     Update cluster-level category across all clusters:
-    1. Use the keeper's category_top1 if present.
-    2. Fall back to majority vote of cluster members' category_top1.
+    1. If manual_category is set on the cluster, preserve it as the authoritative label.
+    2. Otherwise, use the keeper's category_top1 if present.
+    3. Fall back to majority vote of cluster members' category_top1.
     """
-    clusters = conn.execute("SELECT id, representative_id FROM clusters ORDER BY id").fetchall()
+    cluster_cols = {row[1] for row in conn.execute("PRAGMA table_info(clusters)").fetchall()}
+    has_manual = "manual_category" in cluster_cols
+    manual_clause = "manual_category," if has_manual else "NULL AS manual_category,"
+    clusters = conn.execute(f"SELECT id, representative_id, {manual_clause} category FROM clusters ORDER BY id").fetchall()
     updated = 0
 
     cols = {row[1] for row in conn.execute("PRAGMA table_info(images)").fetchall()}
@@ -252,6 +294,12 @@ def update_cluster_categories(conn: sqlite3.Connection) -> int:
     for c in clusters:
         cid = c["id"]
         rep_id = c["representative_id"]
+        manual_cat = c["manual_category"] if has_manual and c["manual_category"] else None
+
+        if manual_cat:
+            conn.execute("UPDATE clusters SET category = ? WHERE id = ?", (manual_cat, cid))
+            updated += 1
+            continue
 
         members = conn.execute(
             f"""
@@ -370,10 +418,12 @@ def run_categorization(
                 uncertain_margin=cat_cfg.uncertain_margin,
                 min_top_prob=cat_cfg.min_top_prob,
             )
-            updates.append((cat_top1, cat_top1_prob, json.dumps(cat_top3), img_id))
+            cat_top2 = cat_top3[1]["label"] if len(cat_top3) > 1 else None
+            cat_top2_prob = cat_top3[1]["prob"] if len(cat_top3) > 1 else None
+            updates.append((cat_top1, cat_top1_prob, cat_top2, cat_top2_prob, json.dumps(cat_top3), img_id))
 
             counts_by_cat[cat_top1] = counts_by_cat.get(cat_top1, 0) + 1
-            if cat_top1 == "uncertain":
+            if cat_top1 in ("uncertain", "Needs label"):
                 uncertain_count += 1
 
         conn.executemany(
@@ -381,6 +431,8 @@ def run_categorization(
             UPDATE images
             SET category_top1 = ?,
                 category_top1_prob = ?,
+                category_top2 = ?,
+                category_top2_prob = ?,
                 category_top3 = ?,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
             WHERE id = ?

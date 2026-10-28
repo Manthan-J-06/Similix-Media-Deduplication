@@ -78,6 +78,8 @@ def init_db(db_path: str | Path) -> sqlite3.Connection:
         ("quality_basis", "TEXT"),
         ("category_top1", "TEXT"),
         ("category_top1_prob", "REAL"),
+        ("category_top2", "TEXT"),
+        ("category_top2_prob", "REAL"),
         ("category_top3", "TEXT"),
     )
 
@@ -128,6 +130,8 @@ def init_db(db_path: str | Path) -> sqlite3.Connection:
         conn.execute("ALTER TABLE clusters ADD COLUMN reference_uncertain INTEGER NOT NULL DEFAULT 0;")
     if "category" not in existing_cluster_cols:
         conn.execute("ALTER TABLE clusters ADD COLUMN category TEXT;")
+    if "manual_category" not in existing_cluster_cols:
+        conn.execute("ALTER TABLE clusters ADD COLUMN manual_category TEXT;")
 
     # 3. Create indexes now that all referenced columns are guaranteed to exist
     conn.executescript(CREATE_INDEXES)

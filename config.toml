@@ -117,13 +117,35 @@ allow_resolution_loss = false
 # Temperature for softmax over cosine similarities (lower = peakier distribution).
 temperature = 0.05
 # Minimum probability difference between top-1 and top-2 required for confident label.
-# If top1_prob - top2_prob < uncertain_margin, categorized as 'uncertain'.
+# If top1_prob - top2_prob < uncertain_margin, categorized as 'uncertain' / 'Needs label'.
 uncertain_margin = 0.05
 # Minimum absolute probability required for top-1 category.
-# If top1_prob < min_top_prob, categorized as 'uncertain'.
+# If top1_prob < min_top_prob, categorized as 'uncertain' / 'Needs label'.
 min_top_prob = 0.20
 
-# Category labels with 3-5 prompt templates each
+# Two-level label categorization (Scene & Subject)
+scene_labels = [
+    "indoor",
+    "landscape",
+    "architecture",
+    "workplace",
+    "studio",
+]
+
+subject_labels = [
+    "portrait",
+    "animal",
+    "food",
+    "vehicle",
+    "document",
+    "screenshot",
+    "technology",
+    "artifact",
+    "people_working",
+    "other",
+]
+
+# Category labels with prompt templates
 [categories.templates]
 landscape = [
     "a photo of a natural landscape or scenery",
@@ -144,6 +166,16 @@ architecture = [
     "a photo of a building, architecture, or city structure",
     "an exterior or interior photograph of architecture",
     "a photo of urban buildings, monuments, or streets",
+]
+workplace = [
+    "a photo of a workplace, office, or desk environment",
+    "a photograph of a professional office, boardroom, or workstation",
+    "a picture of people working in an office or workspace setting",
+]
+studio = [
+    "a photo taken in a professional studio setting with a clean background",
+    "a studio photograph with solid or seamless backdrop",
+    "a staged product or subject photograph in a studio",
 ]
 food = [
     "a photo of food, a meal, or a dish",

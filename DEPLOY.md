@@ -45,6 +45,9 @@ Argus is containerized using `python:3.11-slim`, runs as a non-root user (`argus
    ```bash
    docker compose down
    ```
+   > [!CAUTION]
+   > **Never use `docker compose down -v`**.
+   > The `-v` flag deletes Docker volumes, which permanently destroys the `argus_data` volume containing `auth.db`, per-user databases, uploaded libraries, thumbnails, and ledger journals. To preserve user accounts and data across container restarts and image updates, always stop containers using `docker compose down` (without `-v`).
 
 ### What Persists vs What Doesn't (Docker)
 

@@ -272,6 +272,48 @@ class TestAuthenticationAndSessions:
         assert res.status_code == 200
         assert res.json() == {"status": "ok", "service": "argus"}
 
+    def test_app_restart_persists_accounts_and_sessions(self, tmp_path: Path):
+        """Accounts and sessions persist across app restarts when using ARGUS_DATA_DIR / auth_db."""
+        data_dir = tmp_path / "argus_data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        auth_db = data_dir / "auth.db"
+        users_dir = data_dir / "users"
+
+        # 1. Start App instance 1
+        app1 = create_app(auth_db_path=auth_db, users_dir=users_dir)
+        client1 = TestClient(app1)
+
+        # Register account on App 1
+        email = "persisted_user@example.com"
+        pwd = "PersistPassword123!"
+        auth1 = register_and_login(client1, email, pwd)
+        user_id = auth1["user_id"]
+        token1 = auth1["token"]
+
+        me_resp1 = client1.get("/auth/me")
+        assert me_resp1.status_code == 200
+        assert me_resp1.json()["id"] == user_id
+
+        # 2. Simulate complete application shutdown & restart (create new app instance with same storage)
+        del app1
+        del client1
+
+        app2 = create_app(auth_db_path=auth_db, users_dir=users_dir)
+        client2 = TestClient(app2)
+
+        # A) Existing session token can still access /auth/me
+        client2.cookies.set("argus_session", token1)
+        me_resp2 = client2.get("/auth/me")
+        assert me_resp2.status_code == 200
+        assert me_resp2.json()["id"] == user_id
+        assert me_resp2.json()["email"] == email
+
+        # B) Logging in with the existing account on the restarted app succeeds
+        client3 = TestClient(app2)
+        login_res = client3.post("/auth/login", json={"email": email, "password": pwd})
+        assert login_res.status_code == 200
+        assert login_res.json()["user"]["id"] == user_id
+
 
 class TestPerUserIsolation:
     def test_user_a_cannot_access_user_b_resources(self, auth_test_app):
