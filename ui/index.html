@@ -80,25 +80,22 @@
       display: flex;
       align-items: center;
       gap: 10px;
+      user-select: none;
+      flex-shrink: 0;
     }
-    .argus-logo {
+    .argus-eye {
+      width: 28px;
       height: 28px;
+      flex-shrink: 0;
       display: inline-block;
       vertical-align: middle;
     }
-    .eye-pupil {
-      fill: #0B1B3A;
-    }
     .argus-wordmark {
-      fill: #0B1B3A;
-    }
-    @media (prefers-color-scheme: dark) {
-      .eye-pupil {
-        fill: #1E293B;
-      }
-      .argus-wordmark {
-        fill: #F8FAFC;
-      }
+      font-weight: 700;
+      letter-spacing: .12em;
+      font-size: 1.25rem;
+      color: var(--text);
+      line-height: 1;
     }
 
     /* Mode Slider / Switcher */
@@ -805,15 +802,12 @@
   <!-- Top App Header -->
   <header>
     <div class="brand">
-      <svg class="argus-logo" viewBox="0 0 128 32" height="28" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="ARGUS">
-        <path d="M3 16C7 8.5 16 4.5 24 4.5C32 4.5 41 8.5 45 16C41 23.5 32 27.5 24 27.5C16 27.5 7 23.5 3 16Z" stroke="#2DD4BF" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
-        <circle cx="24" cy="16" r="6.5" class="eye-pupil" fill="#0B1B3A" stroke="#2DD4BF" stroke-width="1.2"/>
-        <rect x="21.5" y="13.5" width="2" height="2" rx="0.4" fill="#2DD4BF"/>
-        <rect x="24.5" y="13.5" width="2" height="2" rx="0.4" fill="#FFFFFF"/>
-        <rect x="21.5" y="16.5" width="2" height="2" rx="0.4" fill="#FFFFFF"/>
-        <rect x="24.5" y="16.5" width="2" height="2" rx="0.4" fill="#2DD4BF"/>
-        <text x="54" y="23" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="20" font-weight="800" letter-spacing="0.14em" class="argus-wordmark" fill="#0B1B3A">ARGUS</text>
+      <svg class="argus-eye" viewBox="0 0 40 40" width="28" height="28" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="Argus eye mark">
+        <path d="M 4 20 C 11 9 29 9 36 20 C 29 31 11 31 4 20 Z" stroke="#2DD4BF" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="20" cy="20" r="7" stroke="#2DD4BF" stroke-width="2"/>
+        <circle cx="20" cy="20" r="3" fill="#2DD4BF"/>
       </svg>
+      <span class="argus-wordmark">ARGUS</span>
     </div>
 
     <!-- Mode Slider (Conservative / Balanced / Aggressive) -->
@@ -854,6 +848,12 @@
       <div id="job-progress-fill" style="width: 0%; height: 100%; background: #2563eb; transition: width 0.3s;"></div>
     </div>
     <div id="job-summary-details" style="display: none; margin-top: 6px; font-size: 12px; color: var(--text-muted);"></div>
+  </div>
+
+  <!-- Inline App Notice Banner -->
+  <div id="app-notice-banner" style="display: none; padding: 10px 16px; font-size: 13px; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border);">
+    <span id="app-notice-text"></span>
+    <button type="button" class="btn" id="btn-dismiss-notice" style="padding: 2px 8px; font-size: 11px;">✕</button>
   </div>
 
   <!-- Main View -->
@@ -952,6 +952,8 @@
           <strong>Files are moved to trash and can be undone.</strong>
         </div>
 
+        <div id="plan-modal-error" style="display:none; color:var(--danger); font-size:0.85rem; padding:8px 12px; background:var(--danger-bg); border:1px solid var(--danger-border); border-radius:6px; margin-bottom:10px;"></div>
+
         <div style="font-size:0.9rem;">
           <p>Batch ID: <code id="plan-batch-id">batch_...</code></p>
           <p style="margin-top:4px;">
@@ -987,6 +989,7 @@
         <button type="button" class="btn" id="btn-close-history">&times;</button>
       </div>
       <div class="modal-body">
+        <div id="history-modal-msg" style="display:none; font-size:0.85rem; padding:8px 12px; border-radius:6px; margin-bottom:12px;"></div>
         <div id="history-loading" style="text-align:center; padding:20px;">Loading history...</div>
         <table class="history-table" id="history-table" style="display:none;">
           <thead>
@@ -1099,10 +1102,71 @@
     // Authentication & CSRF token helper
     let currentUser = null;
     let csrfToken = "";
+    let cachedCsrfToken = "";
 
     function getCookie(name) {
       const match = document.cookie.match(new RegExp('(^|;\\s*)(' + name + ')=([^;]*)'));
       return match ? decodeURIComponent(match[3]) : "";
+    }
+
+    async function getCsrfToken() {
+      if (cachedCsrfToken) return cachedCsrfToken;
+      if (csrfToken) {
+        cachedCsrfToken = csrfToken;
+        return cachedCsrfToken;
+      }
+      const cookieTok = getCookie("argus_csrf");
+      if (cookieTok) {
+        cachedCsrfToken = cookieTok;
+        return cachedCsrfToken;
+      }
+      try {
+        const res = await _origFetch("/auth/me");
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.csrf_token) {
+            cachedCsrfToken = data.csrf_token;
+            csrfToken = data.csrf_token;
+            return cachedCsrfToken;
+          }
+        }
+      } catch (_) {}
+      return getCookie("argus_csrf") || "";
+    }
+    window.getCsrfToken = getCsrfToken;
+
+    // Inline notice helper (replaces alert popups)
+    function showInlineNotice(msg, type = "error") {
+      const banner = document.getElementById("app-notice-banner");
+      const textEl = document.getElementById("app-notice-text");
+      if (!banner || !textEl) return;
+      textEl.textContent = msg;
+      if (type === "error") {
+        banner.style.background = "var(--danger-bg)";
+        banner.style.color = "var(--danger)";
+        banner.style.borderBottom = "1px solid var(--danger-border)";
+      } else if (type === "success") {
+        banner.style.background = "var(--success-bg)";
+        banner.style.color = "var(--success)";
+        banner.style.borderBottom = "1px solid var(--success-border)";
+      } else {
+        banner.style.background = "var(--warning-bg)";
+        banner.style.color = "var(--warning)";
+        banner.style.borderBottom = "1px solid var(--warning-border)";
+      }
+      banner.style.display = "flex";
+      if (type !== "error") {
+        setTimeout(() => {
+          if (banner.style.display === "flex" && textEl.textContent === msg) {
+            banner.style.display = "none";
+          }
+        }, 6000);
+      }
+    }
+
+    function hideInlineNotice() {
+      const banner = document.getElementById("app-notice-banner");
+      if (banner) banner.style.display = "none";
     }
 
     // Intercept fetch: inject CSRF token header on mutations and redirect to /login on 401
@@ -1111,7 +1175,7 @@
       init.headers = init.headers || {};
       const method = (init.method || "GET").toUpperCase();
       if (method === "POST" || method === "PUT" || method === "DELETE" || method === "PATCH") {
-        const token = csrfToken || getCookie("argus_csrf");
+        const token = await getCsrfToken();
         if (token) {
           if (init.headers instanceof Headers) {
             if (!init.headers.has("X-CSRF-Token")) init.headers.set("X-CSRF-Token", token);
@@ -1135,13 +1199,14 @@
 
     async function initAuth() {
       try {
-        const res = await fetch("/auth/me");
+        const res = await _origFetch("/auth/me");
         if (!res.ok) {
           window.location.href = "/login";
           return false;
         }
         currentUser = await res.json();
         csrfToken = currentUser.csrf_token || getCookie("argus_csrf");
+        cachedCsrfToken = csrfToken;
         const emailEl = document.getElementById("user-email-display");
         if (emailEl) emailEl.textContent = currentUser.email;
         return true;
@@ -1382,6 +1447,9 @@
             await selectCluster(targetId, seq);
           } else {
             activeClusterId = null;
+            currentClusterData = null;
+            const grid = document.getElementById("member-grid");
+            if (grid) grid.innerHTML = "";
             document.getElementById("detail-content").style.display = "none";
             const emptyEl = document.getElementById("detail-empty");
             emptyEl.style.display = "flex";
@@ -1460,7 +1528,7 @@
           const newCat = prompt(`Enter category label for Cluster #${data.id}:`, currentVal);
           if (newCat !== null && newCat.trim()) {
             try {
-              const csrf = getCsrfToken();
+              const csrf = await getCsrfToken();
               const resp = await fetch(`/clusters/${data.id}/category`, {
                 method: "POST",
                 headers: {
@@ -1479,11 +1547,11 @@
                 catEl.style.borderColor = "";
                 await refreshAll({ preserveActiveCluster: true });
               } else {
-                const errData = await resp.json();
-                alert(`Failed to set category: ${errData.detail || "Error"}`);
+                const errData = await resp.json().catch(() => ({}));
+                showInlineNotice(`Failed to set category: ${errData.detail || "Error"}`, "error");
               }
             } catch (err) {
-              alert(`Error: ${err.message}`);
+              showInlineNotice(`Error: ${err.message || err}`, "error");
             }
           }
         };
@@ -1674,16 +1742,23 @@
         excluded_ids: excludedIds,
       };
 
+      const planErr = document.getElementById("plan-modal-error");
+      if (planErr) planErr.style.display = "none";
+
       try {
+        const csrf = await getCsrfToken();
         const res = await fetch("/plan", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": csrf,
+          },
           body: JSON.stringify(payload),
         });
 
         if (!res.ok) {
-          const err = await res.json();
-          alert("Planning error: " + (err.detail || "Unable to build plan"));
+          const err = await res.json().catch(() => ({}));
+          showInlineNotice("Planning error: " + (err.detail || "Unable to build plan"), "error");
           return;
         }
 
@@ -1719,6 +1794,7 @@
         document.getElementById("confirm-modal").style.display = "flex";
       } catch (err) {
         console.error("Failed to call /plan:", err);
+        showInlineNotice("Failed to call plan: " + (err.message || err), "error");
       }
     }
 
@@ -1729,17 +1805,29 @@
       const confirmBtn = document.getElementById("btn-confirm-apply");
       confirmBtn.disabled = true;
       confirmBtn.textContent = "Moving...";
+      const planErr = document.getElementById("plan-modal-error");
+      if (planErr) planErr.style.display = "none";
 
       try {
+        const csrf = await getCsrfToken();
         const res = await fetch("/apply", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": csrf,
+          },
           body: JSON.stringify({ batch_id: currentPlannedBatchId, confirm: true }),
         });
 
         if (!res.ok) {
-          const err = await res.json();
-          alert("Apply failed: " + (err.detail || "Error during execution"));
+          const err = await res.json().catch(() => ({}));
+          const errMsg = "Apply failed: " + (err.detail || "Error during execution");
+          if (planErr) {
+            planErr.textContent = errMsg;
+            planErr.style.display = "block";
+          } else {
+            showInlineNotice(errMsg, "error");
+          }
           confirmBtn.disabled = false;
           confirmBtn.textContent = "Confirm & Move";
           return;
@@ -1753,7 +1841,13 @@
         await refreshAll({ preserveActiveCluster: true });
       } catch (err) {
         console.error("Failed to call /apply:", err);
-        alert("Failed to execute move: " + err);
+        const errMsg = "Failed to execute move: " + (err.message || err);
+        if (planErr) {
+          planErr.textContent = errMsg;
+          planErr.style.display = "block";
+        } else {
+          showInlineNotice(errMsg, "error");
+        }
         confirmBtn.disabled = false;
         confirmBtn.textContent = "Confirm & Move";
       }
@@ -1762,18 +1856,38 @@
     // Undo from modal apply-success-box
     document.getElementById("btn-undo-apply").addEventListener("click", async () => {
       if (!currentPlannedBatchId) return;
+      const planErr = document.getElementById("plan-modal-error");
+      if (planErr) planErr.style.display = "none";
       try {
+        const csrf = await getCsrfToken();
         const res = await fetch("/undo", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": csrf,
+          },
           body: JSON.stringify({ batch_id: currentPlannedBatchId }),
         });
-        if (!res.ok) throw new Error("Undo failed");
-        alert("Batch successfully undone! Files have been restored.");
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.detail || "Undo failed");
+        }
+        const undoBtn = document.getElementById("btn-undo-apply");
+        if (undoBtn) {
+          undoBtn.disabled = true;
+          undoBtn.textContent = "✓ Undone";
+        }
+        showInlineNotice("Batch successfully undone! Files have been restored.", "success");
         document.getElementById("confirm-modal").style.display = "none";
         await refreshAll({ preserveActiveCluster: true });
       } catch (err) {
-        alert("Undo failed: " + err);
+        const errMsg = "Undo failed: " + (err.message || err);
+        if (planErr) {
+          planErr.textContent = errMsg;
+          planErr.style.display = "block";
+        } else {
+          showInlineNotice(errMsg, "error");
+        }
       }
     });
 
@@ -1803,7 +1917,7 @@
         console.error("Failed to switch mode:", err);
         currentMode = prevMode;
         buttons.forEach(b => b.classList.toggle("active", b.dataset.mode === prevMode));
-        alert("Failed to switch mode: " + (err.message || err));
+        showInlineNotice("Failed to switch mode: " + (err.message || err), "error");
       } finally {
         buttons.forEach(b => b.disabled = false);
         if (spinner) spinner.style.display = "none";
@@ -1826,9 +1940,13 @@
         btnCatNow.disabled = true;
         btnCatNow.textContent = "Queueing...";
         try {
+          const csrf = await getCsrfToken();
           const res = await fetch("/categories/run", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+              "Content-Type": "application/json",
+              "X-CSRF-Token": csrf,
+            },
           });
           if (!res.ok) {
             const err = await res.json().catch(() => ({}));
@@ -1839,7 +1957,7 @@
             pollJobProgress(data.job_id);
           }
         } catch (err) {
-          alert("Categorization error: " + (err.message || err));
+          showInlineNotice("Categorization error: " + (err.message || err), "error");
         } finally {
           btnCatNow.disabled = false;
           btnCatNow.textContent = "Categorize now";
@@ -1920,19 +2038,47 @@
         tbody.querySelectorAll(".btn-undo-row").forEach(btn => {
           btn.addEventListener("click", async () => {
             const bId = btn.dataset.batch;
-            if (!confirm(`Are you sure you want to restore batch ${bId}?`)) return;
+            btn.disabled = true;
+            btn.textContent = "Restoring...";
+            const histMsg = document.getElementById("history-modal-msg");
+            if (histMsg) histMsg.style.display = "none";
+
             try {
+              const csrf = await getCsrfToken();
               const uRes = await fetch("/undo", {
                 method: "POST",
-                headers: { "Content-Type": "application/json" },
+                headers: {
+                  "Content-Type": "application/json",
+                  "X-CSRF-Token": csrf,
+                },
                 body: JSON.stringify({ batch_id: bId }),
               });
-              if (!uRes.ok) throw new Error("Undo failed");
-              alert(`Batch ${bId} restored successfully!`);
+              if (!uRes.ok) {
+                const errData = await uRes.json().catch(() => ({}));
+                throw new Error(errData.detail || "Undo failed");
+              }
+              if (histMsg) {
+                histMsg.textContent = `✓ Batch ${bId} restored successfully!`;
+                histMsg.style.display = "block";
+                histMsg.style.color = "var(--success)";
+                histMsg.style.background = "var(--success-bg)";
+                histMsg.style.border = "1px solid var(--success-border)";
+              }
+              showInlineNotice(`Batch ${bId} restored successfully!`, "success");
               openHistoryModal();
               await refreshAll({ preserveActiveCluster: true });
             } catch (err) {
-              alert("Undo failed: " + err);
+              btn.disabled = false;
+              btn.textContent = "Undo";
+              if (histMsg) {
+                histMsg.textContent = "Undo failed: " + (err.message || err);
+                histMsg.style.display = "block";
+                histMsg.style.color = "var(--danger)";
+                histMsg.style.background = "var(--danger-bg)";
+                histMsg.style.border = "1px solid var(--danger-border)";
+              } else {
+                showInlineNotice("Undo failed: " + (err.message || err), "error");
+              }
             }
           });
         });
@@ -2205,8 +2351,10 @@
         formData.append("files", f);
       }
       try {
+        const csrf = await getCsrfToken();
         const res = await fetch("/sources/upload", {
           method: "POST",
+          headers: { "X-CSRF-Token": csrf },
           body: formData,
         });
         if (!res.ok) {
@@ -2231,23 +2379,36 @@
         btnStartUpload.textContent = "Upload & Run Pipeline";
         const msg = document.getElementById("source-status-msg");
         msg.style.display = "block";
-        msg.style.background = "rgba(239, 68, 68, 0.1)";
+        msg.style.background = "var(--danger-bg)";
         msg.style.color = "var(--danger)";
-        msg.textContent = err.message;
+        msg.style.border = "1px solid var(--danger-border)";
+        msg.textContent = err.message || "Upload failed";
       }
     });
 
     // Tab 2: Google Drive
     document.getElementById("btn-scan-drive").addEventListener("click", async () => {
       const link = document.getElementById("drive-link-input").value.trim();
-      if (!link) return alert("Please enter a Google Drive folder link or ID");
+      if (!link) {
+        const msg = document.getElementById("source-status-msg");
+        msg.style.display = "block";
+        msg.style.background = "var(--danger-bg)";
+        msg.style.color = "var(--danger)";
+        msg.style.border = "1px solid var(--danger-border)";
+        msg.textContent = "Please enter a Google Drive folder link or ID";
+        return;
+      }
       const btn = document.getElementById("btn-scan-drive");
       btn.disabled = true;
       btn.textContent = "Validating...";
       try {
+        const csrf = await getCsrfToken();
         const res = await fetch("/sources/drive", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": csrf,
+          },
           body: JSON.stringify({ link }),
         });
         if (!res.ok) {
@@ -2273,8 +2434,9 @@
         btn.textContent = "Scan Drive (Read-Only)";
         const msg = document.getElementById("source-status-msg");
         msg.style.display = "block";
-        msg.style.background = "rgba(239, 68, 68, 0.1)";
+        msg.style.background = "var(--danger-bg)";
         msg.style.color = "var(--danger)";
+        msg.style.border = "1px solid var(--danger-border)";
         const txt = (err.message && err.message.toLowerCase().includes("hosted mode")) ? "Disabled in hosted mode" : err.message;
         msg.textContent = txt;
       }
@@ -2283,14 +2445,26 @@
     // Tab 3: Dataset URL
     document.getElementById("btn-import-dataset").addEventListener("click", async () => {
       const url = document.getElementById("dataset-url-input").value.trim();
-      if (!url) return alert("Please enter a dataset URL");
+      if (!url) {
+        const msg = document.getElementById("source-status-msg");
+        msg.style.display = "block";
+        msg.style.background = "var(--danger-bg)";
+        msg.style.color = "var(--danger)";
+        msg.style.border = "1px solid var(--danger-border)";
+        msg.textContent = "Please enter a dataset URL";
+        return;
+      }
       const btn = document.getElementById("btn-import-dataset");
       btn.disabled = true;
       btn.textContent = "Importing...";
       try {
+        const csrf = await getCsrfToken();
         const res = await fetch("/sources/dataset", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": csrf,
+          },
           body: JSON.stringify({ url }),
         });
         if (!res.ok) {
@@ -2316,8 +2490,9 @@
         btn.textContent = "Import Dataset";
         const msg = document.getElementById("source-status-msg");
         msg.style.display = "block";
-        msg.style.background = "rgba(239, 68, 68, 0.1)";
+        msg.style.background = "var(--danger-bg)";
         msg.style.color = "var(--danger)";
+        msg.style.border = "1px solid var(--danger-border)";
         const txt = (err.message && err.message.toLowerCase().includes("hosted mode")) ? "Disabled in hosted mode" : err.message;
         msg.textContent = txt;
       }
@@ -2328,7 +2503,11 @@
       const btn = document.getElementById("btn-rescan");
       btn.disabled = true;
       try {
-        const res = await fetch("/sources/rescan", { method: "POST" });
+        const csrf = await getCsrfToken();
+        const res = await fetch("/sources/rescan", {
+          method: "POST",
+          headers: { "X-CSRF-Token": csrf },
+        });
         if (!res.ok) {
           const err = await res.json().catch(() => ({}));
           throw new Error(err.detail || "Rescan failed");
@@ -2343,7 +2522,7 @@
         }
       } catch (err) {
         btn.disabled = false;
-        alert("Rescan error: " + err.message);
+        showInlineNotice("Rescan error: " + (err.message || err), "error");
       }
     });
 
@@ -2397,8 +2576,15 @@
     if (logoutBtn) {
       logoutBtn.addEventListener("click", async () => {
         try {
-          await fetch("/auth/logout", { method: "POST" });
+          const csrf = await getCsrfToken();
+          await fetch("/auth/logout", {
+            method: "POST",
+            headers: { "X-CSRF-Token": csrf },
+          });
         } catch (_) {}
+        currentUser = null;
+        csrfToken = "";
+        cachedCsrfToken = "";
         window.location.href = "/login";
       });
     }
@@ -2478,13 +2664,11 @@
         }
 
         try {
-          const tok = csrfToken || getCookie("argus_csrf");
+          const csrf = await getCsrfToken();
           const headers = {
             "Content-Type": "application/json",
+            "X-CSRF-Token": csrf,
           };
-          if (tok) {
-            headers["X-CSRF-Token"] = tok;
-          }
 
           const res = await fetch("/auth/delete-account", {
             method: "POST",
@@ -2504,6 +2688,7 @@
             } catch (_) {}
             currentUser = null;
             csrfToken = "";
+            cachedCsrfToken = "";
             window.location.href = "/login?notice=" + encodeURIComponent("Your account was deleted");
             return;
           }
@@ -2528,6 +2713,10 @@
         }
       });
     }
+
+    // Dismiss inline notice banner
+    const btnDismissNotice = document.getElementById("btn-dismiss-notice");
+    if (btnDismissNotice) btnDismissNotice.addEventListener("click", hideInlineNotice);
 
     // Initial Load: check authentication first
     initAuth().then((authenticated) => {
