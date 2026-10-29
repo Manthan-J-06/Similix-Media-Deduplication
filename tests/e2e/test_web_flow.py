@@ -475,3 +475,93 @@ def test_logo_rendering(live_server):
 
         browser.close()
 
+
+def test_library_all_photos_and_downloads(live_server, tmp_path):
+    from playwright.sync_api import sync_playwright
+
+    base_url = live_server
+
+    # Create 3 test images: 2 identical, 1 unique
+    p_orig = tmp_path / "img_orig.jpg"
+    p_copy = tmp_path / "img_copy.jpg"
+    p_unique = tmp_path / "img_unique.jpg"
+    _create_image(p_orig, color=(20, 180, 70), size=(180, 180))
+    p_copy.write_bytes(p_orig.read_bytes())
+    _create_image(p_unique, color=(180, 20, 140), size=(180, 180))
+
+    email = f"libuser_{uuid.uuid4().hex[:8]}@argus.local"
+    password = "ArgusPassword123!"
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context()
+        page = context.new_page()
+
+        page.goto(f"{base_url}/login")
+        page.wait_for_selector("#tab-register", timeout=10000)
+        page.click("#tab-register")
+        page.fill("#email", email)
+        page.fill("#password", password)
+        page.click("#submit-btn")
+
+        try:
+            page.wait_for_url(f"{base_url}/", timeout=15000)
+        except Exception:
+            if page.is_visible("#tab-login.active"):
+                page.fill("#email", email)
+                page.fill("#password", password)
+                page.click("#submit-btn")
+                page.wait_for_url(f"{base_url}/", timeout=15000)
+
+        page.wait_for_selector("#user-email-display", timeout=10000)
+
+        # Upload files
+        page.click("#btn-open-sources")
+        page.wait_for_selector("#sources-modal", state="visible", timeout=5000)
+        page.set_input_files("#file-input", [str(p_orig), str(p_copy), str(p_unique)])
+        page.wait_for_selector("#btn-start-upload", state="visible", timeout=5000)
+        page.click("#btn-start-upload")
+
+        # Wait for banner to complete
+        page.wait_for_selector("#job-progress-banner", state="visible", timeout=10000)
+        page.wait_for_function(
+            "() => document.getElementById('job-percent-text')?.textContent === '100%' || "
+            "(document.getElementById('job-status-text')?.textContent || '').includes('Pipeline complete') || "
+            "(document.getElementById('job-status-text')?.textContent || '').includes('Pipeline completed')",
+            timeout=60000,
+        )
+
+        # 1. Check "All photos" tab view
+        page.wait_for_selector("#tab-all-photos")
+        page.click("#tab-all-photos")
+        page.wait_for_selector("#library-view-panel", state="visible")
+
+        # Verify photo cards in library
+        page.wait_for_selector(".library-card")
+        cards = page.locator(".library-card").all()
+        assert len(cards) >= 3
+
+        # Check search input in library
+        page.fill("#lib-search-input", "img_unique")
+        page.wait_for_timeout(500)
+        filtered_cards = page.locator(".library-card").all()
+        assert len(filtered_cards) == 1
+
+        # Clear search
+        page.fill("#lib-search-input", "")
+        page.wait_for_timeout(500)
+
+        # 2. Check cluster badge jumping
+        cluster_badge = page.locator(".library-card .badge-cluster-link").first
+        if cluster_badge.is_visible():
+            cluster_badge.click()
+            page.wait_for_selector("#duplicates-view-panel", state="visible")
+            page.wait_for_selector("#detail-content", state="visible")
+
+        # 3. Check Download buttons existence
+        assert page.locator("#btn-download-all-keepers").is_visible()
+        assert page.locator("#btn-download-cluster").is_visible()
+
+        context.close()
+        browser.close()
+

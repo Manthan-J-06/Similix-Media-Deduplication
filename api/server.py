@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import io
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -21,6 +22,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Any, Optional
@@ -31,7 +33,7 @@ import zipfile
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -144,6 +146,11 @@ class DatasetSourceRequest(BaseModel):
 
 class ClusterCategoryRequest(BaseModel):
     category: str
+    model_config = ConfigDict(extra="ignore")
+
+
+class DownloadSelectedRequest(BaseModel):
+    image_ids: list[int] = Field(..., min_length=1)
     model_config = ConfigDict(extra="ignore")
 
 
@@ -705,7 +712,7 @@ def create_app(
         if not path.startswith("/thumb/"):
             content_type = response.headers.get("content-type", "")
             if (
-                path.startswith(("/clusters", "/categories", "/jobs", "/history", "/auth", "/plan", "/apply", "/undo", "/sources"))
+                path.startswith(("/clusters", "/categories", "/jobs", "/history", "/auth", "/plan", "/apply", "/undo", "/sources", "/library", "/download"))
                 or "application/json" in content_type
             ):
                 response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
@@ -936,6 +943,279 @@ def create_app(
             media_type="application/zip",
             headers={"Content-Disposition": 'attachment; filename="argus_library.zip"'},
         )
+
+    # ==========================
+    # Downloads & Library
+    # ==========================
+
+    def stream_zip_archive(files_to_zip: list[tuple[Path, str]], zip_filename: str):
+        """Create and stream a zip archive from a list of (Path, arcname) tuples."""
+        if not files_to_zip:
+            raise HTTPException(status_code=404, detail="No downloadable files found")
+
+        max_download_size = 2 * 1024 * 1024 * 1024  # 2 GB cap
+        total_size = 0
+        for fp, _ in files_to_zip:
+            if fp.is_file() and not fp.is_symlink():
+                try:
+                    total_size += fp.stat().st_size
+                except OSError:
+                    pass
+
+        if total_size > max_download_size:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Total download size ({total_size // (1024*1024)} MB) exceeds 2GB cap",
+            )
+
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+        temp_path = Path(temp_file.name)
+        temp_file.close()
+
+        try:
+            with zipfile.ZipFile(temp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                seen_arcnames: set[str] = set()
+                for fp, arcname in files_to_zip:
+                    if not fp.is_file() or fp.is_symlink():
+                        continue
+                    final_arcname = arcname
+                    count = 1
+                    while final_arcname in seen_arcnames:
+                        p = Path(arcname)
+                        final_arcname = f"{p.stem}_{count}{p.suffix}"
+                        count += 1
+                    seen_arcnames.add(final_arcname)
+                    zf.write(fp, arcname=final_arcname)
+        except Exception as exc:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except Exception:
+                    pass
+            raise HTTPException(status_code=500, detail=f"Failed to create zip archive: {exc}")
+
+        def iter_file():
+            try:
+                with open(temp_path, "rb") as f:
+                    while chunk := f.read(65536):
+                        yield chunk
+            finally:
+                if temp_path.exists():
+                    try:
+                        temp_path.unlink()
+                    except Exception:
+                        pass
+
+        return StreamingResponse(
+            iter_file(),
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="{zip_filename}"',
+                "Cache-Control": "no-store",
+            },
+        )
+
+    @app.get("/download/cluster/{cluster_id}")
+    def download_cluster(
+        cluster_id: int,
+        request: Request = None,
+        user: UserContext = Depends(get_current_user),
+        conn: sqlite3.Connection = Depends(get_db),
+    ):
+        """Stream a zip archive of all live files in a cluster (user library only)."""
+        c_row = conn.execute("SELECT id FROM clusters WHERE id = ?", (cluster_id,)).fetchone()
+        if not c_row:
+            raise HTTPException(status_code=404, detail=f"Cluster {cluster_id} not found")
+
+        rows = conn.execute(
+            "SELECT id, file_path, file_size FROM images WHERE cluster_id = ? AND status != 'deleted'",
+            (cluster_id,),
+        ).fetchall()
+
+        files_to_zip = []
+        for r in rows:
+            fp = Path(r["file_path"])
+            if fp.is_file() and not fp.is_symlink():
+                try:
+                    validate_confined_user_path(fp, user.library_dir)
+                    files_to_zip.append((fp, fp.name))
+                except Exception:
+                    try:
+                        validate_confined_user_path(fp, user.root)
+                        files_to_zip.append((fp, fp.name))
+                    except Exception:
+                        pass
+
+        return stream_zip_archive(files_to_zip, f"cluster_{cluster_id}.zip")
+
+    @app.post("/download/selected")
+    def download_selected(
+        req: DownloadSelectedRequest,
+        request: Request = None,
+        user: UserContext = Depends(get_current_user),
+        conn: sqlite3.Connection = Depends(get_db),
+    ):
+        """Stream a zip archive of selected image IDs (user library only, client-safe)."""
+        if not req.image_ids:
+            raise HTTPException(status_code=400, detail="No image IDs provided")
+
+        placeholders = ",".join(["?"] * len(req.image_ids))
+        rows = conn.execute(
+            f"SELECT id, file_path, file_size FROM images WHERE id IN ({placeholders}) AND status != 'deleted'",
+            req.image_ids,
+        ).fetchall()
+
+        files_to_zip = []
+        for r in rows:
+            fp = Path(r["file_path"])
+            if fp.is_file() and not fp.is_symlink():
+                try:
+                    validate_confined_user_path(fp, user.library_dir)
+                    files_to_zip.append((fp, fp.name))
+                except Exception:
+                    try:
+                        validate_confined_user_path(fp, user.root)
+                        files_to_zip.append((fp, fp.name))
+                    except Exception:
+                        pass
+
+        return stream_zip_archive(files_to_zip, "selected_images.zip")
+
+    @app.get("/download/keepers")
+    def download_keepers(
+        mode: str = Query("balanced"),
+        request: Request = None,
+        user: UserContext = Depends(get_current_user),
+        conn: sqlite3.Connection = Depends(get_db),
+    ):
+        """Stream a zip archive of recommended keepers from all duplicate clusters."""
+        clusters = conn.execute("SELECT id, reference_uncertain FROM clusters").fetchall()
+
+        keeper_files = []
+        for c in clusters:
+            cid = c["id"]
+            ref_unc = c["reference_uncertain"] if "reference_uncertain" in c.keys() else 0
+            members = conn.execute(
+                "SELECT * FROM images WHERE cluster_id = ? AND status != 'deleted'",
+                (cid,),
+            ).fetchall()
+            live_members = [
+                m for m in members
+                if os.path.exists(m["file_path"]) and not os.path.islink(m["file_path"])
+            ]
+            if len(live_members) < 2:
+                continue
+
+            member_dicts = [dict(m) for m in live_members]
+            res = choose_keeper(
+                member_dicts,
+                mode=mode,
+                config=request.app.state.config,
+                reference_uncertain=ref_unc,
+            )
+            k_id = res.get("keeper_id")
+            if k_id:
+                k_row = next((m for m in live_members if m["id"] == k_id), None)
+                if k_row:
+                    fp = Path(k_row["file_path"])
+                    if fp.is_file() and not fp.is_symlink():
+                        try:
+                            validate_confined_user_path(fp, user.library_dir)
+                            keeper_files.append((fp, f"cluster_{cid}_{fp.name}"))
+                        except Exception:
+                            try:
+                                validate_confined_user_path(fp, user.root)
+                                keeper_files.append((fp, f"cluster_{cid}_{fp.name}"))
+                            except Exception:
+                                pass
+
+        return stream_zip_archive(keeper_files, "recommended_keepers.zip")
+
+    @app.get("/library")
+    def list_library_images(
+        page: int = Query(1, ge=1),
+        limit: int = Query(60, ge=1, le=200),
+        search: str | None = Query(None),
+        category: str | None = Query(None),
+        request: Request = None,
+        user: UserContext = Depends(get_current_user),
+        conn: sqlite3.Connection = Depends(get_db),
+    ) -> dict[str, Any]:
+        """
+        List all images for the authenticated user (including unique, unclustered images),
+        with pagination (default 60/page), search by filename, and category filtering.
+        """
+        conditions = ["status != 'deleted'"]
+        params: list[Any] = []
+
+        if search and search.strip():
+            s = f"%{search.strip()}%"
+            conditions.append("(file_path LIKE ?)")
+            params.append(s)
+
+        if category and category.strip():
+            cat = category.strip()
+            if cat in ("Needs label", "uncertain"):
+                conditions.append("(category_top1 IS NULL OR category_top1 = 'Needs label' OR category_top1 = 'uncertain')")
+            else:
+                conditions.append("(category_top1 = ? OR category_top2 = ?)")
+                params.extend([cat, cat])
+
+        where_clause = " WHERE " + " AND ".join(conditions)
+
+        total_row = conn.execute(f"SELECT COUNT(*) as cnt FROM images{where_clause}", params).fetchone()
+        total = total_row["cnt"] if total_row else 0
+
+        offset = (page - 1) * limit
+        query_params = list(params) + [limit, offset]
+        rows = conn.execute(
+            f"""
+            SELECT id, file_path, file_size, width, height, format, md5,
+                   cluster_id, is_keeper, is_cluster_anchor,
+                   category_top1, category_top1_prob, category_top2, category_top2_prob,
+                   created_at
+            FROM images
+            {where_clause}
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            query_params,
+        ).fetchall()
+
+        items = []
+        for r in rows:
+            top1 = r["category_top1"]
+            top1_prob = r["category_top1_prob"]
+            top2 = r["category_top2"]
+            top2_prob = r["category_top2_prob"]
+            cat_label = "Needs label" if top1 in ("uncertain", "Needs label") or not top1 else top1
+            items.append({
+                "id": r["id"],
+                "filename": Path(r["file_path"]).name,
+                "file_path": r["file_path"],
+                "file_size": r["file_size"],
+                "width": r["width"],
+                "height": r["height"],
+                "format": r["format"],
+                "md5": r["md5"],
+                "cluster_id": r["cluster_id"],
+                "is_keeper": bool(r["is_keeper"]),
+                "category": cat_label,
+                "category_prob": top1_prob,
+                "category_top1": top1,
+                "category_top1_prob": top1_prob,
+                "category_top2": top2,
+                "category_top2_prob": top2_prob,
+                "created_at": r["created_at"],
+            })
+
+        return {
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "total_pages": math.ceil(total / limit) if limit > 0 else 1,
+            "images": items,
+        }
 
     # ==========================
     # Main Application UI
@@ -1216,6 +1496,7 @@ def create_app(
             "manual_category": manual_cat,
             "reference_uncertain": bool(ref_unc),
             "swap_proposal": keeper_res.get("swap_proposal"),
+            "no_swap_reason": keeper_res.get("no_swap_reason"),
             "members": formatted_members,
         }
 
@@ -1735,6 +2016,32 @@ def create_app(
                         )
                     f_out.write(chunk)
             saved_files.append(str(dest_path))
+
+        # Immediately record uploaded files into the user's DB so they appear in /library without delay
+        try:
+            with sqlite3.connect(user.db_path) as conn:
+                for fp in saved_files:
+                    p = Path(fp)
+                    sz = p.stat().st_size if p.exists() else 0
+                    mtime = p.stat().st_mtime if p.exists() else time.time()
+                    w, h, fmt = None, None, None
+                    try:
+                        with Image.open(p) as img:
+                            w, h = img.size
+                            fmt = img.format
+                    except Exception:
+                        pass
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO images (
+                            file_path, file_size, modified_time, width, height, format, status, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, 'discovered', strftime('%Y-%m-%dT%H:%M:%SZ','now'), strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                        """,
+                        (str(p.resolve()), sz, mtime, w, h, fmt),
+                    )
+                conn.commit()
+        except Exception as exc:
+            logging.getLogger("argus.api").warning("Could not pre-insert uploaded files into DB: %s", exc)
 
         job_id = launch_pipeline_job(request.app, user=user, source_type="local", folder=dest_dir)
         return {

@@ -795,6 +795,150 @@
         padding: 8px 12px;
       }
     }
+
+    /* Main View Tabs Bar */
+    .view-tabs-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 6px 16px;
+      background: var(--panel-bg);
+      border-bottom: 1px solid var(--border);
+    }
+    .view-tab-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      font-size: 0.85rem;
+      font-weight: 500;
+      padding: 5px 14px;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .view-tab-btn:hover { color: var(--text); }
+    .view-tab-btn.active {
+      background: var(--bg-surface);
+      color: var(--primary);
+      font-weight: 600;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+
+    /* Library View */
+    .library-panel {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow-y: auto;
+      background: var(--bg);
+      padding: 16px 20px;
+      gap: 16px;
+    }
+    .library-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+      background: var(--panel-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px 16px;
+    }
+    .library-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+      gap: 16px;
+    }
+    .library-card {
+      background: var(--panel-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      box-shadow: var(--card-shadow);
+      transition: transform 0.15s ease, border-color 0.15s ease;
+    }
+    .library-card:hover {
+      transform: translateY(-2px);
+      border-color: var(--primary);
+    }
+    .library-card-thumb-wrap {
+      position: relative;
+      width: 100%;
+      height: 140px;
+      background: var(--bg-surface);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+    .library-card-thumb-wrap img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+    .library-card-content {
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: 0.8rem;
+    }
+    .library-card-title {
+      font-weight: 600;
+      color: var(--text);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .library-card-meta {
+      color: var(--text-muted);
+      font-size: 0.75rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .badge-unique {
+      background: #64748b;
+      color: #fff;
+      font-size: 0.68rem;
+      font-weight: 600;
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+    .badge-cluster-link {
+      background: #2563eb;
+      color: #fff;
+      font-size: 0.68rem;
+      font-weight: 600;
+      padding: 2px 6px;
+      border-radius: 4px;
+      cursor: pointer;
+      text-decoration: none;
+    }
+    .badge-cluster-link:hover {
+      background: #1d4ed8;
+    }
+    .library-pagination {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      padding: 12px 0;
+    }
+    .no-swap-banner {
+      background: var(--panel-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 0.84rem;
+      color: var(--text-muted);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
   </style>
 </head>
 <body>
@@ -856,8 +1000,21 @@
     <button type="button" class="btn" id="btn-dismiss-notice" style="padding: 2px 8px; font-size: 11px;">✕</button>
   </div>
 
+  <!-- View Switcher Bar (Duplicates vs All Photos) -->
+  <div class="view-tabs-bar" id="view-tabs-bar">
+    <div class="segmented-control" id="main-view-tabs">
+      <button type="button" class="view-tab-btn active" id="tab-duplicates">Duplicates</button>
+      <button type="button" class="view-tab-btn" id="tab-all-photos">All photos</button>
+    </div>
+    <div class="view-tabs-actions" style="display:flex; align-items:center; gap:8px;">
+      <button type="button" class="btn" id="btn-download-all-keepers" title="Download recommended keepers of all duplicate clusters" style="font-size:12px; padding:4px 10px;">
+        ⬇ Download all keepers
+      </button>
+    </div>
+  </div>
+
   <!-- Main View -->
-  <div class="app-main">
+  <div class="app-main" id="duplicates-view-panel">
 
     <!-- Left Column: Cluster List -->
     <aside class="sidebar" id="cluster-list-panel">
@@ -913,6 +1070,8 @@
             </div>
           </div>
           <div class="detail-actions">
+            <button type="button" class="btn" id="btn-download-cluster" title="Download all files in this cluster">⬇ Download cluster</button>
+            <button type="button" class="btn" id="btn-download-selected" title="Download selected images" style="display:none;">⬇ Download selected</button>
             <button type="button" class="btn" id="btn-select-safe">Select all safe copies</button>
             <button type="button" class="btn btn-danger" id="btn-plan-deletion">Move to trash</button>
           </div>
@@ -930,6 +1089,12 @@
           </div>
         </div>
 
+        <!-- No Swap Info Banner -->
+        <div class="no-swap-banner" id="no-swap-banner" style="display:none;">
+          <span>ℹ️</span>
+          <span id="no-swap-reason-text">No swap: reference uncertain</span>
+        </div>
+
         <!-- Members Grid -->
         <div class="member-grid" id="member-grid">
           <!-- Member Cards Rendered via JS -->
@@ -937,6 +1102,36 @@
       </div>
     </main>
 
+  </div>
+
+  <!-- Library View Panel ("All photos") -->
+  <div class="library-panel" id="library-view-panel" style="display:none;">
+    <div class="library-toolbar">
+      <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap; flex:1;">
+        <input type="text" class="search-input" id="lib-search-input" placeholder="Search photos by filename..." style="max-width:280px;">
+        <select class="filter-select" id="lib-category-filter" style="max-width:200px;">
+          <option value="">All Categories</option>
+        </select>
+        <span style="font-size:13px; color:var(--text-muted);">
+          Total: <strong id="lib-total-count" style="color:var(--text);">0</strong> photos
+        </span>
+      </div>
+      <div style="display:flex; align-items:center; gap:8px;">
+        <button type="button" class="btn" id="lib-refresh-btn" style="padding:5px 10px; font-size:12px;">🔄 Refresh</button>
+      </div>
+    </div>
+
+    <!-- Photos Grid (60 per page) -->
+    <div class="library-grid" id="library-grid">
+      <!-- Photos rendered via JS -->
+    </div>
+
+    <!-- Pagination -->
+    <div class="library-pagination">
+      <button type="button" class="btn" id="lib-prev-btn" disabled>◀ Previous</button>
+      <span id="lib-page-info" style="font-size:13px; color:var(--text-muted); font-weight:500;">Page 1 of 1</span>
+      <button type="button" class="btn" id="lib-next-btn" disabled>Next ▶</button>
+    </div>
   </div>
 
   <!-- Confirm Deletion Modal Screen (Built from POST /plan) -->
@@ -1255,32 +1450,53 @@
 
     function renderCategoriesDropdown(cats) {
       const sel = document.getElementById("category-filter");
+      const libSel = document.getElementById("lib-category-filter");
       const catWrap = document.getElementById("categorize-now-wrap");
-      const prevVal = sel.value;
+      const prevVal = sel ? sel.value : "";
+      const prevLibVal = libSel ? libSel.value : "";
       const entries = Object.entries(cats || {});
 
       if (entries.length === 0) {
         // Not categorized yet: show explanatory message and Categorize now button
-        sel.innerHTML = '<option value="" disabled selected>Categories are computed after processing</option>';
+        if (sel) sel.innerHTML = '<option value="" disabled selected>Categories are computed after processing</option>';
+        if (libSel) libSel.innerHTML = '<option value="">All Categories</option>';
         if (catWrap) catWrap.style.display = "block";
         return;
       }
 
       if (catWrap) catWrap.style.display = "none";
-      sel.innerHTML = '<option value="">All Categories</option>';
+      if (sel) sel.innerHTML = '<option value="">All Categories</option>';
+      if (libSel) libSel.innerHTML = '<option value="">All Categories</option>';
+
       let foundPrev = false;
+      let foundLibPrev = false;
       for (const [name, count] of entries) {
-        const opt = document.createElement("option");
-        opt.value = name;
-        opt.textContent = `${name} (${count})`;
-        if (name === prevVal) {
-          opt.selected = true;
-          foundPrev = true;
+        if (sel) {
+          const opt = document.createElement("option");
+          opt.value = name;
+          opt.textContent = `${name} (${count})`;
+          if (name === prevVal) {
+            opt.selected = true;
+            foundPrev = true;
+          }
+          sel.appendChild(opt);
         }
-        sel.appendChild(opt);
+        if (libSel) {
+          const libOpt = document.createElement("option");
+          libOpt.value = name;
+          libOpt.textContent = `${name} (${count})`;
+          if (name === prevLibVal) {
+            libOpt.selected = true;
+            foundLibPrev = true;
+          }
+          libSel.appendChild(libOpt);
+        }
       }
-      if (!foundPrev && prevVal) {
+      if (sel && !foundPrev && prevVal) {
         sel.value = "";
+      }
+      if (libSel && !foundLibPrev && prevLibVal) {
+        libSel.value = "";
       }
     }
 
@@ -1458,6 +1674,10 @@
               : "";
             emptyEl.innerHTML = `<p style="color:var(--text-muted); font-size:1.1rem;">No duplicate clusters found${countMsg}.</p>`;
           }
+
+          if (currentView === "all-photos") {
+            loadLibrary(libCurrentPage);
+          }
         } catch (err) {
           if (seq !== currentRefreshSeq) return;
           if (!isRetry && canRetry) {
@@ -1567,14 +1787,18 @@
       // Reset selection to default (all delete-safe copies selected by default)
       selectedImageIds.clear();
       deleteSafeMembers.forEach(m => selectedImageIds.add(m.id));
+      updateSelectedDownloadButton();
 
-      // Swap Proposal Banner
+      // Swap Proposal Banner & No Swap Info Banner
       const swapBanner = document.getElementById("swap-proposal-banner");
       const swapDesc = document.getElementById("swap-banner-desc");
       const btnApprove = document.getElementById("btn-swap-approve");
       const btnSkip = document.getElementById("btn-swap-skip");
+      const noSwapBanner = document.getElementById("no-swap-banner");
+      const noSwapText = document.getElementById("no-swap-reason-text");
 
       if (data.swap_proposal) {
+        if (noSwapBanner) noSwapBanner.style.display = "none";
         const sp = data.swap_proposal;
         swapBanner.style.display = "flex";
 
@@ -1608,6 +1832,14 @@
         };
       } else {
         swapBanner.style.display = "none";
+        if (noSwapBanner) {
+          if (data.no_swap_reason) {
+            noSwapBanner.style.display = "flex";
+            if (noSwapText) noSwapText.textContent = data.no_swap_reason;
+          } else {
+            noSwapBanner.style.display = "none";
+          }
+        }
       }
 
       // Render Member Copies Grid
@@ -1638,8 +1870,12 @@
           : "";
 
         const fname = getBasename(m.file_path);
-        const matchStr = m.match_pct !== null ? `${m.match_pct}%` : "100.0%";
-        const resStr = m.resolution_pct !== null ? `${m.resolution_pct}%` : "100.0%";
+        const matchStr = (m.match_pct !== null && m.match_pct !== undefined)
+          ? `${m.match_pct}%`
+          : (m.is_cluster_anchor || m.quality_status === "reference" ? "100.0%" : "—");
+        const resStr = (m.resolution_pct !== null && m.resolution_pct !== undefined)
+          ? `${m.resolution_pct}%`
+          : (m.is_cluster_anchor || m.quality_status === "reference" ? "100.0%" : "—");
 
         const isChecked = selectedImageIds.has(m.id);
         const vParam = m.md5 ? `&v=${m.md5.slice(0, 12)}` : "";
@@ -1688,6 +1924,7 @@
             } else {
               selectedImageIds.delete(m.id);
             }
+            updateSelectedDownloadButton();
           });
         }
 
@@ -1697,6 +1934,7 @@
           btnSingleTrash.addEventListener("click", () => {
             selectedImageIds.clear();
             selectedImageIds.add(m.id);
+            updateSelectedDownloadButton();
             buildAndShowPlanModal();
           });
         }
@@ -1717,6 +1955,7 @@
         const id = parseInt(cb.dataset.id, 10);
         cb.checked = selectedImageIds.has(id);
       });
+      updateSelectedDownloadButton();
     });
 
     // Move to trash / Review Plan button
@@ -2711,6 +2950,220 @@
           }
           checkDeleteButtonEnabled();
         }
+      });
+    }
+
+    // Selection download button update helper
+    function updateSelectedDownloadButton() {
+      const btn = document.getElementById("btn-download-selected");
+      if (!btn) return;
+      if (selectedImageIds.size > 0) {
+        btn.style.display = "inline-flex";
+        btn.textContent = `⬇ Download selected (${selectedImageIds.size})`;
+      } else {
+        btn.style.display = "none";
+      }
+    }
+
+    // Cluster & Keepers Download handlers
+    const btnDlCluster = document.getElementById("btn-download-cluster");
+    if (btnDlCluster) {
+      btnDlCluster.addEventListener("click", () => {
+        if (!activeClusterId) return;
+        window.location.href = `/download/cluster/${activeClusterId}`;
+      });
+    }
+
+    const btnDlKeepers = document.getElementById("btn-download-all-keepers");
+    if (btnDlKeepers) {
+      btnDlKeepers.addEventListener("click", () => {
+        window.location.href = `/download/keepers?mode=${encodeURIComponent(currentMode)}`;
+      });
+    }
+
+    const btnDlSelected = document.getElementById("btn-download-selected");
+    if (btnDlSelected) {
+      btnDlSelected.addEventListener("click", async () => {
+        if (selectedImageIds.size === 0) return;
+        try {
+          const csrf = await getCsrfToken();
+          const res = await fetch("/download/selected", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "X-CSRF-Token": csrf,
+            },
+            body: JSON.stringify({ image_ids: Array.from(selectedImageIds) }),
+          });
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            showInlineNotice(err.detail || "Download failed", "error");
+            return;
+          }
+          const blob = await res.blob();
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = "selected_images.zip";
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+        } catch (err) {
+          showInlineNotice(err.message || "Download failed", "error");
+        }
+      });
+    }
+
+    // View switching (Duplicates vs All photos)
+    let currentView = "duplicates";
+    let libCurrentPage = 1;
+    let libTotalPages = 1;
+
+    function switchView(view) {
+      currentView = view;
+      const tabDupes = document.getElementById("tab-duplicates");
+      const tabAll = document.getElementById("tab-all-photos");
+      const dupesPanel = document.getElementById("duplicates-view-panel");
+      const libPanel = document.getElementById("library-view-panel");
+
+      if (view === "all-photos") {
+        if (tabDupes) tabDupes.classList.remove("active");
+        if (tabAll) tabAll.classList.add("active");
+        if (dupesPanel) dupesPanel.style.display = "none";
+        if (libPanel) libPanel.style.display = "flex";
+        loadLibrary(libCurrentPage);
+      } else {
+        if (tabAll) tabAll.classList.remove("active");
+        if (tabDupes) tabDupes.classList.add("active");
+        if (libPanel) libPanel.style.display = "none";
+        if (dupesPanel) dupesPanel.style.display = "flex";
+      }
+    }
+
+    const tabDupesBtn = document.getElementById("tab-duplicates");
+    if (tabDupesBtn) tabDupesBtn.addEventListener("click", () => switchView("duplicates"));
+    const tabAllBtn = document.getElementById("tab-all-photos");
+    if (tabAllBtn) tabAllBtn.addEventListener("click", () => switchView("all-photos"));
+
+    async function loadLibrary(page = 1) {
+      libCurrentPage = page;
+      const searchInput = document.getElementById("lib-search-input");
+      const catSelect = document.getElementById("lib-category-filter");
+      const searchVal = searchInput ? searchInput.value.trim() : "";
+      const catVal = catSelect ? catSelect.value : "";
+
+      let url = `/library?page=${libCurrentPage}&limit=60`;
+      if (searchVal) url += `&search=${encodeURIComponent(searchVal)}`;
+      if (catVal) url += `&category=${encodeURIComponent(catVal)}`;
+
+      try {
+        const res = await fetch(url);
+        if (!res.ok) {
+          console.error("Failed to load library:", res.status);
+          return;
+        }
+        const data = await res.json();
+        libTotalPages = data.total_pages || 1;
+
+        const totalEl = document.getElementById("lib-total-count");
+        if (totalEl) totalEl.textContent = data.total;
+        const pageInfo = document.getElementById("lib-page-info");
+        if (pageInfo) pageInfo.textContent = `Page ${data.page} of ${libTotalPages}`;
+
+        const prevBtn = document.getElementById("lib-prev-btn");
+        if (prevBtn) prevBtn.disabled = data.page <= 1;
+        const nextBtn = document.getElementById("lib-next-btn");
+        if (nextBtn) nextBtn.disabled = data.page >= libTotalPages;
+
+        const grid = document.getElementById("library-grid");
+        if (!grid) return;
+        grid.innerHTML = "";
+
+        if (!data.images || data.images.length === 0) {
+          grid.innerHTML = `<div style="grid-column: 1 / -1; padding: 40px; text-align: center; color: var(--text-muted); font-size: 0.95rem;">No photos found.</div>`;
+          return;
+        }
+
+        data.images.forEach(img => {
+          const card = document.createElement("div");
+          card.className = "library-card";
+          const vParam = img.md5 ? `&v=${img.md5.slice(0, 12)}` : "";
+          const thumbUrl = `/thumb/${img.id}?size=320${vParam}`;
+
+          let clusterBadge = "";
+          if (img.cluster_id) {
+            clusterBadge = `<span class="badge-cluster-link" title="Jump to Cluster #${img.cluster_id}" onclick="jumpToClusterFromLibrary(${img.cluster_id})">Cluster #${img.cluster_id}</span>`;
+          } else {
+            clusterBadge = `<span class="badge-unique">Unique</span>`;
+          }
+
+          let keeperBadge = img.is_keeper ? `<span class="badge-recommended" style="font-size:0.68rem; padding:2px 6px;">Keeper</span>` : "";
+
+          card.innerHTML = `
+            <div class="library-card-thumb-wrap">
+              <img src="${thumbUrl}" alt="" loading="lazy" onerror="this.onerror=null;this.src=PLACEHOLDER_THUMB;">
+              <div style="position: absolute; top: 6px; right: 6px; display: flex; gap: 4px;">
+                ${keeperBadge}
+                ${clusterBadge}
+              </div>
+            </div>
+            <div class="library-card-content">
+              <div class="library-card-title" title="${img.filename}">${img.filename}</div>
+              <div class="library-card-meta">
+                <span>${formatBytes(img.file_size)}</span>
+                <span class="chip chip-category" style="font-size: 0.68rem;">${img.category || "Needs label"}</span>
+              </div>
+            </div>
+          `;
+          grid.appendChild(card);
+        });
+      } catch (err) {
+        console.error("loadLibrary error:", err);
+      }
+    }
+
+    window.jumpToClusterFromLibrary = async function(clusterId) {
+      switchView("duplicates");
+      await selectCluster(clusterId);
+    };
+
+    let libSearchTimeout = null;
+    const libSearchEl = document.getElementById("lib-search-input");
+    if (libSearchEl) {
+      libSearchEl.addEventListener("input", () => {
+        clearTimeout(libSearchTimeout);
+        libSearchTimeout = setTimeout(() => {
+          loadLibrary(1);
+        }, 300);
+      });
+    }
+
+    const libCatEl = document.getElementById("lib-category-filter");
+    if (libCatEl) {
+      libCatEl.addEventListener("change", () => {
+        loadLibrary(1);
+      });
+    }
+
+    const libPrevEl = document.getElementById("lib-prev-btn");
+    if (libPrevEl) {
+      libPrevEl.addEventListener("click", () => {
+        if (libCurrentPage > 1) loadLibrary(libCurrentPage - 1);
+      });
+    }
+
+    const libNextEl = document.getElementById("lib-next-btn");
+    if (libNextEl) {
+      libNextEl.addEventListener("click", () => {
+        if (libCurrentPage < libTotalPages) loadLibrary(libCurrentPage + 1);
+      });
+    }
+
+    const libRefreshEl = document.getElementById("lib-refresh-btn");
+    if (libRefreshEl) {
+      libRefreshEl.addEventListener("click", () => {
+        loadLibrary(libCurrentPage);
       });
     }
 

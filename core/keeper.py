@@ -194,6 +194,7 @@ def choose_keeper(
             "reference_uncertain": 0,
             "allow_resolution_loss": False,
             "swap_proposal": None,
+            "no_swap_reason": None,
         }
 
     # Normalize rows to dictionaries
@@ -329,6 +330,7 @@ def choose_keeper(
             "reference_uncertain": 1,
             "allow_resolution_loss": res_loss_allowed,
             "swap_proposal": None,
+            "no_swap_reason": "No swap: reference uncertain",
         }
 
     # Map byte-identical groups by (md5, file_size)
@@ -564,6 +566,7 @@ def choose_keeper(
 
     # 5. Swap Proposal: when recommended keeper is not the reference (the original)
     swap_proposal = None
+    no_swap_reason = None
     if keeper_id != ref_id and ref_member is not None:
         bytes_saved = max(0, ref_sz - keeper_sz)
         saving_pct = round((bytes_saved / ref_sz) * 100.0, 1) if ref_sz > 0 else 0.0
@@ -606,6 +609,37 @@ def choose_keeper(
             ),
             "better_than_keeper_ids": better_ids,
         }
+    else:
+        if is_uncertain:
+            no_swap_reason = "No swap: reference uncertain"
+        elif mode == "conservative":
+            no_swap_reason = "No swap: conservative mode keeps original reference"
+        else:
+            smaller_members = [
+                m for m in members
+                if (m.get("file_size") or 0) < ref_sz and m.get("id") != ref_id
+            ]
+            if not smaller_members:
+                no_swap_reason = "No swap: reference is already smallest copy"
+            else:
+                reasons_list = []
+                for sm in smaller_members:
+                    sm_w = sm.get("width") or 0
+                    sm_h = sm.get("height") or 0
+                    sm_px = sm_w * sm_h
+                    sm_sz = sm.get("file_size") or 0
+                    if not res_loss_allowed and sm_px < ref_px:
+                        reasons_list.append("resolution loss not allowed")
+                    elif sm_sz > max_non_ref_sz:
+                        reasons_list.append("size reduction below threshold")
+                    elif sm.get("quality_status") == "unalignable":
+                        reasons_list.append("unaligned")
+                    elif sm.get("ssim_color") is not None and sm.get("ssim_color") < limits.get("ssim_color", 0.0):
+                        reasons_list.append("candidate below mode quality threshold")
+                    else:
+                        reasons_list.append("candidate below mode limits")
+                unique_reasons = list(dict.fromkeys(reasons_list))
+                no_swap_reason = f"No swap: {', '.join(unique_reasons)}"
 
     return {
         "keeper_id": keeper_id,
@@ -617,6 +651,7 @@ def choose_keeper(
         "reference_uncertain": 1 if is_uncertain else 0,
         "allow_resolution_loss": res_loss_allowed,
         "swap_proposal": swap_proposal,
+        "no_swap_reason": no_swap_reason,
     }
 
 

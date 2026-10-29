@@ -1705,3 +1705,94 @@ class TestPipelineResumable:
             "reference_uncertain must be 1 when comparison cap is hit on >8 members"
         )
 
+    def test_library_view_all_photos_pagination_and_filters(self, api_test_env):
+        """Test GET /library lists every image including unique ones, with pagination and filters."""
+        client = api_test_env["client"]
+
+        # Default list (all images)
+        res = client.get("/library")
+        assert res.status_code == 200
+        assert res.headers.get("Cache-Control", "").startswith("no-store")
+        data = res.json()
+        assert data["total"] == 6
+        assert data["page"] == 1
+        assert len(data["images"]) == 6
+
+        # Check unique image is included
+        alone_img = next((img for img in data["images"] if img["id"] == 6), None)
+        assert alone_img is not None
+        assert alone_img["filename"] == "alone.jpg"
+        assert alone_img["cluster_id"] is None
+        assert alone_img["category"] == "animal"
+
+        # Pagination: 2 per page
+        res_p1 = client.get("/library?limit=2&page=1")
+        assert res_p1.status_code == 200
+        d_p1 = res_p1.json()
+        assert len(d_p1["images"]) == 2
+        assert d_p1["total"] == 6
+        assert d_p1["total_pages"] == 3
+
+        # Search filter
+        res_search = client.get("/library?search=alone")
+        assert res_search.status_code == 200
+        d_search = res_search.json()
+        assert d_search["total"] == 1
+        assert d_search["images"][0]["id"] == 6
+
+        # Category filter
+        res_cat = client.get("/library?category=animal")
+        assert res_cat.status_code == 200
+        d_cat = res_cat.json()
+        assert d_cat["total"] == 1
+        assert d_cat["images"][0]["id"] == 6
+
+        res_land = client.get("/library?category=landscape")
+        assert res_land.status_code == 200
+        assert res_land.json()["total"] == 3
+
+    def test_download_cluster_selected_and_keepers(self, api_test_env):
+        """Test streaming zip downloads for cluster, selected files, and all keepers."""
+        import zipfile
+        client = api_test_env["client"]
+
+        # 1. Download cluster 1
+        res_cl = client.get("/download/cluster/1")
+        assert res_cl.status_code == 200
+        assert res_cl.headers["content-type"] == "application/zip"
+        assert 'attachment; filename="cluster_1.zip"' in res_cl.headers["content-disposition"]
+        with zipfile.ZipFile(io.BytesIO(res_cl.content)) as zf:
+            names = zf.namelist()
+            assert len(names) == 3
+            assert any("orig.jpg" in n for n in names)
+            assert any("orig_copy" in n for n in names)
+            assert any("orig_low" in n for n in names)
+
+        # 2. Download selected images (ids 1 and 6)
+        res_sel = client.post("/download/selected", json={"image_ids": [1, 6]})
+        assert res_sel.status_code == 200
+        assert res_sel.headers["content-type"] == "application/zip"
+        assert 'attachment; filename="selected_images.zip"' in res_sel.headers["content-disposition"]
+        with zipfile.ZipFile(io.BytesIO(res_sel.content)) as zf:
+            names = zf.namelist()
+            assert len(names) == 2
+            assert any("orig.jpg" in n for n in names)
+            assert any("alone.jpg" in n for n in names)
+
+        # 3. Download recommended keepers
+        res_kp = client.get("/download/keepers?mode=balanced")
+        assert res_kp.status_code == 200
+        assert res_kp.headers["content-type"] == "application/zip"
+        assert 'attachment; filename="recommended_keepers.zip"' in res_kp.headers["content-disposition"]
+        with zipfile.ZipFile(io.BytesIO(res_kp.content)) as zf:
+            names = zf.namelist()
+            assert len(names) >= 2  # Keeper from cluster 1 and keeper from cluster 2
+
+        # 4. Error handling: non-existent cluster
+        res_err = client.get("/download/cluster/9999")
+        assert res_err.status_code == 404
+
+        # 5. Error handling: empty image_ids
+        res_empty = client.post("/download/selected", json={"image_ids": []})
+        assert res_empty.status_code in (400, 422)
+

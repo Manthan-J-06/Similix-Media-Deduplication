@@ -35,6 +35,7 @@ from core.quality import (
     align_and_compute_metrics,
     compute_laplacian_sharpness,
     compute_source_likelihood_scores,
+    load_proxy_rgb,
     run_quality_pipeline,
     select_reference_member,
 )
@@ -540,6 +541,61 @@ class TestSyntheticQualityCases:
         assert m.quality_status == "aligned"
         assert m.sharpness_ratio < 0.20  # significantly lower sharpness than reference
         assert m.ssim is not None and m.ssim > 0.80
+
+    def test_load_proxy_rgb_prioritizes_local_disk_path_over_source(self, tmp_path: Path):
+        """When an image exists on local disk, load_proxy_rgb must open it directly without delegating to source."""
+        p = tmp_path / "local.jpg"
+        im = Image.new("RGB", (100, 100), color=(10, 20, 30))
+        im.save(p)
+
+        class FailingSource:
+            def get_thumbnail(self, *args, **kwargs):
+                raise RuntimeError("Source should not be called for local disk paths!")
+
+        arr, scale, dims = load_proxy_rgb(str(p), proxy_size=512, source=FailingSource())
+        assert dims == (100, 100)
+        assert arr.shape == (100, 100, 3)
+
+    def test_match_pct_computed_from_real_pixels_q70_q30_blur(self, base_image: Image.Image, tmp_path: Path):
+        """Verify match_pct is computed from real pixels (q70 is not falsely 100%, q30 is lower, blur has lower sharpness)."""
+        ref_path = tmp_path / "ref.jpg"
+        base_image.save(ref_path, format="JPEG", quality=95)
+
+        q70_path = tmp_path / "copy_q70.jpg"
+        base_image.save(q70_path, format="JPEG", quality=70)
+
+        q30_path = tmp_path / "copy_q30.jpg"
+        base_image.save(q30_path, format="JPEG", quality=30)
+
+        blur_path = tmp_path / "copy_blur.jpg"
+        base_image.filter(ImageFilter.GaussianBlur(radius=2.0)).save(blur_path, format="JPEG", quality=95)
+
+        m_exact = align_and_compute_metrics(ref_path, ref_path)
+        m_q70 = align_and_compute_metrics(q70_path, ref_path)
+        m_q30 = align_and_compute_metrics(q30_path, ref_path)
+        m_blur = align_and_compute_metrics(blur_path, ref_path)
+
+        assert m_exact.quality_status == "aligned"
+        assert m_q70.quality_status == "aligned"
+        assert m_q30.quality_status == "aligned"
+        assert m_blur.quality_status == "aligned"
+
+        # Exact match SSIM color is 1.0 (100%)
+        assert m_exact.ssim_color == 1.0
+
+        # q70 must be real pixel SSIM, strictly less than 1.0 (never false 100%)
+        assert m_q70.ssim_color is not None
+        assert 0.90 <= m_q70.ssim_color < 1.0
+        q70_pct = round(m_q70.ssim_color * 100.0, 1)
+        assert q70_pct < 100.0
+
+        # q30 must have lower SSIM than q70
+        assert m_q30.ssim_color is not None
+        assert m_q30.ssim_color < m_q70.ssim_color
+
+        # Blur must trigger sharpness reduction
+        assert m_blur.sharpness_ratio < 0.50
+        assert m_blur.blur_flag is True
 
     def test_90_degree_rotated_copy_aligned_ssim_stays_high(self, base_image: Image.Image):
         rot_im = base_image.rotate(90, expand=True)

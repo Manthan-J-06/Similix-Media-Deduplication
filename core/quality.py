@@ -926,6 +926,12 @@ def load_proxy_rgb(
                     orig_dims = im.size
                 except Exception as exc:
                     raise OSError(f"Drive proxy thumbnail not available for {file_path}: {exc}")
+        elif os.path.exists(file_path):
+            with Image.open(file_path) as raw_im:
+                orig_dims = raw_im.size
+                if raw_im.format == "JPEG" and max(orig_dims) > 2 * proxy_size:
+                    raw_im.draft("RGB", (proxy_size * 2, proxy_size * 2))
+                im = raw_im.convert("RGB")
         elif source is not None:
             im = source.get_thumbnail(file_path, size=(proxy_size, proxy_size)).convert("RGB")
             try:
@@ -933,12 +939,6 @@ def load_proxy_rgb(
                 orig_dims = (meta.width or im.size[0], meta.height or im.size[1])
             except Exception:
                 orig_dims = im.size
-        else:
-            with Image.open(file_path) as raw_im:
-                orig_dims = raw_im.size
-                if raw_im.format == "JPEG" and max(orig_dims) > 2 * proxy_size:
-                    raw_im.draft("RGB", (proxy_size * 2, proxy_size * 2))
-                im = raw_im.convert("RGB")
 
     w, h = im.size
     max_dim = max(w, h)
