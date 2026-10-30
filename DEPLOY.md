@@ -32,10 +32,28 @@ Argus is containerized using `python:3.11-slim`, runs as a non-root user (`argus
    docker compose up --build -d
    ```
 
-3. **Verify Service Health**
+3. **Verify Service Health & Startup Self-Check**
    ```bash
    curl http://localhost:8000/healthz
-   # Response: {"status":"ok","service":"argus"}
+   # Response:
+   # {
+   #   "status": "ok",
+   #   "service": "argus",
+   #   "data_dir": "/data",
+   #   "db_path": "/data/argus.db",
+   #   "secret_key_set": "yes"
+   # }
+   ```
+
+   Argus logs a startup self-check banner upon boot:
+   ```text
+   ==================================================
+     ARGUS Startup Self-Check
+   ==================================================
+     Data Directory : /data
+     DB Path        : /data/argus.db
+     Secret Key Set : yes
+   ==================================================
    ```
 
 4. **Access the Web Interface**
@@ -160,8 +178,8 @@ Hugging Face Spaces allows hosting containerized web applications directly on ma
    - `HOST`: `0.0.0.0`
    - `HOSTED_MODE`: `true` (Disables local directory scanning and dataset URL fetching)
    - `ALLOW_REGISTRATION`: `true` (or `false` for invite-only)
-   - `ARGUS_USERS_DIR`: `/data/users`
-   - `ARGUS_ACCOUNTS_DB`: `/data/auth.db`
+   - `SECRET_KEY`: `<minimum 32 character random string>` (Required in hosted mode)
+   - `ARGUS_DATA_DIR`: `/data` (Single root for all user databases, libraries, jobs, and thumbnails)
 
 4. **Push Repository to Hugging Face**
    ```bash
@@ -177,4 +195,4 @@ Hugging Face Spaces allows hosting containerized web applications directly on ma
 | Tier | Path | Persistence | Explanation |
 |---|---|---|---|
 | **Free Tier** | `/data` or `/app` | ❌ **Ephemeral** | The container filesystem is ephemeral. Whenever the Space restarts, updates, or goes to sleep after inactivity, **all uploaded images, users, and SQLite databases will be wiped clean**. |
-| **Persistent Storage Tier** | `/data` | ✅ **Persists** | When **Persistent Storage** (Small, Medium, or Large) is purchased and enabled in Space settings, `/data` is backed by network-attached storage. Setting `ARGUS_USERS_DIR=/data/users` and `ARGUS_ACCOUNTS_DB=/data/auth.db` guarantees that all users, credentials, image libraries, ledgers, and deduplication states **persist permanently across restarts and rebuilds**. |
+| **Persistent Storage Tier** | `/data` | ✅ **Persists** | When **Persistent Storage** (Small, Medium, or Large) is purchased and enabled in Space settings, `/data` is backed by network-attached storage. Setting `ARGUS_DATA_DIR=/data` guarantees that all users, credentials, image libraries, ledgers, and deduplication states **persist permanently across restarts and rebuilds**. |

@@ -801,6 +801,16 @@ def cmd_serve(args: argparse.Namespace) -> None:
     # Bind host and port, supporting HOST/PORT env vars for container deployments
     host = getattr(args, "host", None) or os.environ.get("HOST", "127.0.0.1")
     port = getattr(args, "port", None) or int(os.environ.get("PORT", 8000))
+    secret_is_set = "yes" if bool(os.environ.get("SECRET_KEY") or cfg.get("auth", {}).get("secret_key")) else "no"
+    print(
+        f"\n==================================================\n"
+        f"  ARGUS Startup Self-Check\n"
+        f"==================================================\n"
+        f"  Data Directory : {app.state.data_root}\n"
+        f"  DB Path        : {app.state.db_path}\n"
+        f"  Secret Key Set : {secret_is_set}\n"
+        f"=================================================="
+    )
     print(f"Starting Argus API server on http://{host}:{port} (data root: {app.state.data_root}, auth db: {app.state.auth_db_path}, users: {app.state.users_dir})")
     uvicorn.run(app, host=host, port=port)
 

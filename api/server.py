@@ -8,6 +8,7 @@ Authentication, session management, and per-user isolation enforced.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import io
 import json
@@ -682,12 +683,28 @@ def create_app(
             sys.stderr.write(f"ERROR: SECRET_KEY must be at least 32 characters in hosted mode (got {len(str(secret_key).strip())}). Refusing to start.\n")
             raise RuntimeError(f"SECRET_KEY must be at least 32 characters in hosted mode (got {len(str(secret_key).strip())}). Refusing to start.")
 
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        secret_is_set = "yes" if bool(os.environ.get("SECRET_KEY") or config.get("auth", {}).get("secret_key")) else "no"
+        sys.stdout.write(
+            f"\n==================================================\n"
+            f"  ARGUS Startup Self-Check\n"
+            f"==================================================\n"
+            f"  Data Directory : {data_root}\n"
+            f"  DB Path        : {resolved_db_path}\n"
+            f"  Secret Key Set : {secret_is_set}\n"
+            f"==================================================\n\n"
+        )
+        sys.stdout.flush()
+        yield
+
     app = FastAPI(
         title="Argus API",
         version="0.1.0",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+        lifespan=lifespan,
     )
 
     @app.middleware("http")
@@ -777,9 +794,20 @@ def create_app(
     # ==========================
 
     @app.get("/healthz")
-    def health_check():
+    def health_check(request: Request):
         """Public health check endpoint for reverse proxies and orchestrators."""
-        return {"status": "ok", "service": "argus"}
+        cfg = getattr(request.app.state, "config", {}) or {}
+        secret_is_set = bool(
+            os.environ.get("SECRET_KEY")
+            or cfg.get("auth", {}).get("secret_key")
+        )
+        return {
+            "status": "ok",
+            "service": "argus",
+            "data_dir": str(getattr(request.app.state, "data_root", "")),
+            "db_path": str(getattr(request.app.state, "db_path", "")),
+            "secret_key_set": "yes" if secret_is_set else "no",
+        }
 
     @app.get("/login")
     def serve_login():

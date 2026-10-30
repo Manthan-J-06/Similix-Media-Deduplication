@@ -270,7 +270,12 @@ class TestAuthenticationAndSessions:
         client = TestClient(auth_test_app["app"])
         res = client.get("/healthz")
         assert res.status_code == 200
-        assert res.json() == {"status": "ok", "service": "argus"}
+        data = res.json()
+        assert data["status"] == "ok"
+        assert data["service"] == "argus"
+        assert "data_dir" in data
+        assert "db_path" in data
+        assert data["secret_key_set"] in ("yes", "no")
 
     def test_app_restart_persists_accounts_and_sessions(self, tmp_path: Path):
         """Accounts and sessions persist across app restarts when using ARGUS_DATA_DIR / auth_db."""

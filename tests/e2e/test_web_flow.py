@@ -21,6 +21,7 @@ import sys
 import time
 import urllib.request
 import uuid
+import zipfile
 
 from PIL import Image
 import pytest
@@ -133,11 +134,17 @@ def test_full_web_flow(live_server, tmp_path):
     test_email = f"e2e_user_{uuid.uuid4().hex[:8]}@example.com"
     test_password = "SecurePassword123!"
 
-    # 1. Prepare 12 images (4 are copies)
-    img_dir = tmp_path / "test_images"
+    # 1. Prepare 30 mixed images with copies:
+    # 4 duplicate groups (11 images):
+    # - Cluster A: 3 copies
+    # - Cluster B: 3 copies
+    # - Cluster C: 3 copies
+    # - Cluster D: 2 copies
+    # 19 distinct standalone images
+    img_dir = tmp_path / "test_images_30"
     img_dir.mkdir(parents=True, exist_ok=True)
 
-    # Cluster A: 3 copies (orig + 2 copies)
+    # Cluster A: 3 copies (orig + 2 exact copies)
     p_a0 = img_dir / "img_a0.jpg"
     _create_image(p_a0, color=(220, 50, 50), size=(180, 180))
     p_a1 = img_dir / "img_a1.jpg"
@@ -145,7 +152,7 @@ def test_full_web_flow(live_server, tmp_path):
     p_a2 = img_dir / "img_a2.jpg"
     shutil.copyfile(p_a0, p_a2)
 
-    # Cluster B: 3 copies (orig + 2 copies)
+    # Cluster B: 3 copies (orig + 2 exact copies)
     p_b0 = img_dir / "img_b0.jpg"
     _create_image(p_b0, color=(50, 50, 220), size=(200, 200))
     p_b1 = img_dir / "img_b1.jpg"
@@ -153,28 +160,45 @@ def test_full_web_flow(live_server, tmp_path):
     p_b2 = img_dir / "img_b2.jpg"
     shutil.copyfile(p_b0, p_b2)
 
-    # 6 distinct standalone images
-    other_images = []
-    colors = [
-        (40, 200, 40),
-        (220, 220, 40),
-        (200, 40, 200),
-        (220, 140, 40),
-        (40, 220, 220),
-        (100, 100, 100),
-    ]
-    for idx, col in enumerate(colors):
-        p_other = img_dir / f"img_other_{idx}.jpg"
-        _create_image(p_other, color=col, size=(160 + idx * 10, 160 + idx * 10))
-        other_images.append(p_other)
+    # Cluster C: 3 copies (orig + 2 exact copies)
+    p_c0 = img_dir / "img_c0.jpg"
+    _create_image(p_c0, color=(50, 200, 50), size=(190, 190))
+    p_c1 = img_dir / "img_c1.jpg"
+    shutil.copyfile(p_c0, p_c1)
+    p_c2 = img_dir / "img_c2.jpg"
+    shutil.copyfile(p_c0, p_c2)
 
-    all_12_images = [p_a0, p_a1, p_a2, p_b0, p_b1, p_b2] + other_images
-    assert len(all_12_images) == 12
+    # Cluster D: 2 copies (orig + 1 exact copy)
+    p_d0 = img_dir / "img_d0.jpg"
+    _create_image(p_d0, color=(220, 200, 50), size=(210, 210))
+    p_d1 = img_dir / "img_d1.jpg"
+    shutil.copyfile(p_d0, p_d1)
+
+    # 19 distinct standalone images
+    unique_images = []
+    base_colors = [
+        (40, 200, 40), (220, 220, 40), (200, 40, 200), (220, 140, 40),
+        (40, 220, 220), (100, 100, 100), (180, 30, 80), (30, 180, 150),
+        (150, 80, 200), (210, 100, 30), (70, 120, 240), (240, 120, 70),
+        (120, 240, 70), (160, 160, 30), (30, 160, 160), (160, 30, 160),
+        (80, 80, 180), (180, 80, 80), (80, 180, 80)
+    ]
+    for idx, col in enumerate(base_colors):
+        p_u = img_dir / f"img_u_{idx:02d}.jpg"
+        _create_image(p_u, color=col, size=(150 + (idx % 8) * 10, 150 + (idx % 8) * 10))
+        unique_images.append(p_u)
+
+    all_30_images = [p_a0, p_a1, p_a2, p_b0, p_b1, p_b2, p_c0, p_c1, p_c2, p_d0, p_d1] + unique_images
+    assert len(all_30_images) == 30
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context()
         page = context.new_page()
+
+        # Fail test if unexpected alert/confirm popups appear
+        dialog_events = []
+        page.on("dialog", lambda d: (dialog_events.append(f"{d.type}: {d.message}"), d.dismiss()))
 
         # 2. Register new account
         page.goto(f"{base_url}/login")
@@ -189,7 +213,6 @@ def test_full_web_flow(live_server, tmp_path):
         try:
             page.wait_for_url(f"{base_url}/", timeout=15000)
         except Exception:
-            # Fallback in case auto-login didn't redirect automatically
             if page.is_visible("#tab-login.active"):
                 page.fill("#email", test_email)
                 page.fill("#password", test_password)
@@ -200,10 +223,10 @@ def test_full_web_flow(live_server, tmp_path):
         email_text = page.text_content("#user-email-display") or ""
         assert test_email in email_text
 
-        # 3. Upload 12 images
+        # 3. Upload 30 images
         page.click("#btn-open-sources")
         page.wait_for_selector("#sources-modal", state="visible", timeout=5000)
-        page.set_input_files("#file-input", [str(img) for img in all_12_images])
+        page.set_input_files("#file-input", [str(img) for img in all_30_images])
         page.wait_for_selector("#btn-start-upload", state="visible", timeout=5000)
         page.click("#btn-start-upload")
 
@@ -213,37 +236,91 @@ def test_full_web_flow(live_server, tmp_path):
             "() => document.getElementById('job-percent-text')?.textContent === '100%' || "
             "(document.getElementById('job-status-text')?.textContent || '').includes('Pipeline complete') || "
             "(document.getElementById('job-status-text')?.textContent || '').includes('Pipeline completed')",
-            timeout=60000,
+            timeout=90000,
         )
 
-        # Assert clusters appear within 60s
-        page.wait_for_selector("#cluster-list .cluster-item", timeout=60000)
-        clusters = page.query_selector_all("#cluster-list .cluster-item")
-        assert len(clusters) >= 1, "Expected duplicate clusters to appear"
+        # 5. Library view: shows all 30 photos
+        page.wait_for_selector("#tab-all-photos", timeout=10000)
+        page.click("#tab-all-photos")
+        page.wait_for_selector("#library-view-panel", state="visible", timeout=10000)
+        page.wait_for_selector(".library-card", timeout=10000)
+        page.wait_for_function("() => document.querySelectorAll('.library-card').length === 30", timeout=15000)
+        cards = page.query_selector_all(".library-card")
+        assert len(cards) == 30, f"Expected 30 library cards, got {len(cards)}"
 
-        # 5. Switch all three modes
-        for mode in ["balanced", "aggressive", "conservative"]:
+        # 6. Duplicates tab: shows clusters
+        page.click("#tab-duplicates")
+        page.wait_for_selector("#duplicates-view-panel", state="visible", timeout=10000)
+        page.wait_for_selector("#cluster-list .cluster-item", timeout=10000)
+        clusters = page.query_selector_all("#cluster-list .cluster-item")
+        assert len(clusters) >= 3, f"Expected at least 3 duplicate clusters, got {len(clusters)}"
+
+        # 7. Switch all three modes (conservative, balanced, aggressive)
+        for mode in ["aggressive", "conservative", "balanced"]:
             btn_id = f"#mode-{mode}"
             page.click(btn_id)
             page.wait_for_selector(f"{btn_id}.active", timeout=5000)
             page.wait_for_selector("#mode-spinner", state="hidden", timeout=5000)
             page.wait_for_selector("#cluster-list .cluster-item", timeout=5000)
             cur_clusters = page.query_selector_all("#cluster-list .cluster-item")
-            assert len(cur_clusters) >= 1
+            assert len(cur_clusters) >= 1, f"Expected clusters in mode {mode}"
 
-        # 6. Open a cluster
+        # 8. Open a cluster & download cluster zip
         first_cluster = page.query_selector("#cluster-list .cluster-item")
         assert first_cluster is not None
         first_cluster.click()
 
         page.wait_for_selector("#detail-content", state="visible", timeout=5000)
-        title = page.text_content("#detail-cluster-title") or ""
-        assert "Cluster #" in title
+        page.wait_for_selector("#btn-download-cluster", state="visible", timeout=5000)
 
-        members = page.query_selector_all("#member-grid .member-card")
-        assert len(members) >= 2, f"Expected cluster to contain >=2 copies, got {len(members)}"
+        with page.expect_download(timeout=15000) as download_info:
+            page.click("#btn-download-cluster")
+        download = download_info.value
+        assert download.suggested_filename.endswith(".zip")
+        download_zip = tmp_path / f"test_cluster_{uuid.uuid4().hex[:6]}.zip"
+        download.save_as(str(download_zip))
+        assert download_zip.exists()
+        assert download_zip.stat().st_size > 0
+        with zipfile.ZipFile(download_zip, "r") as zf:
+            zip_entries = zf.namelist()
+            assert len(zip_entries) >= 2, f"Expected cluster zip to contain >= 2 files, got {zip_entries}"
 
-        # 7. Assert categories dropdown is populated or shows explanatory message
+        # 9. Trash and Undo
+        page.wait_for_selector("#member-grid .member-card", timeout=5000)
+        copy_card = page.query_selector(".member-card:not(.is-keeper)")
+        assert copy_card is not None, "Expected a non-keeper copy card in cluster"
+        copy_filename_el = copy_card.query_selector(".card-filename")
+        assert copy_filename_el is not None
+        copy_disk_path_str = copy_filename_el.get_attribute("title")
+        assert copy_disk_path_str, "Expected title attribute with disk file path"
+        copy_disk_path = Path(copy_disk_path_str)
+        assert copy_disk_path.exists(), f"File should exist before moving to trash: {copy_disk_path}"
+
+        page.click("#btn-select-safe")
+        page.wait_for_timeout(300)
+        page.click("#btn-plan-deletion")
+        page.wait_for_selector("#confirm-modal", state="visible", timeout=5000)
+        page.wait_for_selector("#btn-confirm-apply:not([disabled])", timeout=5000)
+        page.click("#btn-confirm-apply")
+
+        page.wait_for_selector("#apply-success-box", state="visible", timeout=10000)
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if not copy_disk_path.exists():
+                break
+            time.sleep(0.2)
+        assert not copy_disk_path.exists(), f"File should have moved to trash: {copy_disk_path}"
+
+        page.wait_for_selector("#btn-undo-apply", state="visible", timeout=5000)
+        page.click("#btn-undo-apply")
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            if copy_disk_path.exists():
+                break
+            time.sleep(0.3)
+        assert copy_disk_path.exists(), f"File should be restored on disk after undo: {copy_disk_path}"
+
+        # 10. Assert categories dropdown is populated or shows explanatory message
         page.wait_for_selector("#category-filter", timeout=5000)
         cat_options = page.eval_on_selector_all("#category-filter option", "opts => opts.map(o => o.textContent)")
         assert len(cat_options) >= 1
@@ -253,7 +330,7 @@ def test_full_web_flow(live_server, tmp_path):
         )
         assert valid_cat_state, f"Unexpected category dropdown options: {cat_options}"
 
-        # 8. Delete the account
+        # 11. Delete the account
         page.click("#btn-account-menu")
         page.wait_for_selector("#btn-open-delete-account", state="visible", timeout=5000)
         page.click("#btn-open-delete-account")
@@ -266,6 +343,8 @@ def test_full_web_flow(live_server, tmp_path):
         page.click("#btn-confirm-delete-account")
 
         page.wait_for_url(re.compile(r".*/login.*"), timeout=15000)
+
+        assert len(dialog_events) == 0, f"Unexpected alert dialogs: {dialog_events}"
 
         context.close()
         browser.close()
