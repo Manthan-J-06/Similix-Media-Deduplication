@@ -117,110 +117,328 @@ allow_resolution_loss = false
 # Temperature for softmax over cosine similarities (lower = peakier distribution).
 temperature = 0.05
 # Minimum probability difference between top-1 and top-2 required for confident label.
-# If top1_prob - top2_prob < uncertain_margin, categorized as 'uncertain' / 'Needs label'.
-uncertain_margin = 0.05
+# If top1_prob - top2_prob < uncertain_margin, categorized as 'Needs label'.
+uncertain_margin = 0.03
 # Minimum absolute probability required for top-1 category.
-# If top1_prob < min_top_prob, categorized as 'uncertain' / 'Needs label'.
-min_top_prob = 0.20
+# If top1_prob < min_top_prob, categorized as 'Needs label'.
+min_top_prob = 0.15
 
-# Two-level label categorization (Scene & Subject)
-scene_labels = [
-    "indoor",
-    "landscape",
-    "architecture",
-    "workplace",
-    "studio",
+labels = [
+    "portrait/selfie",
+    "group photo",
+    "baby",
+    "pet dog",
+    "pet cat",
+    "wildlife",
+    "food and drink",
+    "beach",
+    "mountains",
+    "forest",
+    "city street",
+    "building exterior",
+    "interior room",
+    "night scene",
+    "sunset",
+    "flowers",
+    "car",
+    "motorbike",
+    "bicycle",
+    "airplane",
+    "boat",
+    "sports",
+    "party/event",
+    "wedding",
+    "document or receipt",
+    "screenshot of an app",
+    "meme with text",
+    "whiteboard",
+    "artwork",
+    "sculpture",
+    "landmark",
+    "bridge",
+    "snow",
+    "water/river",
+    "farm",
+    "computer/laptop",
+    "phone",
+    "product photo",
+    "map",
 ]
 
-subject_labels = [
-    "portrait",
-    "animal",
-    "food",
-    "vehicle",
-    "document",
-    "screenshot",
-    "technology",
-    "artifact",
-    "people_working",
-    "other",
-]
-
-# Category labels with prompt templates
+# Category labels with 5 prompt templates per label
 [categories.templates]
-landscape = [
-    "a photo of a natural landscape or scenery",
-    "a scenic photograph of nature, mountains, ocean, or countryside",
-    "a photo of outdoor scenery and environment",
-]
-portrait = [
-    "a portrait photo of a person or people",
+"portrait/selfie" = [
+    "a portrait photo of a person",
+    "a selfie photo of a person looking directly at the camera",
     "a close-up photograph of a human face",
-    "a picture of people or a selfie",
+    "a headshot portrait of an individual",
+    "a picture of a person looking at the lens",
 ]
-animal = [
-    "a photo of an animal, pet, or wildlife",
-    "a photograph of a dog, cat, bird, or animal",
-    "a close-up picture of an animal in nature",
+"group photo" = [
+    "a photo of a group of people posing together",
+    "a group portrait of several people smiling together",
+    "a photograph of a gathering of friends, colleagues, or family",
+    "a wide picture showing multiple people together in a group",
+    "a team photo or group of people standing side by side",
 ]
-architecture = [
-    "a photo of a building, architecture, or city structure",
-    "an exterior or interior photograph of architecture",
-    "a photo of urban buildings, monuments, or streets",
+baby = [
+    "a photo of a baby or newborn infant",
+    "a close-up photograph of a cute baby or toddler",
+    "a picture of an infant baby sleeping or smiling",
+    "a portrait of a baby in a crib or blanket",
+    "a photograph of a young baby",
 ]
-workplace = [
-    "a photo of a workplace, office, or desk environment",
-    "a photograph of a professional office, boardroom, or workstation",
-    "a picture of people working in an office or workspace setting",
+"pet dog" = [
+    "a photo of a pet dog",
+    "a close-up picture of a domestic pet dog or puppy",
+    "a photograph of a cute domestic dog playing or resting",
+    "a portrait of a pet dog indoors or outdoors",
+    "a picture of someone's pet dog looking at the camera",
 ]
-studio = [
-    "a photo taken in a professional studio setting with a clean background",
-    "a studio photograph with solid or seamless backdrop",
-    "a staged product or subject photograph in a studio",
+"pet cat" = [
+    "a photo of a pet cat",
+    "a close-up picture of a domestic cat or kitten",
+    "a photograph of a pet cat sitting, sleeping, or playing",
+    "a portrait of a domestic pet cat looking forward",
+    "a picture of someone's pet cat indoors",
 ]
-food = [
-    "a photo of food, a meal, or a dish",
-    "a photograph of delicious food on a plate or table",
-    "a picture of cuisine, cooking, or dining",
+wildlife = [
+    "a photo of wild animals in nature or wildlife",
+    "a photograph of wild animals, wild birds, or safari fauna",
+    "a close-up picture of a wild animal in its natural wilderness habitat",
+    "a wildlife photography shot of wild creatures outdoors",
+    "a picture taken in the wild of untamed animals",
 ]
-document = [
-    "a photo of a document, invoice, or receipt",
-    "a photo of printed text on paper, book page, or sign",
-    "a scanned document or paper note",
+"food and drink" = [
+    "a photo of food and drink on a table or counter",
+    "a photograph of a cooked meal, gourmet dish, or beverage",
+    "a close-up food photography picture of snacks, coffee, or dining",
+    "a picture of appetizing food on a plate or drinks in glasses",
+    "a photo of restaurant cuisine, dessert, baked goods, or drinks",
 ]
-screenshot = [
-    "a direct digital screenshot or flat screen capture of a user interface",
-    "a clean digital screen grab of a website, application, or software window",
-    "a flat digital capture of an operating system, app UI, or computer desktop",
+beach = [
+    "a photo of a sandy beach and ocean waves",
+    "a scenic landscape picture of a seashore, coastline, or tropical beach",
+    "a photograph taken outdoors of a sunny beach with sand and water",
+    "a picture of a coastal beach with blue ocean and waves",
+    "a seaside beach view with sand and tide",
 ]
-technology = [
-    "a photograph of modern technology such as laptops, computers, or smartphones",
-    "a photo of electronic devices, phones, or computer screens in an environment",
-    "a picture of tech gadgets, keyboards, laptops, or mobile devices",
+mountains = [
+    "a photo of rugged mountains and rocky peaks",
+    "a scenic landscape picture of mountain ranges and alpine summits",
+    "a photograph taken outdoors of high mountains against the sky",
+    "a mountain landscape with ridges, hills, and valleys",
+    "a view of towering mountains in nature",
 ]
-people_working = [
-    "a photo of people working in an office, desk, or workplace setting",
-    "a photograph of employees, colleagues, or professionals at work",
-    "a picture of people collaborating, having a meeting, or working on laptops",
+forest = [
+    "a photo of a lush green forest with tall trees",
+    "a scenic landscape photograph of woodland, trees, and forest nature",
+    "a picture taken outdoors in a deep forest or woods",
+    "a nature photo of dense trees and foliage in a forest",
+    "a tranquil woodland scene with forest trees and greenery",
 ]
-vehicle = [
-    "a photo of a car, automobile, or vehicle",
-    "a photograph of transportation like a car, bicycle, train, or plane",
-    "a photo of a vehicle on a road or street",
+"city street" = [
+    "a photo of a city street with traffic, cars, and buildings",
+    "an urban street scene with sidewalks, crosswalks, and storefronts",
+    "a photograph taken outdoors of a bustling downtown city street",
+    "a picture of an urban avenue with cars on the road and street lights",
+    "a view along a metropolis city street",
 ]
-artifact = [
-    "a photo of an artifact, work of art, or museum object",
-    "a photograph of a sculpture, statue, antique, or craft",
-    "a picture of an artistic artifact, historical relic, or pottery",
+"building exterior" = [
+    "a photo of a building exterior and architectural facade",
+    "an exterior photograph of a residential house, apartment, or commercial building",
+    "a picture taken outdoors showing the facade of a building",
+    "an architectural photo of a structure from the outside",
+    "a clear exterior view of an architectural building or glass tower",
 ]
-indoor = [
-    "a photo of an indoor room or home interior",
-    "a photograph of an indoor space, living room, or bedroom",
-    "an interior view of a room, hallway, or furnished space",
+"interior room" = [
+    "a photo of an indoor interior room, living space, or bedroom",
+    "an indoor photograph of a furnished room, kitchen, or home interior",
+    "a picture taken indoors showing the interior design of a furnished room",
+    "an interior view of a room with furniture, walls, and ceiling",
+    "a photo of a cozy furnished interior room inside a house",
 ]
-other = [
-    "a photo of a miscellaneous, abstract, or uncategorized object",
-    "a photograph that does not belong to standard categories",
-    "a photo of other, ambiguous, or unclassified subject matter",
+"night scene" = [
+    "a photo of a dark night scene with glowing night lights",
+    "a nighttime photograph illuminated by street lights, city lights, or moon",
+    "a picture taken outdoors at night under a dark night sky",
+    "a night photography shot of dark streets or cityscape lit up at night",
+    "a moody photograph taken after dark at night",
+]
+sunset = [
+    "a photo of a vibrant sunset or sunrise over the horizon",
+    "a scenic photograph of golden hour dusk with orange sunset sky",
+    "a picture taken outdoors of colorful clouds during sunset",
+    "a landscape view of sunset with golden evening sunlight",
+    "a photo of the setting sun with orange and red sky colors",
+]
+flowers = [
+    "a photo of blooming flowers or colorful floral blossoms",
+    "a close-up botanical photograph of vibrant flowers in a garden",
+    "a picture of flower petals, bouquets, and blooming plants",
+    "a macro photograph of fresh flowers in bloom",
+    "a colorful photo of garden flowers or wildflowers",
+]
+car = [
+    "a photo of a passenger car, sedan, or automobile",
+    "a photograph of a motor vehicle or automobile on a street or parking lot",
+    "a close-up picture of a car or sports car",
+    "a picture of an automobile parked or driving",
+    "a clean photo of a motor car",
+]
+motorbike = [
+    "a photo of a motorbike, motorcycle, or motor scooter",
+    "a photograph of a two-wheeled motorcycle on the road",
+    "a close-up picture of a motorbike or motorcycle parked outside",
+    "a picture of a motorcycle on a street",
+    "a clean photo of a motor scooter or motorbike",
+]
+bicycle = [
+    "a photo of a bicycle, road bike, or mountain bike",
+    "a photograph of a two-wheeled pedal bicycle parked or on a path",
+    "a close-up picture of bicycle wheels, frame, and handlebars",
+    "a picture taken outdoors of a pedal bike or commuter bicycle",
+    "a photo of a cyclist's bicycle",
+]
+airplane = [
+    "a photo of an airplane or passenger jet aircraft",
+    "a photograph of a plane flying in the sky or on an airport tarmac",
+    "a picture of a commercial airplane or airliner",
+    "a view of an aircraft or jet at an airport or in flight",
+    "a clear photo of an airplane in the sky or runway",
+]
+boat = [
+    "a photo of a boat, ship, sailboat, or yacht on the water",
+    "a maritime photograph of a vessel sailing on a lake or sea",
+    "a picture of a boat docked at a harbor, marina, or pier",
+    "a scenic photo of a boat floating on water",
+    "a photograph of watercraft such as a speedboat, canoe, or sailboat",
+]
+sports = [
+    "a photo of an athletic sports event, match, or competition",
+    "an action sports photograph of athletes playing a game",
+    "a picture of people participating in sports, fitness, or athletics",
+    "a dynamic action shot of players in a sports game or race",
+    "a photo of sports players on a court, field, or stadium",
+]
+"party/event" = [
+    "a photo of a festive party, celebration, or social gathering event",
+    "a photograph of people celebrating at a party, concert, or festival",
+    "a picture of an indoor or outdoor party event with decorations",
+    "a joyful photo of people enjoying a party celebration",
+    "a scene of people having fun at a party or social celebration",
+]
+wedding = [
+    "a photo of a wedding ceremony or wedding reception",
+    "a wedding photograph of a bride and groom celebrating marriage",
+    "a picture of a bride in a wedding gown or wedding couple",
+    "an elegant bridal wedding ceremony or banquet reception",
+    "a romantic wedding day photography portrait of the couple",
+]
+"document or receipt" = [
+    "a photo or scan of a paper document, invoice, or printed receipt",
+    "a photograph of printed text on a paper sheet, bill, or receipt",
+    "a close-up picture of a printed receipt with line items and numbers",
+    "a flat scan or photo of a paper document with legible printed text",
+    "a photo of a paper receipt, bill, certificate, or official document",
+]
+"screenshot of an app" = [
+    "a digital screenshot of a mobile phone app or computer software interface",
+    "a direct digital screen capture of an application user interface",
+    "a clean flat screenshot of a software program or smartphone app screen",
+    "a digital screengrab of an app interface with icons, menus, and text",
+    "a flat graphic screenshot of an application window or mobile app UI",
+]
+"meme with text" = [
+    "an internet meme image with humorous caption text overlay",
+    "a funny image meme macro with bold overlaid text",
+    "a social media meme graphic with humorous text",
+    "a viral comedic meme picture with caption typography",
+    "a joke meme image featuring overlaid humor text",
+]
+whiteboard = [
+    "a photo of a classroom or office whiteboard with handwritten marker notes",
+    "a photograph of diagrams, drawings, or handwriting on a dry-erase whiteboard",
+    "a picture of a presentation whiteboard with marker writing",
+    "a close-up photo of handwritten brainstorm notes on a white board",
+    "a view of an office dry erase whiteboard filled with notes and sketches",
+]
+artwork = [
+    "a photo of a fine art painting, illustration, or museum artwork",
+    "a photograph of an artistic canvas painting, drawing, or gallery artwork",
+    "a picture of fine art, oil painting, watercolor, or digital illustration",
+    "a reproduction photo of an artistic painting on canvas",
+    "a piece of visual artwork or illustration in a gallery",
+]
+sculpture = [
+    "a photo of a carved three-dimensional statue or sculpture",
+    "a photograph of a bronze, stone, or marble sculpture or monument",
+    "a close-up picture of an artistic statue or public sculpture",
+    "a museum photograph of a sculptural figurine or statue",
+    "a 3D sculpture carved from marble, bronze, clay, or stone",
+]
+landmark = [
+    "a photo of a famous world landmark, iconic monument, or historic heritage site",
+    "a scenic photograph of a renowned architectural landmark or famous monument",
+    "a tourist picture of an iconic historical landmark attraction",
+    "a travel photography shot of a world-famous landmark or ancient monument",
+    "a recognizable historic landmark monument or heritage structure",
+]
+bridge = [
+    "a photo of a suspension bridge, arch bridge, or overpass crossing water",
+    "a scenic landscape photograph of a bridge over a river, bay, or canyon",
+    "a picture taken outdoors showing bridge architecture, roadway, and towers",
+    "an architectural shot of a large bridge spanning across water",
+    "a view of a bridge crossing a river or waterway",
+]
+snow = [
+    "a photo of a winter landscape covered in deep white snow",
+    "a cold winter scene with snowfall, frozen ice, and snowy ground",
+    "a photograph taken outdoors of snow-covered ground and frosty trees",
+    "a scenic winter landscape photo with white snow and frost",
+    "a winter photography shot of snowy terrain and ice",
+]
+"water/river" = [
+    "a photo of a flowing river, stream, creek, or waterfall",
+    "a scenic landscape photograph of fresh water, a lake, or river rapids",
+    "a picture taken outdoors of moving water in a river or creek",
+    "a nature photography shot of a river flowing through landscape",
+    "a serene photo of clean fresh water in a river or stream",
+]
+farm = [
+    "a photo of a rural farm, agricultural field, pasture, or barn",
+    "a countryside photograph of farmland, crops, pastures, and farm barn",
+    "a picture taken outdoors of an agricultural farm with crop fields",
+    "a scenic rural landscape of a crop farm, tractor, or pasture",
+    "a view of an agricultural farm with barns and open fields",
+]
+"computer/laptop" = [
+    "a photo of a computer laptop, desktop PC, keyboard, and monitor on a desk",
+    "a photograph of a personal laptop computer open on a workspace desk",
+    "a close-up picture of a notebook computer, laptop keyboard, and screen",
+    "a picture of an open laptop computer on a table",
+    "a photo of a portable laptop computer",
+]
+phone = [
+    "a photo of a mobile smartphone, cell phone, or telephone",
+    "a close-up photograph of a modern smartphone device in hand or on a desk",
+    "a picture of a mobile telephone or cellular phone handset",
+    "a photo of a handheld mobile phone or touchscreen smartphone",
+    "a clear picture of a smartphone handset",
+]
+"product photo" = [
+    "a studio product photography shot of merchandise on a clean background",
+    "a clean commercial product photograph of an item on a plain white backdrop",
+    "a professional studio packshot photo of commercial retail merchandise",
+    "an e-commerce catalog product picture with studio lighting",
+    "a staged commercial photo of a packaged product on seamless studio backdrop",
+]
+map = [
+    "a photo or graphic of a geographic map, street atlas, or floor plan",
+    "a photograph of a cartographic map with roads, countries, or terrain",
+    "a picture of a printed navigational map, street map, or atlas",
+    "a detailed geographic map showing borders, topography, or streets",
+    "a visual cartography map with roads, contours, and geographical features",
 ]
 
 # ── Deletion ledger & trash (core/ledger.py) ──────────────────────────────────

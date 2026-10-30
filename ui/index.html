@@ -1570,9 +1570,23 @@
         const vParam = c.keeper && c.keeper.md5 ? `&v=${c.keeper.md5.slice(0, 12)}` : "";
         const thumbUrl = c.keeper && c.keeper.id ? `/thumb/${c.keeper.id}?size=96${vParam}` : "";
         const reclaimableText = formatBytes(c.reclaimable_bytes || c.savings_bytes || 0);
-        const catBadge = c.category
-          ? `<span class="chip chip-category" ${c.category === 'Needs label' ? 'style="background:rgba(234,179,8,0.15);color:#eab308;border-color:rgba(234,179,8,0.4);"' : ''}>${escapeHtml(c.category)}</span>`
-          : "";
+        const catBadge = (() => {
+          if (c.manual_category) {
+            return `<span class="chip chip-category">${escapeHtml(c.manual_category)}</span>`;
+          }
+          const top1Val = (c.category_top1_prob !== undefined && c.category_top1_prob !== null) ? c.category_top1_prob : 0;
+          const top2Val = (c.category_top2_prob !== undefined && c.category_top2_prob !== null) ? c.category_top2_prob : 0;
+          const isNeeds = c.category === 'Needs label' || (c.category_top1_prob !== undefined && c.category_top1_prob !== null && (top1Val < 0.15 || (top1Val - top2Val < 0.03)));
+          if (isNeeds) {
+            return `<span class="chip chip-category" style="background:rgba(234,179,8,0.15);color:#eab308;border-color:rgba(234,179,8,0.4);">Needs label</span>`;
+          }
+          if (c.category_top1 && c.category_top2) {
+            const p1 = Math.round((c.category_top1_prob || 0) * 100);
+            const p2 = Math.round((c.category_top2_prob || 0) * 100);
+            return `<span class="chip chip-category" title="Top-1: ${escapeHtml(c.category_top1)} (${p1}%) | Top-2: ${escapeHtml(c.category_top2)} (${p2}%)">${escapeHtml(c.category_top1)} (${p1}%) &bull; ${escapeHtml(c.category_top2)} (${p2}%)</span>`;
+          }
+          return c.category ? `<span class="chip chip-category">${escapeHtml(c.category)}</span>` : "";
+        })();
 
         item.innerHTML = `
           <div class="cluster-thumb-box">
@@ -1740,17 +1754,35 @@
 
       document.getElementById("detail-cluster-title").textContent = `Cluster #${data.id}`;
       const catEl = document.getElementById("detail-cluster-category");
-      if (data.category) {
-        catEl.textContent = data.category;
+      if (data.category || data.manual_category) {
         catEl.style.display = "inline-flex";
-        if (data.category === "Needs label") {
-          catEl.style.background = "rgba(234, 179, 8, 0.15)";
-          catEl.style.color = "#eab308";
-          catEl.style.borderColor = "rgba(234, 179, 8, 0.4)";
-        } else {
+        if (data.manual_category) {
+          catEl.textContent = data.manual_category;
           catEl.style.background = "";
           catEl.style.color = "";
           catEl.style.borderColor = "";
+        } else {
+          const top1Val = (data.category_top1_prob !== undefined && data.category_top1_prob !== null) ? data.category_top1_prob : 0;
+          const top2Val = (data.category_top2_prob !== undefined && data.category_top2_prob !== null) ? data.category_top2_prob : 0;
+          const isNeeds = data.category === 'Needs label' || (data.category_top1_prob !== undefined && data.category_top1_prob !== null && (top1Val < 0.15 || (top1Val - top2Val < 0.03)));
+          if (isNeeds) {
+            catEl.textContent = "Needs label";
+            catEl.style.background = "rgba(234, 179, 8, 0.15)";
+            catEl.style.color = "#eab308";
+            catEl.style.borderColor = "rgba(234, 179, 8, 0.4)";
+          } else if (data.category_top1 && data.category_top2) {
+            const p1 = Math.round((data.category_top1_prob || 0) * 100);
+            const p2 = Math.round((data.category_top2_prob || 0) * 100);
+            catEl.textContent = `${data.category_top1} (${p1}%) · ${data.category_top2} (${p2}%)`;
+            catEl.style.background = "";
+            catEl.style.color = "";
+            catEl.style.borderColor = "";
+          } else {
+            catEl.textContent = data.category;
+            catEl.style.background = "";
+            catEl.style.color = "";
+            catEl.style.borderColor = "";
+          }
         }
       } else {
         catEl.style.display = "none";
@@ -1915,7 +1947,23 @@
               <span style="font-weight:600; color:var(--text);">${formatBytes(m.size)}</span>
             </div>
             <div style="font-size:0.75rem; color:var(--text-muted);">${m.width} &times; ${m.height} &bull; ${m.format}</div>
-            ${m.category ? `<span class="chip chip-category" ${m.category === 'Needs label' ? 'style="background:rgba(234,179,8,0.15);color:#eab308;border-color:rgba(234,179,8,0.4);"' : ''} title="Top-1: ${m.category_top1 || m.category} (${Math.round((m.category_top1_prob || m.category_prob || 0) * 100)}%)${m.category_top2 ? ` | Top-2: ${m.category_top2} (${Math.round((m.category_top2_prob || 0) * 100)}%)` : ''}">${m.category}</span>` : ""}
+            ${(() => {
+              const p1 = Math.round((m.category_top1_prob || m.category_prob || 0) * 100);
+              const p2 = Math.round((m.category_top2_prob || 0) * 100);
+              const top1Val = (m.category_top1_prob !== undefined && m.category_top1_prob !== null) ? m.category_top1_prob : (m.category_prob || 0);
+              const top2Val = (m.category_top2_prob !== undefined && m.category_top2_prob !== null) ? m.category_top2_prob : 0;
+              const isNeedsLabel = m.category === 'Needs label' || (top1Val < 0.15) || ((top1Val - top2Val) < 0.03);
+              if (isNeedsLabel) {
+                return `<span class="chip chip-category" style="background:rgba(234,179,8,0.15);color:#eab308;border-color:rgba(234,179,8,0.4);" title="Top-1: ${escapeHtml(m.category_top1 || m.category || '')} (${p1}%)${m.category_top2 ? ` | Top-2: ${escapeHtml(m.category_top2)} (${p2}%)` : ''}">Needs label</span>`;
+              }
+              if (m.category_top1 && m.category_top2) {
+                return `<span class="chip chip-category" title="Top-1: ${escapeHtml(m.category_top1)} (${p1}%) | Top-2: ${escapeHtml(m.category_top2)} (${p2}%)">${escapeHtml(m.category_top1)} (${p1}%) &bull; ${escapeHtml(m.category_top2)} (${p2}%)</span>`;
+              }
+              if (m.category) {
+                return `<span class="chip chip-category">${escapeHtml(m.category)} (${p1}%)</span>`;
+              }
+              return "";
+            })()}
             <div class="status-row">
               ${statusHtml}
               ${!m.is_recommended_keeper ? `
@@ -3208,7 +3256,20 @@
               <div class="library-card-title" title="${img.filename}">${img.filename}</div>
               <div class="library-card-meta">
                 <span>${formatBytes(img.file_size)}</span>
-                <span class="chip chip-category" style="font-size: 0.68rem;">${img.category || "Needs label"}</span>
+                ${(() => {
+                  const p1 = Math.round((img.category_top1_prob || img.category_prob || 0) * 100);
+                  const p2 = Math.round((img.category_top2_prob || 0) * 100);
+                  const top1Val = (img.category_top1_prob !== undefined && img.category_top1_prob !== null) ? img.category_top1_prob : (img.category_prob || 0);
+                  const top2Val = (img.category_top2_prob !== undefined && img.category_top2_prob !== null) ? img.category_top2_prob : 0;
+                  const isNeedsLabel = img.category === 'Needs label' || !img.category || (top1Val < 0.15) || ((top1Val - top2Val) < 0.03);
+                  if (isNeedsLabel) {
+                    return `<span class="chip chip-category" style="font-size:0.68rem; background:rgba(234,179,8,0.15);color:#eab308;border-color:rgba(234,179,8,0.4);" title="Top-1: ${escapeHtml(img.category_top1 || img.category || '')} (${p1}%)${img.category_top2 ? ` | Top-2: ${escapeHtml(img.category_top2)} (${p2}%)` : ''}">Needs label</span>`;
+                  }
+                  if (img.category_top1 && img.category_top2) {
+                    return `<span class="chip chip-category" style="font-size:0.68rem;" title="Top-1: ${escapeHtml(img.category_top1)} (${p1}%) | Top-2: ${escapeHtml(img.category_top2)} (${p2}%)">${escapeHtml(img.category_top1)} (${p1}%) &bull; ${escapeHtml(img.category_top2)} (${p2}%)</span>`;
+                  }
+                  return `<span class="chip chip-category" style="font-size:0.68rem;">${escapeHtml(img.category)} (${p1}%)</span>`;
+                })()}
               </div>
             </div>
           `;

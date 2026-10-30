@@ -26,6 +26,48 @@ import torch
 from core.embeddings import CLIPEmbedder, deserialize_embedding, get_device
 
 
+DEFAULT_LABELS = [
+    "portrait/selfie",
+    "group photo",
+    "baby",
+    "pet dog",
+    "pet cat",
+    "wildlife",
+    "food and drink",
+    "beach",
+    "mountains",
+    "forest",
+    "city street",
+    "building exterior",
+    "interior room",
+    "night scene",
+    "sunset",
+    "flowers",
+    "car",
+    "motorbike",
+    "bicycle",
+    "airplane",
+    "boat",
+    "sports",
+    "party/event",
+    "wedding",
+    "document or receipt",
+    "screenshot of an app",
+    "meme with text",
+    "whiteboard",
+    "artwork",
+    "sculpture",
+    "landmark",
+    "bridge",
+    "snow",
+    "water/river",
+    "farm",
+    "computer/laptop",
+    "phone",
+    "product photo",
+    "map",
+]
+
 DEFAULT_SCENE_LABELS = [
     "indoor",
     "landscape",
@@ -44,15 +86,14 @@ DEFAULT_SUBJECT_LABELS = [
     "technology",
     "artifact",
     "people_working",
-    "other",
 ]
 
 
 @dataclass
 class CategoryConfig:
     temperature: float = 0.05
-    uncertain_margin: float = 0.05
-    min_top_prob: float = 0.20
+    uncertain_margin: float = 0.03
+    min_top_prob: float = 0.15
     labels: list[str] = field(default_factory=list)
     templates: dict[str, list[str]] = field(default_factory=dict)
     scene_labels: list[str] = field(default_factory=list)
@@ -63,8 +104,8 @@ def parse_category_config(config: dict) -> CategoryConfig:
     """Parse [categories] section from config.toml with support for two-level scene & subject labels."""
     cat_cfg = config.get("categories", {})
     temperature = float(cat_cfg.get("temperature", 0.05))
-    uncertain_margin = float(cat_cfg.get("uncertain_margin", 0.05))
-    min_top_prob = float(cat_cfg.get("min_top_prob", 0.20))
+    uncertain_margin = float(cat_cfg.get("uncertain_margin", 0.03))
+    min_top_prob = float(cat_cfg.get("min_top_prob", 0.15))
 
     scene_cfg = cat_cfg.get("scene_labels")
     scene_labels = [str(s) for s in scene_cfg] if isinstance(scene_cfg, list) else list(DEFAULT_SCENE_LABELS)
@@ -95,7 +136,7 @@ def parse_category_config(config: dict) -> CategoryConfig:
         # Merge scene labels, subject labels, and any custom templates preserving order
         seen = set()
         labels = []
-        for l in scene_labels + subject_labels + list(templates.keys()):
+        for l in list(templates.keys()) or DEFAULT_LABELS:
             if l not in seen:
                 seen.add(l)
                 labels.append(l)
@@ -216,18 +257,18 @@ def classify_vector(
     text_matrix: np.ndarray,
     label_names: list[str],
     temperature: float = 0.05,
-    uncertain_margin: float = 0.05,
-    min_top_prob: float = 0.20,
+    uncertain_margin: float = 0.03,
+    min_top_prob: float = 0.15,
 ) -> tuple[str, float, list[dict[str, Any]]]:
     """
     Classify a single upright image CLIP vector against label text embeddings.
 
     Returns:
         (category_top1, category_top1_prob, category_top3)
-        where category_top1 is either a label name or 'uncertain'.
+        where category_top1 is either a label name or 'Needs label'.
     """
     if len(label_names) == 0 or text_matrix.shape[0] == 0:
-        return "uncertain", 0.0, []
+        return "Needs label", 0.0, []
 
     # Ensure float32 and unit norm
     vec = clip_vec.astype(np.float32).flatten()
@@ -255,7 +296,7 @@ def classify_vector(
     # 1. Margin between top 1 and top 2 is smaller than uncertain_margin
     # 2. Absolute probability of top 1 is below min_top_prob
     is_uncertain = ((top1_prob - top2_prob) < uncertain_margin) or (top1_prob < min_top_prob)
-    final_label = "uncertain" if is_uncertain else top1_label
+    final_label = "Needs label" if is_uncertain else top1_label
 
     top3 = [
         {"label": label_names[idx], "prob": round(float(probs[idx]), 4)}

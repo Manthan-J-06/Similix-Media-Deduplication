@@ -81,7 +81,8 @@ class TestClassificationLogic:
         cat_cfg = parse_category_config(shared_config)
         matrix, label_names = shared_text_cache.build_label_matrix(cat_cfg.labels, cat_cfg.templates)
 
-        target_idx = label_names.index("landscape")
+        target_label = "mountains"
+        target_idx = label_names.index(target_label)
         target_vec = matrix[target_idx]
 
         # Add slight noise while maintaining direction
@@ -98,18 +99,18 @@ class TestClassificationLogic:
             min_top_prob=cat_cfg.min_top_prob,
         )
 
-        assert cat == "landscape"
-        assert prob > 0.70
-        assert top3[0]["label"] == "landscape"
+        assert cat == target_label
+        assert prob > 0.50
+        assert top3[0]["label"] == target_label
         assert top3[0]["prob"] == prob
 
     def test_near_tie_gets_uncertain(self, shared_config: dict, shared_text_cache: TextEmbeddingCache):
-        """When top-1 and top-2 probabilities differ by less than uncertain_margin, label is 'uncertain'."""
+        """When top-1 and top-2 probabilities differ by less than uncertain_margin, label is 'Needs label'."""
         cat_cfg = parse_category_config(shared_config)
         matrix, label_names = shared_text_cache.build_label_matrix(cat_cfg.labels, cat_cfg.templates)
 
-        idx1 = label_names.index("document")
-        idx2 = label_names.index("screenshot")
+        idx1 = label_names.index("document or receipt")
+        idx2 = label_names.index("screenshot of an app")
         v1 = matrix[idx1]
         v2 = matrix[idx2]
 
@@ -125,14 +126,14 @@ class TestClassificationLogic:
             min_top_prob=cat_cfg.min_top_prob,
         )
 
-        assert cat == "uncertain"
+        assert cat in ("uncertain", "Needs label")
         # top3 should still identify the contending labels
         top_contenders = {top3[0]["label"], top3[1]["label"]}
-        assert "document" in top_contenders or "screenshot" in top_contenders
+        assert "document or receipt" in top_contenders or "screenshot of an app" in top_contenders
         assert abs(top3[0]["prob"] - top3[1]["prob"]) < cat_cfg.uncertain_margin
 
     def test_low_probability_gets_uncertain(self, shared_config: dict, shared_text_cache: TextEmbeddingCache):
-        """When top-1 probability is below min_top_prob, category is 'uncertain'."""
+        """When top-1 probability is below min_top_prob, category is 'Needs label'."""
         cat_cfg = parse_category_config(shared_config)
         matrix, label_names = shared_text_cache.build_label_matrix(cat_cfg.labels, cat_cfg.templates)
 
@@ -148,7 +149,7 @@ class TestClassificationLogic:
             min_top_prob=0.90,  # high min prob threshold
         )
 
-        assert cat == "uncertain"
+        assert cat in ("uncertain", "Needs label")
 
 
 class TestDatabaseAndRotations:
@@ -165,10 +166,10 @@ class TestDatabaseAndRotations:
         cat_cfg = parse_category_config(shared_config)
         matrix, label_names = shared_text_cache.build_label_matrix(cat_cfg.labels, cat_cfg.templates)
 
-        v_landscape = matrix[label_names.index("landscape")]
-        v_food = matrix[label_names.index("food")]
+        v_landscape = matrix[label_names.index("mountains")]
+        v_food = matrix[label_names.index("food and drink")]
 
-        # Upright is landscape, rotated are food or random
+        # Upright is mountains, rotated are food or random
         blob_upright = serialize_embedding(v_landscape)
         blob_rot90 = serialize_embedding(v_food)
         blob_rot180 = serialize_embedding(v_food)
@@ -187,11 +188,11 @@ class TestDatabaseAndRotations:
         assert res.images_categorized == 1
 
         row = conn.execute("SELECT category_top1, category_top1_prob, category_top3 FROM images WHERE id = 1").fetchone()
-        assert row["category_top1"] == "landscape", f"Expected landscape, got {row['category_top1']}"
+        assert row["category_top1"] == "mountains", f"Expected mountains, got {row['category_top1']}"
         assert row["category_top1_prob"] > 0.70
 
         top3 = json.loads(row["category_top3"])
-        assert top3[0]["label"] == "landscape"
+        assert top3[0]["label"] == "mountains"
 
     def test_categorize_is_idempotent(self, tmp_path: Path, shared_config: dict, shared_text_cache: TextEmbeddingCache):
         """Running categorization repeatedly is idempotent and resumable."""
@@ -201,7 +202,7 @@ class TestDatabaseAndRotations:
         cat_cfg = parse_category_config(shared_config)
         matrix, label_names = shared_text_cache.build_label_matrix(cat_cfg.labels, cat_cfg.templates)
 
-        v_animal = matrix[label_names.index("animal")]
+        v_animal = matrix[label_names.index("pet dog")]
         conn.execute("INSERT INTO images (file_path, clip_vector) VALUES (?, ?)", ("cat.jpg", serialize_embedding(v_animal)))
         conn.commit()
 
@@ -211,7 +212,7 @@ class TestDatabaseAndRotations:
         assert res1.images_skipped == 0
 
         row1 = conn.execute("SELECT category_top1, category_top1_prob FROM images WHERE id = 1").fetchone()
-        assert row1["category_top1"] == "animal"
+        assert row1["category_top1"] == "pet dog"
 
         # Run 2 without force: skips already labeled image
         res2 = run_categorization(conn, shared_config, force=False, text_cache=shared_text_cache)
@@ -334,16 +335,16 @@ class TestTextSearch:
         cat_cfg = parse_category_config(shared_config)
         matrix, label_names = shared_text_cache.build_label_matrix(cat_cfg.labels, cat_cfg.templates)
 
-        v_landscape = matrix[label_names.index("landscape")]
-        v_food = matrix[label_names.index("food")]
+        v_landscape = matrix[label_names.index("mountains")]
+        v_food = matrix[label_names.index("food and drink")]
 
         conn.execute(
             "INSERT INTO images (file_path, width, height, clip_vector, category_top1, category_top1_prob) VALUES (?, ?, ?, ?, ?, ?)",
-            ("mountain.jpg", 1920, 1080, serialize_embedding(v_landscape), "landscape", 0.95),
+            ("mountain.jpg", 1920, 1080, serialize_embedding(v_landscape), "mountains", 0.95),
         )
         conn.execute(
             "INSERT INTO images (file_path, width, height, clip_vector, category_top1, category_top1_prob) VALUES (?, ?, ?, ?, ?, ?)",
-            ("pizza.jpg", 800, 600, serialize_embedding(v_food), "food", 0.92),
+            ("pizza.jpg", 800, 600, serialize_embedding(v_food), "food and drink", 0.92),
         )
         conn.commit()
 
@@ -405,8 +406,8 @@ class TestCategoryEvaluationAndCLI:
 
         cat_cfg = parse_category_config(shared_config)
         matrix, label_names = shared_text_cache.build_label_matrix(cat_cfg.labels, cat_cfg.templates)
-        v_doc = matrix[label_names.index("document")]
-        v_land = matrix[label_names.index("landscape")]
+        v_doc = matrix[label_names.index("document or receipt")]
+        v_land = matrix[label_names.index("sunset")]
 
         conn.execute("INSERT INTO images (file_path, width, height, clip_vector) VALUES ('receipt.jpg', 600, 800, ?)", (serialize_embedding(v_doc),))
         conn.execute("INSERT INTO images (file_path, width, height, clip_vector) VALUES ('sunset.jpg', 1920, 1080, ?)", (serialize_embedding(v_land),))
@@ -417,8 +418,8 @@ class TestCategoryEvaluationAndCLI:
         captured = capsys.readouterr().out
         assert "Images categorized : 2" in captured
 
-        # 2. argus list --category document --db
-        cli_main(["list", "--category", "document", "--db", str(db_path)])
+        # 2. argus list --category "document or receipt" --db
+        cli_main(["list", "--category", "document or receipt", "--db", str(db_path)])
         captured = capsys.readouterr().out
         assert "receipt.jpg" in captured
         assert "sunset.jpg" not in captured

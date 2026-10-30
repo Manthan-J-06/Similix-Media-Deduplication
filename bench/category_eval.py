@@ -143,7 +143,7 @@ def evaluate_categories(
         per_label_total[true_label] += 1
         confusion[true_label][pred_label] += 1
 
-        if pred_label == "uncertain":
+        if pred_label in ("uncertain", "needs label"):
             uncertain_count += 1
 
         if pred_label == true_label:
