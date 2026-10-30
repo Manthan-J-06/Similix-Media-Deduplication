@@ -2137,6 +2137,13 @@ def create_app(
 
         opener = urllib.request.build_opener(SafeRedirectHandler())
         req_head = urllib.request.Request(url, headers={"User-Agent": "Argus/0.1.0"})
+        temp_dir = user.root / "tmp"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        tmp_download = tempfile.NamedTemporaryFile(prefix="dataset_stream_", dir=temp_dir, delete=False)
+        tmp_download_path = Path(tmp_download.name)
+        total_downloaded = 0
+        content_type = ""
+
         try:
             with opener.open(req_head, timeout=30) as resp:
                 content_len = resp.headers.get("Content-Length")
@@ -2144,84 +2151,129 @@ def create_app(
                     raise HTTPException(status_code=400, detail=f"Dataset exceeds {size_cap_bytes // (1024*1024)} MB size cap")
 
                 content_type = (resp.headers.get("Content-Type") or "").lower()
-                data = bytearray()
                 while True:
                     chunk = resp.read(65536)
                     if not chunk:
                         break
-                    data.extend(chunk)
-                    if len(data) > size_cap_bytes:
+                    total_downloaded += len(chunk)
+                    if total_downloaded > size_cap_bytes:
                         raise HTTPException(status_code=400, detail=f"Dataset exceeds {size_cap_bytes // (1024*1024)} MB size cap")
+                    tmp_download.write(chunk)
+            tmp_download.flush()
+            tmp_download.close()
+
+            quotas_cfg = cfg.get("quotas", {})
+            user_storage_cap = quotas_cfg.get("user_storage_cap_mb", 2048) * 1024 * 1024
+            if get_user_storage_usage(user.root) + total_downloaded > user_storage_cap:
+                raise HTTPException(status_code=400, detail="Dataset download exceeds user storage quota (2 GB)")
+
+            clean_project = re.sub(r"[^a-zA-Z0-9_\-]", "_", req.project.strip()) or "default"
+            dest_dir = user.library_dir / clean_project
+            validate_confined_user_path(dest_dir, user.root)
+            dest_dir.mkdir(parents=True, exist_ok=True)
+
+            is_zip = False
+            with open(tmp_download_path, "rb") as fh:
+                magic = fh.read(4)
+                if magic.startswith(b"PK\x03\x04") or "zip" in content_type or url.lower().endswith(".zip"):
+                    is_zip = True
+
+            extracted_files: list[str] = []
+
+            if is_zip:
+                try:
+                    zf = zipfile.ZipFile(tmp_download_path)
+                except Exception as exc:
+                    raise HTTPException(status_code=400, detail=f"Invalid zip archive: {exc}")
+
+                entries = zf.infolist()
+                image_entries = [e for e in entries if not e.is_dir()]
+                if len(image_entries) > file_count_cap:
+                    raise HTTPException(status_code=400, detail=f"Archive exceeds {file_count_cap} file cap (found {len(image_entries)})")
+
+                total_uncompressed = sum(e.file_size for e in image_entries)
+                if total_uncompressed > size_cap_bytes:
+                    raise HTTPException(status_code=400, detail=f"Archive uncompressed size exceeds {size_cap_bytes // (1024*1024)} MB cap")
+
+                allowed_img_exts = {"jpg", "jpeg", "png", "webp", "heic"}
+                for e in image_entries:
+                    ename = e.filename
+                    if ".." in ename or ename.startswith("/") or ename.startswith("\\"):
+                        raise HTTPException(status_code=400, detail=f"Path traversal in archive rejected: {ename}")
+                    ext = Path(ename).suffix.lower().lstrip(".")
+                    if ext not in allowed_img_exts:
+                        raise HTTPException(status_code=400, detail=f"Non-image file in archive rejected: {ename}")
+
+                # Stream and extract in batches of 50
+                conn = get_connection(user.db_path)
+                try:
+                    BATCH_SIZE = 50
+                    for b_idx in range(0, len(image_entries), BATCH_SIZE):
+                        batch = image_entries[b_idx : b_idx + BATCH_SIZE]
+                        db_rows = []
+                        for e in batch:
+                            safe_name = Path(e.filename).name
+                            out_path = dest_dir / safe_name
+                            validate_confined_user_path(out_path, user.root)
+                            out_path.write_bytes(zf.read(e))
+                            extracted_files.append(str(out_path))
+                            stat = out_path.stat()
+                            db_rows.append((str(out_path), stat.st_size, stat.st_mtime, "local"))
+
+                        conn.executemany(
+                            """
+                            INSERT OR IGNORE INTO images (file_path, file_size, modified_time, source, status, created_at)
+                            VALUES (?, ?, ?, ?, 'discovered', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                            """,
+                            db_rows,
+                        )
+                        conn.commit()
+                finally:
+                    conn.close()
+            else:
+                data = tmp_download_path.read_bytes()
+                try:
+                    im = Image.open(io.BytesIO(data))
+                    im.verify()
+                    fmt = (im.format or "JPEG").lower()
+                except Exception:
+                    raise HTTPException(status_code=400, detail="Non-image content type rejected")
+
+                base_name = Path(urllib.parse.urlparse(url).path).name or f"dataset_{uuid.uuid4().hex[:8]}.{fmt}"
+                if "." not in base_name:
+                    base_name = f"{base_name}.{fmt}"
+                out_path = dest_dir / base_name
+                validate_confined_user_path(out_path, user.root)
+                out_path.write_bytes(data)
+                extracted_files.append(str(out_path))
+
+                stat = out_path.stat()
+                conn = get_connection(user.db_path)
+                try:
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO images (file_path, file_size, modified_time, source, status, created_at)
+                        VALUES (?, ?, ?, ?, 'discovered', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                        """,
+                        (str(out_path), stat.st_size, stat.st_mtime, "local"),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+
+            job_id = launch_pipeline_job(request.app, user=user, source_type="local", folder=dest_dir)
+            return {
+                "job_id": job_id,
+                "project": clean_project,
+                "extracted_count": len(extracted_files),
+            }
         except HTTPException:
             raise
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Failed to download dataset: {exc}")
-
-        quotas_cfg = cfg.get("quotas", {})
-        user_storage_cap = quotas_cfg.get("user_storage_cap_mb", 2048) * 1024 * 1024
-        if get_user_storage_usage(user.root) + len(data) > user_storage_cap:
-            raise HTTPException(status_code=400, detail="Dataset download exceeds user storage quota (2 GB)")
-
-        clean_project = re.sub(r"[^a-zA-Z0-9_\-]", "_", req.project.strip()) or "default"
-        dest_dir = user.library_dir / clean_project
-        validate_confined_user_path(dest_dir, user.root)
-        dest_dir.mkdir(parents=True, exist_ok=True)
-
-        is_zip = data.startswith(b"PK\x03\x04") or "zip" in content_type or url.lower().endswith(".zip")
-        extracted_files = []
-
-        if is_zip:
-            try:
-                zf = zipfile.ZipFile(io.BytesIO(data))
-            except Exception as exc:
-                raise HTTPException(status_code=400, detail=f"Invalid zip archive: {exc}")
-
-            entries = zf.infolist()
-            image_entries = [e for e in entries if not e.is_dir()]
-            if len(image_entries) > file_count_cap:
-                raise HTTPException(status_code=400, detail=f"Archive exceeds {file_count_cap} file cap (found {len(image_entries)})")
-
-            total_uncompressed = sum(e.file_size for e in image_entries)
-            if total_uncompressed > size_cap_bytes:
-                raise HTTPException(status_code=400, detail=f"Archive uncompressed size exceeds {size_cap_bytes // (1024*1024)} MB cap")
-
-            allowed_img_exts = {"jpg", "jpeg", "png", "webp", "heic"}
-            for e in image_entries:
-                ename = e.filename
-                if ".." in ename or ename.startswith("/") or ename.startswith("\\"):
-                    raise HTTPException(status_code=400, detail=f"Path traversal in archive rejected: {ename}")
-                ext = Path(ename).suffix.lower().lstrip(".")
-                if ext not in allowed_img_exts:
-                    raise HTTPException(status_code=400, detail=f"Non-image file in archive rejected: {ename}")
-
-            for e in image_entries:
-                safe_name = Path(e.filename).name
-                out_path = dest_dir / safe_name
-                validate_confined_user_path(out_path, user.root)
-                out_path.write_bytes(zf.read(e))
-                extracted_files.append(str(out_path))
-        else:
-            try:
-                im = Image.open(io.BytesIO(data))
-                im.verify()
-                fmt = (im.format or "JPEG").lower()
-            except Exception:
-                raise HTTPException(status_code=400, detail="Non-image content type rejected")
-
-            base_name = Path(urllib.parse.urlparse(url).path).name or f"dataset_{uuid.uuid4().hex[:8]}.{fmt}"
-            if "." not in base_name:
-                base_name = f"{base_name}.{fmt}"
-            out_path = dest_dir / base_name
-            validate_confined_user_path(out_path, user.root)
-            out_path.write_bytes(data)
-            extracted_files.append(str(out_path))
-
-        job_id = launch_pipeline_job(request.app, user=user, source_type="local", folder=dest_dir)
-        return {
-            "job_id": job_id,
-            "project": clean_project,
-            "extracted_count": len(extracted_files),
-        }
+        finally:
+            if tmp_download_path.exists():
+                tmp_download_path.unlink(missing_ok=True)
 
     @app.post("/sources/rescan")
     def rescan_sources(
@@ -2282,7 +2334,8 @@ def create_app(
                             except OSError:
                                 is_alive = False
                         last_heartbeat = state.get("heartbeat_at") or state.get("updated_at", 0)
-                        is_stalled = (now - last_heartbeat) > 60
+                        last_progress = state.get("last_progress_at") or state.get("updated_at", 0)
+                        is_stalled = ((now - last_heartbeat) > 60) or ((now - last_progress) > 60)
 
                         if not is_alive and state.get("status") == "running":
                             state["status"] = "failed"
@@ -2298,16 +2351,26 @@ def create_app(
                             }
 
                         if is_stalled and state.get("status") == "running":
+                            curr_file = state.get("current_file_path") or state.get("failed_file")
+                            stg = state.get("stage") or "pipeline"
+                            if curr_file:
+                                err_msg = f"Stage '{stg}' stalled on file '{curr_file}' (no progress for 60s)"
+                            else:
+                                err_msg = "Worker heartbeat timed out (>60s)"
                             state["status"] = "stalled"
-                            state["error"] = "Worker heartbeat timed out (>60s)"
+                            state["error"] = err_msg
+                            state["message"] = f"Pipeline stalled: {err_msg}"
+                            if curr_file:
+                                state["failed_stage"] = stg
+                                state["failed_file"] = curr_file
                             write_job_state(jf, state)
                             job_id = state.get("id") or state.get("job_id") or jf.stem
                             return {
                                 "active": False,
                                 "status": "stalled",
                                 "job_id": str(job_id),
-                                "error": "Worker heartbeat timed out (>60s)",
-                                "message": "Worker heartbeat timed out (>60s)",
+                                "error": err_msg,
+                                "message": f"Pipeline stalled: {err_msg}",
                             }
 
                         job_id = state.get("id") or state.get("job_id") or jf.stem

@@ -903,6 +903,91 @@ class TestAPIServer:
         assert resp.status_code == 400
         assert "redirect off allow-list" in resp.json()["detail"].lower()
 
+    def test_dataset_streaming_and_batch_processing_of_50(self, api_test_env, monkeypatch):
+        """Dataset URLs: stream and process in batches of 50."""
+        import io
+        import zipfile
+        import urllib.request
+        from PIL import Image
+
+        client = api_test_env["client"]
+        db_file = api_test_env["db_file"]
+
+        # Create a zip containing 60 synthetic JPEG images
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w") as zf:
+            for i in range(60):
+                im_buf = io.BytesIO()
+                im = Image.new("RGB", (64, 64), color=(i, i * 2 % 255, 100))
+                im.save(im_buf, format="JPEG")
+                zf.writestr(f"img_{i:03d}.jpg", im_buf.getvalue())
+        zip_bytes = zip_buf.getvalue()
+
+        class MockResp:
+            def __init__(self, data):
+                self._data = io.BytesIO(data)
+                self.headers = {"Content-Length": str(len(data)), "Content-Type": "application/zip"}
+            def read(self, amt=65536):
+                return self._data.read(amt)
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+
+        class MockOpener:
+            def open(self, req, timeout=30):
+                return MockResp(zip_bytes)
+
+        monkeypatch.setattr(urllib.request, "build_opener", lambda *args: MockOpener())
+
+        resp = client.post(
+            "/sources/dataset",
+            json={"url": "https://huggingface.co/datasets/argus/sample.zip", "project": "batch50_test"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["extracted_count"] == 60
+        assert "job_id" in data
+
+        # Check DB pre-insertion
+        conn = sqlite3.connect(db_file)
+        count = conn.execute("SELECT COUNT(*) FROM images WHERE file_path LIKE '%batch50_test%'").fetchone()[0]
+        conn.close()
+        assert count == 60
+
+    def test_job_stalled_stage_reports_error_with_file_name(self, api_test_env):
+        """A stalled stage (no progress 60s) reports an error with the file name."""
+        import json
+        import time
+
+        client = api_test_env["client"]
+        jobs_dir = api_test_env["jobs_dir"]
+
+        job_id = "test_stalled_job"
+        job_file = jobs_dir / f"{job_id}.json"
+        job_data = {
+            "id": job_id,
+            "status": "running",
+            "stage": "hash",
+            "stage_display": "Perceptual hashing",
+            "current_file": 12,
+            "total_files": 100,
+            "current_file_path": "drive://file_stalled_abc/hung_photo.jpg",
+            "progress": 15.0,
+            "updated_at": time.time() - 70.0,
+            "last_progress_at": time.time() - 70.0,
+            "heartbeat_at": time.time() - 70.0,
+        }
+        job_file.write_text(json.dumps(job_data))
+
+        resp = client.get("/jobs/active")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["active"] is False
+        assert data["status"] == "stalled"
+        assert "stalled on file 'drive://file_stalled_abc/hung_photo.jpg'" in data["error"]
+        assert "(no progress for 60s)" in data["error"]
+
     def test_drive_link_parsing_and_auth_check(self, api_test_env):
         """
         B.3 & B.6: Test Drive URL parsing and authentication check.

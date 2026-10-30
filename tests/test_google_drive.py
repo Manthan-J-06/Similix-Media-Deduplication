@@ -761,3 +761,107 @@ class TestDriveThumbnailConfirmation:
         bw_row = db.execute("SELECT SUM(bytes_downloaded) FROM drive_bandwidth WHERE stage = 'confirm'").fetchone()
         assert bw_row[0] == len(ref_bytes) + len(cand_bytes)
 
+
+class TestDriveThumbnailConcurrencyAndCaching:
+    def test_fetch_thumbnails_thread_pool_and_progress_reports(self, tmp_path: Path):
+        """Fetch Drive thumbnails with 8 workers, 20s timeout, and report 'N of M' after every file."""
+        mock_service = MagicMock()
+        sample_jpeg = _create_sample_jpeg_bytes()
+
+        source = GoogleDriveSource(
+            service=mock_service,
+            cache_dir=tmp_path / "cache",
+        )
+
+        file_ids = [f"drive://file_{i}/photo_{i}.jpg" for i in range(16)]
+        for i, fid in enumerate(file_ids):
+            source._drive_item_cache[f"file_{i}"] = {
+                "thumbnailLink": f"https://lh3.googleusercontent.com/link_{i}=s220"
+            }
+            source._metadata_cache[fid] = MagicMock(modified_time=1700000000.0 + i)
+            source._metadata_cache[f"file_{i}"] = MagicMock(modified_time=1700000000.0 + i)
+
+        resp_mock = MagicMock()
+        resp_mock.status = 200
+        resp_mock.read.return_value = sample_jpeg
+        resp_mock.__enter__.return_value = resp_mock
+
+        progress_calls = []
+
+        def on_progress(cur, total, fid):
+            progress_calls.append((cur, total, fid))
+
+        with patch("urllib.request.urlopen", return_value=resp_mock) as mock_urlopen:
+            thumbs = source.fetch_thumbnails(file_ids, max_workers=8, progress_callback=on_progress)
+
+        assert len(thumbs) == 16
+        assert len(progress_calls) == 16
+        # Assert each call received (cur, total, fid)
+        assert progress_calls[-1][0] == 16
+        assert progress_calls[-1][1] == 16
+        for cur, total, fid in progress_calls:
+            assert total == 16
+            assert fid in file_ids
+
+        # Check all files cached on disk by file_id + modifiedTime
+        for i in range(16):
+            expected_cache = tmp_path / "cache" / f"file_{i}_{int(1700000000.0 + i)}.jpg"
+            assert expected_cache.exists()
+            assert expected_cache.stat().st_size > 0
+
+    def test_cache_by_file_id_and_mtime_skips_network(self, tmp_path: Path):
+        """Cache by file id + modifiedTime; skip files already processed."""
+        mock_service = MagicMock()
+        sample_jpeg = _create_sample_jpeg_bytes()
+
+        source = GoogleDriveSource(
+            service=mock_service,
+            cache_dir=tmp_path / "cache",
+        )
+
+        # Pre-seed cache on disk for file_cached
+        cache_file = tmp_path / "cache" / "file_cached_1700005555.jpg"
+        cache_file.write_bytes(sample_jpeg)
+
+        source._metadata_cache["drive://file_cached/pic.jpg"] = MagicMock(modified_time=1700005555.0)
+        source._metadata_cache["file_cached"] = MagicMock(modified_time=1700005555.0)
+
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            thumb = source.get_thumbnail("drive://file_cached/pic.jpg")
+            # Network download must NOT be called because it is already cached
+            mock_urlopen.assert_not_called()
+
+        assert isinstance(thumb, Image.Image)
+
+    def test_download_thumbnail_retries_with_backoff_on_429(self, tmp_path: Path):
+        """Thumbnail download retries up to 3 times with backoff on HTTP 429."""
+        mock_service = MagicMock()
+        sample_jpeg = _create_sample_jpeg_bytes()
+
+        source = GoogleDriveSource(
+            service=mock_service,
+            cache_dir=tmp_path / "cache",
+        )
+
+        import urllib.error
+        err_429 = urllib.error.HTTPError(
+            url="https://lh3.googleusercontent.com/test=s512",
+            code=429,
+            msg="Too Many Requests",
+            hdrs={},
+            fp=None,
+        )
+
+        resp_success = MagicMock()
+        resp_success.status = 200
+        resp_success.read.return_value = sample_jpeg
+        resp_success.__enter__.return_value = resp_success
+
+        with patch("urllib.request.urlopen", side_effect=[err_429, err_429, resp_success]) as mock_urlopen, \
+             patch("time.sleep") as mock_sleep:
+            data = source._download_thumbnail_bytes("https://lh3.googleusercontent.com/test=s512", timeout=20, max_retries=3)
+
+        assert data == sample_jpeg
+        assert mock_urlopen.call_count == 3
+        assert mock_sleep.call_count == 2
+

@@ -18,6 +18,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 import imagehash
 from PIL import Image
@@ -65,17 +66,33 @@ def compute_stage1_hashes(
     conn: sqlite3.Connection,
     config: dict,
     result: Stage1Result | None = None,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> int:
     """
     Compute perceptual hashes for all images that don't have one yet.
-    Processes in configurable batches, using small thumbnails.
+    Processes in batches of 50, using an 8-worker thread pool for thumbnails
+    and reporting "N of M" after every file.
     """
     thumb_size = config.get("general", {}).get("thumbnail_size", 256)
-    batch_size = config.get("general", {}).get("batch_size", 500)
+    batch_size = config.get("stage1", {}).get("batch_size", 50)
     hash_algo = config.get("stage1", {}).get("hash_algorithm", "phash")
     hash_size = config.get("stage1", {}).get("hash_size", 8)
 
+    total_to_hash = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM images
+        WHERE phash IS NULL
+          AND is_raw_pair = 0
+          AND (status IS NULL OR status != 'skipped')
+        """
+    ).fetchone()[0]
+
+    if total_to_hash == 0:
+        return 0
+
     hashes_computed = 0
+    hashes_processed = 0
 
     while True:
         batch = conn.execute(
@@ -85,6 +102,7 @@ def compute_stage1_hashes(
             WHERE phash IS NULL
               AND is_raw_pair = 0
               AND (status IS NULL OR status != 'skipped')
+            ORDER BY id
             LIMIT ?
             """,
             (batch_size,),
@@ -93,19 +111,47 @@ def compute_stage1_hashes(
         if not batch:
             break
 
+        file_ids = [row["file_path"] for row in batch]
+
+        def _on_file_progress(done_in_batch: int, total_in_batch: int, fpath: str):
+            cur_overall = hashes_processed + done_in_batch
+            if progress_callback:
+                progress_callback(cur_overall, total_to_hash, fpath)
+
+        # Concurrently fetch thumbnails with 8 workers
+        thumbs_map = source.fetch_thumbnails(
+            file_ids,
+            max_workers=8,
+            progress_callback=_on_file_progress,
+            size=(thumb_size, thumb_size),
+        )
+
         updates: list[tuple[str, int]] = []
         failed_ids: list[int] = []
+
         for row in batch:
-            file_id = row["file_path"]
+            fid = row["id"]
+            fpath = row["file_path"]
+            thumb = thumbs_map.get(fpath)
+            if thumb is None:
+                # Try single get_thumbnail fallback if not in map
+                try:
+                    thumb = source.get_thumbnail(fpath, size=(thumb_size, thumb_size))
+                except Exception as exc:
+                    if result is not None:
+                        result.files_skipped += 1
+                        result.skipped_reasons.append((fpath, f"Thumbnail generation failed: {exc}"))
+                    failed_ids.append(fid)
+                    continue
+
             try:
-                thumb = source.get_thumbnail(file_id, size=(thumb_size, thumb_size))
                 phash_val = str(_compute_hash(thumb, algo=hash_algo, hash_size=hash_size))
-                updates.append((phash_val, row["id"]))
+                updates.append((phash_val, fid))
             except Exception as exc:
                 if result is not None:
                     result.files_skipped += 1
-                    result.skipped_reasons.append((file_id, f"Thumbnail/pHash generation failed: {exc}"))
-                failed_ids.append(row["id"])
+                    result.skipped_reasons.append((fpath, f"pHash computation failed: {exc}"))
+                failed_ids.append(fid)
                 continue
 
         if updates:
@@ -132,6 +178,8 @@ def compute_stage1_hashes(
                 [(fid,) for fid in failed_ids],
             )
             conn.commit()
+
+        hashes_processed += len(batch)
 
     return hashes_computed
 
@@ -318,6 +366,7 @@ def run_stage1(
     source_or_root: ImageSource | Path | str,
     conn: sqlite3.Connection,
     config: dict,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> Stage1Result:
     """Execute Stage 1 end-to-end."""
     result = Stage1Result()
@@ -327,8 +376,10 @@ def run_stage1(
     else:
         source = LocalFolderSource(source_or_root)
 
-    # Step 1: Compute pHash on thumbnails using draft mode
-    result.hashes_computed = compute_stage1_hashes(source, conn, config, result=result)
+    # Step 1: Compute pHash on thumbnails using draft mode and thread pool
+    result.hashes_computed = compute_stage1_hashes(
+        source, conn, config, result=result, progress_callback=progress_callback
+    )
 
     # Step 2: Form near-duplicate clusters
     new_clusters, members_added, total_clustered = cluster_stage1_candidates(conn, config)

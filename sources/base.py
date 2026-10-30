@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Callable, Iterator
 from PIL import Image
 
 
@@ -56,3 +56,54 @@ class ImageSource(ABC):
         Must use fast decoders (like JPEG draft mode) to avoid full image loads.
         """
         ...
+
+    def fetch_thumbnails(
+        self,
+        file_ids: list[str],
+        max_workers: int = 8,
+        progress_callback: Callable[[int, int, str], None] | None = None,
+        size: tuple[int, int] = (256, 256),
+    ) -> dict[str, Image.Image]:
+        """
+        Fetch thumbnails for multiple file IDs concurrently using a thread pool (default 8 workers).
+        Invokes progress_callback(cur, total, file_id) after every file.
+        """
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        total = len(file_ids)
+        if total == 0:
+            return {}
+
+        results: dict[str, Image.Image] = {}
+        completed = 0
+        lock = threading.Lock()
+
+        def _fetch_one(fid: str) -> tuple[str, Image.Image | None]:
+            nonlocal completed
+            try:
+                img = self.get_thumbnail(fid, size=size)
+            except Exception:
+                img = None
+            with lock:
+                completed += 1
+                cur = completed
+            if progress_callback is not None:
+                try:
+                    progress_callback(cur, total, fid)
+                except Exception:
+                    pass
+            return fid, img
+
+        workers = min(max_workers, max(1, total))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(_fetch_one, fid) for fid in file_ids]
+            for fut in as_completed(futures):
+                try:
+                    fid, img = fut.result()
+                    if img is not None:
+                        results[fid] = img
+                except Exception:
+                    pass
+
+        return results

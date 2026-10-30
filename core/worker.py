@@ -42,20 +42,56 @@ from db.connection import get_connection, init_db
 logger = logging.getLogger("argus.worker")
 
 
-class JobHeartbeatThread(threading.Thread):
-    """Background thread that writes a heartbeat timestamp to the job file every interval seconds."""
+class WorkerState:
+    """Live state tracked by worker and monitored by watchdog thread."""
 
-    def __init__(self, job_file: Path, interval: float = 5.0):
+    def __init__(self):
+        self.stage: str = "scan"
+        self.stage_display: str = "Scanning files"
+        self.current_file_path: str | None = None
+        self.last_progress_time: float = time.time()
+        self.is_stalled: bool = False
+
+
+class JobHeartbeatThread(threading.Thread):
+    """Background thread that writes a heartbeat timestamp to the job file and monitors for stalled stages (>60s)."""
+
+    def __init__(self, job_file: Path, interval: float = 5.0, worker_state: WorkerState | None = None):
         super().__init__(daemon=True, name="JobHeartbeat")
         self.job_file = job_file
         self.interval = interval
+        self.worker_state = worker_state
         self._stop_event = threading.Event()
 
     def run(self) -> None:
         while not self._stop_event.wait(self.interval):
             try:
+                now = time.time()
+                if self.worker_state is not None:
+                    # Check if stage has stalled (no progress for 60s)
+                    elapsed_since_prog = now - self.worker_state.last_progress_time
+                    if elapsed_since_prog > 60.0 and not self.worker_state.is_stalled:
+                        self.worker_state.is_stalled = True
+                        stalled_stage = self.worker_state.stage
+                        stalled_file = self.worker_state.current_file_path or "unknown"
+                        stall_err = f"Stage '{stalled_stage}' stalled on file '{stalled_file}' (no progress for 60s)"
+                        logger.error(stall_err)
+                        print(f"PIPELINE STALL: {stall_err}", file=sys.stderr)
+                        update_job_file(
+                            self.job_file,
+                            status="failed",
+                            stage=stalled_stage,
+                            stage_display=f"Stalled: {stalled_stage}",
+                            error=stall_err,
+                            message=f"Pipeline failed: {stall_err}",
+                            failed_stage=stalled_stage,
+                            failed_file=stalled_file,
+                            actionable_advice="Processing stalled for over 60 seconds with no progress. Check network connectivity, source availability, or file integrity.",
+                        )
+                        break
+
                 if self.job_file.is_file():
-                    update_job_file(self.job_file, heartbeat_at=time.time())
+                    update_job_file(self.job_file, heartbeat_at=now)
             except Exception:
                 pass
 
@@ -68,14 +104,18 @@ def update_job_file(
     status: str | None = None,
     stage: str | None = None,
     stage_display: str | None = None,
+    stage_progress: float | None = None,
     current_file: int | None = None,
     total_files: int | None = None,
+    current_file_path: str | None = None,
     progress: float | None = None,
     message: str | None = None,
     warnings: list[str] | None = None,
     error: str | None = None,
     pid: int | None = None,
     heartbeat_at: float | None = None,
+    start_time: float | None = None,
+    stage_timings: dict[str, float] | None = None,
     slowest_clusters: list[dict[str, Any]] | None = None,
     images_added: int | None = None,
     clusters_created: int | None = None,
@@ -100,16 +140,28 @@ def update_job_file(
     if pid is not None:
         data["pid"] = pid
 
+    now = time.time()
+    if not data.get("start_time"):
+        data["start_time"] = start_time or now
+    elif start_time is not None:
+        data["start_time"] = start_time
+
+    data["elapsed_seconds"] = round(now - data["start_time"], 1)
+
     if status is not None:
         data["status"] = status
     if stage is not None:
         data["stage"] = stage
     if stage_display is not None:
         data["stage_display"] = stage_display
+    if stage_progress is not None:
+        data["stage_progress"] = stage_progress
     if current_file is not None:
         data["current_file"] = current_file
     if total_files is not None:
         data["total_files"] = total_files
+    if current_file_path is not None:
+        data["current_file_path"] = current_file_path
     if progress is not None:
         data["progress"] = progress
     if message is not None:
@@ -118,6 +170,8 @@ def update_job_file(
         data["warnings"] = warnings
     if error is not None:
         data["error"] = error
+    if stage_timings is not None:
+        data["stage_timings"] = stage_timings
     if slowest_clusters is not None:
         data["slowest_clusters"] = slowest_clusters
     if images_added is not None:
@@ -137,11 +191,13 @@ def update_job_file(
     if failed_file is not None:
         data["failed_file"] = failed_file
 
+    if current_file is not None or progress is not None or stage_progress is not None:
+        data["last_progress_at"] = now
+
     for k, v in extra.items():
         if v is not None:
             data[k] = v
 
-    now = time.time()
     data["updated_at"] = now
     data["heartbeat_at"] = heartbeat_at if heartbeat_at is not None else now
     job_file.parent.mkdir(parents=True, exist_ok=True)
@@ -234,8 +290,11 @@ def run_pipeline(
     current_stage = "scan"
     current_file_path: str | None = None
     slowest_5_records: list[dict[str, Any]] = []
+    stage_timings: dict[str, float] = {}
+    job_start_time = time.time()
 
-    heartbeat = JobHeartbeatThread(job_file, interval=5.0)
+    worker_state = WorkerState()
+    heartbeat = JobHeartbeatThread(job_file, interval=5.0, worker_state=worker_state)
     heartbeat.start()
 
     try:
@@ -253,30 +312,45 @@ def run_pipeline(
             status="running",
             stage="scan",
             stage_display="Scanning files",
+            stage_progress=0.0,
             current_file=0,
             total_files=0,
             progress=5.0,
+            start_time=job_start_time,
             message="Scanning files...",
         )
 
-        # ── Stage 0 & 1: Discovery, MD5, and pHash ──
+        # ── Stage 0: Discovery & MD5 ──
+        t_stage = time.time()
+        current_stage = "scan"
+        worker_state.stage = "scan"
+        worker_state.stage_display = "Scanning files"
+        worker_state.last_progress_time = time.time()
+
         if source_type == "drive":
             from sources.google_drive import GoogleDriveSource
-            current_stage = "scan"
             source0 = GoogleDriveSource(folder_id=drive_folder_id, conn=conn, stage="stage0")
-            s0_res = run_stage0(source0, conn, cfg)
+
+            def on_drive_scan(cur: int, tot: int, fpath: str):
+                worker_state.current_file_path = fpath
+                worker_state.last_progress_time = time.time()
+                stg_pct = (cur / max(1, tot)) * 100 if tot > 0 else 50.0
+                update_job_file(
+                    job_file,
+                    stage="scan",
+                    stage_display="Scanning files",
+                    stage_progress=round(stg_pct, 1),
+                    current_file=cur,
+                    total_files=tot,
+                    current_file_path=fpath,
+                    progress=5.0,
+                    message=f"Scanning Drive folder ({cur} files discovered)",
+                )
+
+            s0_res = run_stage0(source0, conn, cfg, progress_callback=on_drive_scan)
             for p, r in s0_res.skipped_reasons:
                 all_warnings.append(f"{Path(p).name}: {r}")
-
-            update_job_file(
-                job_file,
-                progress=15.0,
-                message="Perceptual hashing (Drive thumbnails)...",
-            )
             source_active = GoogleDriveSource(folder_id=drive_folder_id, conn=conn, stage="stage1")
-            s1_res = run_stage1(source_active, conn, cfg)
-            for p, r in s1_res.skipped_reasons:
-                all_warnings.append(f"{Path(p).name}: {r}")
         else:
             from sources.local_folder import LocalFolderSource
             scan_dir = Path(folder or cfg.get("sources", {}).get("library_dir", "~/.argus/library")).expanduser().resolve()
@@ -288,40 +362,101 @@ def run_pipeline(
                 job_file,
                 stage="scan",
                 stage_display="Scanning files",
+                stage_progress=0.0,
                 current_file=0,
                 total_files=total_files,
                 progress=5.0,
                 message=f"Scanning (0 of {total_files} files)",
             )
 
-            current_stage = "scan"
+            def on_local_scan(cur: int, tot: int, fpath: str):
+                worker_state.current_file_path = fpath
+                worker_state.last_progress_time = time.time()
+                stg_pct = (cur / max(1, tot)) * 100 if tot > 0 else 50.0
+                pct = 5.0 + 10.0 * (cur / max(1, tot)) if tot > 0 else 5.0
+                update_job_file(
+                    job_file,
+                    stage="scan",
+                    stage_display="Scanning files",
+                    stage_progress=round(stg_pct, 1),
+                    current_file=cur,
+                    total_files=tot,
+                    current_file_path=fpath,
+                    progress=round(pct, 1),
+                    message=f"Scanning ({cur} of {tot} files)",
+                )
+
             if _stage_needs_scan(conn) or total_files > conn.execute("SELECT COUNT(*) FROM images").fetchone()[0]:
-                s0_res = run_stage0(source_active, conn, cfg)
+                s0_res = run_stage0(source_active, conn, cfg, progress_callback=on_local_scan)
                 for p, r in s0_res.skipped_reasons:
                     all_warnings.append(f"{Path(p).name}: {r}")
             else:
                 logger.info("Stage 0 (scan) already complete — skipping.")
-                # Reconstruct a dummy result for progress display
                 class _DummyResult:
                     files_discovered = 0
                     files_unchanged = total_files
+                    skipped_reasons: list[tuple[str, str]] = []
                 s0_res = _DummyResult()
 
+        stage_timings["scan"] = round(time.time() - t_stage, 3)
+
+        # ── Stage 1: Perceptual Hashing ──
+        t_stage = time.time()
+        current_stage = "hash"
+        worker_state.stage = "hash"
+        worker_state.stage_display = "Perceptual hashing"
+        worker_state.last_progress_time = time.time()
+
+        total_to_hash = conn.execute(
+            """
+            SELECT COUNT(*) FROM images
+            WHERE phash IS NULL
+              AND is_raw_pair = 0
+              AND (status IS NULL OR status != 'skipped')
+            """
+        ).fetchone()[0]
+
+        update_job_file(
+            job_file,
+            stage="hash",
+            stage_display="Perceptual hashing",
+            stage_progress=0.0,
+            current_file=0,
+            total_files=total_to_hash,
+            progress=15.0,
+            message=f"Perceptual hashing (0 of {total_to_hash} files)" if total_to_hash > 0 else "Perceptual hashing up-to-date",
+        )
+
+        def on_hash_progress(cur: int, tot: int, fpath: str):
+            worker_state.current_file_path = fpath
+            worker_state.last_progress_time = time.time()
+            stg_pct = (cur / max(1, tot)) * 100 if tot > 0 else 100.0
+            pct = 15.0 + 10.0 * (cur / max(1, tot)) if tot > 0 else 25.0
             update_job_file(
                 job_file,
-                progress=15.0,
-                current_file=s0_res.files_discovered + s0_res.files_unchanged,
-                total_files=total_files,
-                message=f"Perceptual hashing (0 of {total_files} files)",
+                stage="hash",
+                stage_display="Perceptual hashing",
+                stage_progress=round(stg_pct, 1),
+                current_file=cur,
+                total_files=tot,
+                current_file_path=fpath,
+                progress=round(pct, 1),
+                message=f"Perceptual hashing ({cur} of {tot} files)",
             )
 
-            current_stage = "hash"
-            s1_res = run_stage1(source_active, conn, cfg)
-            for p, r in s1_res.skipped_reasons:
-                all_warnings.append(f"{Path(p).name}: {r}")
+        s1_res = run_stage1(source_active, conn, cfg, progress_callback=on_hash_progress)
+        for p, r in s1_res.skipped_reasons:
+            all_warnings.append(f"{Path(p).name}: {r}")
+
+        stage_timings["hash"] = round(time.time() - t_stage, 3)
 
         # ── Stage 2: Embeddings ──
+        t_stage = time.time()
         current_stage = "embed"
+        worker_state.stage = "embed"
+        worker_state.stage_display = "Embedding"
+        worker_state.last_progress_time = time.time()
+
         pending_embed = conn.execute(
             """
             SELECT COUNT(*) FROM images
@@ -335,20 +470,27 @@ def run_pipeline(
             job_file,
             stage="embed",
             stage_display="Embedding",
+            stage_progress=0.0,
             current_file=0,
             total_files=pending_embed,
             progress=25.0,
             message=f"Embedding (0 of {pending_embed} files)" if pending_embed > 0 else "Embeddings up-to-date",
         )
 
-        def on_embed_progress(cur: int, tot: int):
-            pct = 25.0 + 30.0 * (cur / max(1, tot))
+        def on_embed_progress(cur: int, tot: int, fpath: str | None = None):
+            if fpath:
+                worker_state.current_file_path = fpath
+            worker_state.last_progress_time = time.time()
+            stg_pct = (cur / max(1, tot)) * 100 if tot > 0 else 100.0
+            pct = 25.0 + 33.0 * (cur / max(1, tot)) if tot > 0 else 58.0
             update_job_file(
                 job_file,
                 stage="embed",
                 stage_display="Embedding",
+                stage_progress=round(stg_pct, 1),
                 current_file=cur,
                 total_files=tot,
+                current_file_path=fpath,
                 progress=round(pct, 1),
                 message=f"Embedding ({cur} of {tot} files)",
             )
@@ -358,12 +500,20 @@ def run_pipeline(
         else:
             logger.info("Stage 2 (embed) already complete — skipping.")
 
+        stage_timings["embed"] = round(time.time() - t_stage, 3)
+
         # ── Stage 2: Clustering ──
+        t_stage = time.time()
         current_stage = "cluster"
+        worker_state.stage = "cluster"
+        worker_state.stage_display = "Clustering"
+        worker_state.last_progress_time = time.time()
+
         update_job_file(
             job_file,
             stage="cluster",
             stage_display="Clustering",
+            stage_progress=50.0,
             progress=58.0,
             message="Clustering candidate duplicates...",
         )
@@ -373,45 +523,82 @@ def run_pipeline(
         else:
             logger.info("Stage 2 (cluster) already complete — skipping.")
 
+        stage_timings["cluster"] = round(time.time() - t_stage, 3)
+
         # ── Stage 3: Verification ──
+        t_stage = time.time()
         current_stage = "verify"
+        worker_state.stage = "verify"
+        worker_state.stage_display = "Geometric verification"
+        worker_state.last_progress_time = time.time()
+
         cand_count = conn.execute(
-            "SELECT COUNT(*) FROM images WHERE cluster_id IS NOT NULL"
+            "SELECT COUNT(*) FROM images WHERE cluster_id IS NOT NULL AND is_keeper = 0"
         ).fetchone()[0]
 
         update_job_file(
             job_file,
             stage="verify",
             stage_display="Geometric verification",
+            stage_progress=0.0,
             current_file=0,
             total_files=cand_count,
-            progress=70.0,
-            message=f"Geometric verification ({cand_count} candidates)",
+            progress=65.0,
+            message=f"Geometric verification (0 of {cand_count} pairs)" if cand_count > 0 else "Geometric verification up-to-date",
         )
+
+        def on_verify_progress(cur: int, tot: int, fpath: str):
+            worker_state.current_file_path = fpath
+            worker_state.last_progress_time = time.time()
+            stg_pct = (cur / max(1, tot)) * 100 if tot > 0 else 100.0
+            pct = 65.0 + 10.0 * (cur / max(1, tot)) if tot > 0 else 75.0
+            update_job_file(
+                job_file,
+                stage="verify",
+                stage_display="Geometric verification",
+                stage_progress=round(stg_pct, 1),
+                current_file=cur,
+                total_files=tot,
+                current_file_path=fpath,
+                progress=round(pct, 1),
+                message=f"Geometric verification ({cur} of {tot} pairs)",
+            )
+
         if _stage_needs_verify(conn):
-            run_stage3_verification(conn, cfg, source=source_active)
+            run_stage3_verification(conn, cfg, source=source_active, progress_callback=on_verify_progress)
         else:
             logger.info("Stage 3 (verify) already complete — skipping.")
 
+        stage_timings["verify"] = round(time.time() - t_stage, 3)
+
         # ── Stage 4: Quality & Keeper Selection ──
+        t_stage = time.time()
         current_stage = "quality"
+        worker_state.stage = "quality"
+        worker_state.stage_display = "Evaluating quality"
+        worker_state.last_progress_time = time.time()
+
         cluster_count = conn.execute("SELECT COUNT(*) FROM clusters").fetchone()[0]
         update_job_file(
             job_file,
             stage="quality",
             stage_display=f"Evaluating quality (0 of {cluster_count} clusters)" if cluster_count > 0 else "Quality up-to-date",
+            stage_progress=0.0,
             current_file=0,
             total_files=cluster_count,
-            progress=85.0,
+            progress=75.0,
             message=f"Evaluating quality (0 of {cluster_count} clusters)" if cluster_count > 0 else "Quality up-to-date",
         )
 
         def on_quality_progress(cur: int, tot: int, cid: int):
-            pct = 85.0 + 7.0 * (cur / max(1, tot))
+            worker_state.last_progress_time = time.time()
+            stg_pct = (cur / max(1, tot)) * 100 if tot > 0 else 100.0
+            pct = 75.0 + 13.0 * (cur / max(1, tot)) if tot > 0 else 88.0
             update_job_file(
                 job_file,
                 stage="quality",
                 stage_display=f"Evaluating quality (cluster {cur} of {tot}, id #{cid})",
+                stage_progress=round(stg_pct, 1),
                 current_file=cur,
                 total_files=tot,
                 progress=round(pct, 1),
@@ -429,8 +616,15 @@ def run_pipeline(
         else:
             logger.info("Stage 4 (quality) already complete — skipping.")
 
+        stage_timings["quality"] = round(time.time() - t_stage, 3)
+
         # ── Stage 5: Semantic Categorization ──
+        t_stage = time.time()
         current_stage = "categorize"
+        worker_state.stage = "categorize"
+        worker_state.stage_display = "Categorizing"
+        worker_state.last_progress_time = time.time()
+
         pending_cat = conn.execute(
             """
             SELECT COUNT(*) FROM images
@@ -443,18 +637,22 @@ def run_pipeline(
             job_file,
             stage="categorize",
             stage_display="Categorizing",
+            stage_progress=0.0,
             current_file=0,
             total_files=pending_cat,
-            progress=92.0,
+            progress=88.0,
             message=f"Categorizing (0 of {pending_cat} files)" if pending_cat > 0 else "Categories up-to-date",
         )
 
         def on_cat_progress(cur: int, tot: int):
-            pct = 92.0 + 7.0 * (cur / max(1, tot))
+            worker_state.last_progress_time = time.time()
+            stg_pct = (cur / max(1, tot)) * 100 if tot > 0 else 100.0
+            pct = 88.0 + 10.0 * (cur / max(1, tot)) if tot > 0 else 98.0
             update_job_file(
                 job_file,
                 stage="categorize",
                 stage_display="Categorizing",
+                stage_progress=round(stg_pct, 1),
                 current_file=cur,
                 total_files=tot,
                 progress=round(pct, 1),
@@ -466,8 +664,20 @@ def run_pipeline(
         else:
             logger.info("Stage 5 (categorize) already complete — skipping.")
 
+        stage_timings["categorize"] = round(time.time() - t_stage, 3)
+
         # ── Finalize ──
         conn.commit()
+
+        # Timing Summary Report
+        total_pipeline_time = round(time.time() - job_start_time, 3)
+        print("\n" + "=" * 54)
+        print("  Argus Deduplication Pipeline Stage Timings")
+        print("=" * 54)
+        for stg, dur in stage_timings.items():
+            print(f"  - {stg.capitalize():<24} : {dur:>8.3f}s")
+        print(f"  Total Pipeline Time      : {total_pipeline_time:>8.3f}s")
+        print("=" * 54 + "\n")
 
         # Verification step (Requirement 4): Open a fresh connection, verify all writes are committed
         # and readable from an independent connection before reporting 'completed'.
@@ -502,6 +712,7 @@ def run_pipeline(
             stage="done",
             stage_display="Completed with warnings" if all_warnings else "Completed",
             progress=100.0,
+            stage_progress=100.0,
             message=f"Pipeline complete: {summary_msg}",
             warnings=all_warnings,
             slowest_clusters=slowest_5_records if slowest_5_records else None,
@@ -513,8 +724,13 @@ def run_pipeline(
             verified_images=v_images,
             verified_clusters=v_clusters,
             verified_categories=v_categories,
+            stage_timings=stage_timings,
+            start_time=job_start_time,
         )
     except Exception as exc:
+        if worker_state.is_stalled:
+            return
+
         import traceback
         print(f"PIPELINE EXCEPTION at stage '{current_stage}': {type(exc).__name__}: {exc}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
@@ -546,7 +762,8 @@ def run_pipeline(
 
         actionable_advice = " ".join(advice_parts) if advice_parts else "Review error logs and retry the operation."
 
-        file_info = f" on file '{current_file_path}'" if current_file_path else ""
+        active_file = worker_state.current_file_path or current_file_path
+        file_info = f" on file '{active_file}'" if active_file else ""
         formatted_message = f"Pipeline failed at stage '{current_stage}'{file_info}: {err_msg}. Action: {actionable_advice}"
 
         update_job_file(
@@ -556,9 +773,11 @@ def run_pipeline(
             error=err_msg,
             message=formatted_message,
             failed_stage=current_stage,
-            failed_file=current_file_path,
+            failed_file=active_file,
             actionable_advice=actionable_advice,
             slowest_clusters=slowest_5_records if slowest_5_records else None,
+            stage_timings=stage_timings if stage_timings else None,
+            start_time=job_start_time,
         )
     finally:
         heartbeat.stop()

@@ -28,7 +28,7 @@ import logging
 import pickle
 import sqlite3
 import time
-from typing import Any
+from typing import Any, Callable
 
 import cv2
 import numpy as np
@@ -475,6 +475,7 @@ def run_stage3_verification(
     conn: sqlite3.Connection,
     config: dict | None = None,
     source: ImageSource | None = None,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> Stage3Result:
     """
     Execute Stage 3 verification on all duplicate clusters in SQLite.
@@ -553,6 +554,10 @@ def run_stage3_verification(
         """
     ).fetchall()
 
+    total_pairs = conn.execute(
+        "SELECT COUNT(*) FROM images WHERE cluster_id IS NOT NULL AND is_keeper = 0"
+    ).fetchone()[0]
+
     res = Stage3Result()
     mem_cache: dict[int, tuple[list[cv2.KeyPoint], np.ndarray | None]] = {}
 
@@ -615,6 +620,11 @@ def run_stage3_verification(
             match_res = verifier.match_features(rep_kp, rep_des, m_kp, m_des)
 
             res.pairs_evaluated += 1
+            if progress_callback:
+                try:
+                    progress_callback(res.pairs_evaluated, max(1, total_pairs), m_path)
+                except Exception:
+                    pass
 
             if match_res.status == "inconclusive":
                 res.pairs_inconclusive += 1

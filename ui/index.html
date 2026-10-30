@@ -984,12 +984,27 @@
 
   <!-- Background Job Progress Banner -->
   <div id="job-progress-banner" style="display: none; background: var(--bg-surface); border-bottom: 1px solid var(--border); padding: 8px 16px; font-size: 13px;">
-    <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
       <span id="job-status-text" style="font-weight: 500;">Running pipeline...</span>
-      <span id="job-percent-text" style="color: var(--text-muted); font-size: 12px;">0%</span>
+      <div style="display: flex; gap: 12px; align-items: center;">
+        <span id="job-elapsed-text" style="color: var(--text-muted); font-size: 12px;">Elapsed: 0s</span>
+        <span id="job-percent-text" style="color: var(--text-muted); font-size: 12px; font-weight: 600;">0%</span>
+      </div>
     </div>
-    <div style="width: 100%; background: var(--border); height: 6px; border-radius: 3px; overflow: hidden;">
-      <div id="job-progress-fill" style="width: 0%; height: 100%; background: #2563eb; transition: width 0.3s;"></div>
+    <!-- Overall progress -->
+    <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 4px;">
+      <span style="font-size: 11px; color: var(--text-muted); min-width: 44px;">Overall</span>
+      <div style="flex: 1; background: var(--border); height: 6px; border-radius: 3px; overflow: hidden;">
+        <div id="job-progress-fill" style="width: 0%; height: 100%; background: #2563eb; transition: width 0.3s;"></div>
+      </div>
+    </div>
+    <!-- Per-stage progress -->
+    <div id="job-stage-progress-container" style="display: flex; gap: 8px; align-items: center;">
+      <span id="job-stage-label" style="font-size: 11px; color: var(--text-muted); min-width: 44px;">Stage</span>
+      <div style="flex: 1; background: var(--border); height: 4px; border-radius: 2px; overflow: hidden;">
+        <div id="job-stage-progress-fill" style="width: 0%; height: 100%; background: #2dd4bf; transition: width 0.3s;"></div>
+      </div>
+      <span id="job-stage-percent-text" style="font-size: 11px; color: var(--text-muted); min-width: 36px; text-align: right;">0%</span>
     </div>
     <div id="job-summary-details" style="display: none; margin-top: 6px; font-size: 12px; color: var(--text-muted);"></div>
   </div>
@@ -2359,13 +2374,28 @@
     let activeJobPollTimeout = null;
     let currentPollingJobId = null;
     let pollDelayMs = 1000;
+    let jobElapsedInterval = null;
+    let jobStartedAt = null;
+
+    function formatElapsedSeconds(sec) {
+      const s = Math.max(0, Math.floor(sec));
+      if (s < 60) return `Elapsed: ${s}s`;
+      const m = Math.floor(s / 60);
+      const rem = s % 60;
+      return `Elapsed: ${m}m ${rem}s`;
+    }
 
     function stopJobPolling() {
       if (activeJobPollTimeout) {
         clearTimeout(activeJobPollTimeout);
         activeJobPollTimeout = null;
       }
+      if (jobElapsedInterval) {
+        clearInterval(jobElapsedInterval);
+        jobElapsedInterval = null;
+      }
       currentPollingJobId = null;
+      jobStartedAt = null;
       pollDelayMs = 1000;
       const banner = document.getElementById("job-progress-banner");
       if (banner) banner.style.display = "none";
@@ -2389,28 +2419,64 @@
         clearTimeout(activeJobPollTimeout);
         activeJobPollTimeout = null;
       }
+      if (jobElapsedInterval) {
+        clearInterval(jobElapsedInterval);
+        jobElapsedInterval = null;
+      }
 
       const banner = document.getElementById("job-progress-banner");
       const statusText = document.getElementById("job-status-text");
       const percentText = document.getElementById("job-percent-text");
       const fill = document.getElementById("job-progress-fill");
+      const stageFill = document.getElementById("job-stage-progress-fill");
+      const stagePercentText = document.getElementById("job-stage-percent-text");
+      const stageLabel = document.getElementById("job-stage-label");
+      const elapsedText = document.getElementById("job-elapsed-text");
 
       banner.style.display = "block";
       fill.style.background = "#2563eb";
+      if (stageFill) stageFill.style.background = "#2dd4bf";
       setSourceButtonsDisabled(true);
+
+      // Elapsed time tracking
+      jobStartedAt = (activeInfo && typeof activeInfo.start_time === "number") ? activeInfo.start_time * 1000 : Date.now();
+      if (elapsedText) {
+        elapsedText.textContent = formatElapsedSeconds((Date.now() - jobStartedAt) / 1000);
+        jobElapsedInterval = setInterval(() => {
+          if (!currentPollingJobId) {
+            clearInterval(jobElapsedInterval);
+            jobElapsedInterval = null;
+            return;
+          }
+          if (elapsedText) {
+            elapsedText.textContent = formatElapsedSeconds((Date.now() - jobStartedAt) / 1000);
+          }
+        }, 1000);
+      }
 
       let lastProgressivePoll = Date.now();
 
       // If activeInfo provided from /jobs/active: read stage, done, total
       if (activeInfo && typeof activeInfo === "object") {
-        const stage = activeInfo.stage || "Running";
+        const stage = activeInfo.stage_display || activeInfo.stage || "Running";
         const done = Number.isInteger(activeInfo.done) ? activeInfo.done : (activeInfo.current_file || 0);
         const total = Number.isInteger(activeInfo.total) ? activeInfo.total : (activeInfo.total_files || 0);
         const countText = total > 0 ? ` (${done} of ${total} files)` : "";
         statusText.textContent = `${stage}${countText}`;
-        const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+        const pct = typeof activeInfo.progress === "number" ? Math.round(activeInfo.progress) : (total > 0 ? Math.round((done / total) * 100) : 0);
         percentText.textContent = `${pct}%`;
         fill.style.width = `${pct}%`;
+
+        let stgPct = 0;
+        if (typeof activeInfo.stage_progress === "number") {
+          stgPct = Math.round(activeInfo.stage_progress);
+        } else if (total > 0) {
+          stgPct = Math.round((done / total) * 100);
+        }
+        stgPct = Math.max(0, Math.min(100, stgPct));
+        if (stageFill) stageFill.style.width = `${stgPct}%`;
+        if (stagePercentText) stagePercentText.textContent = `${stgPct}%`;
+        if (stageLabel) stageLabel.textContent = stage.split(" ")[0] || "Stage";
       }
 
       async function pollStep() {
@@ -2435,6 +2501,10 @@
             return;
           }
           const data = await res.json();
+          if (data.start_time && typeof data.start_time === "number") {
+            jobStartedAt = data.start_time * 1000;
+          }
+
           const stageText = data.stage_display || data.stage || "Running";
           const countText = (data.total_files && data.total_files > 0) ? ` (${data.current_file || 0} of ${data.total_files} files)` : "";
           statusText.textContent = data.message || `${stageText}${countText}`;
@@ -2442,11 +2512,26 @@
           percentText.textContent = `${pct}%`;
           fill.style.width = `${pct}%`;
 
+          let stgPct = 0;
+          if (typeof data.stage_progress === "number") {
+            stgPct = Math.round(data.stage_progress);
+          } else if (data.total_files && data.total_files > 0) {
+            stgPct = Math.round(((data.current_file || 0) / data.total_files) * 100);
+          }
+          stgPct = Math.max(0, Math.min(100, stgPct));
+          if (stageFill) stageFill.style.width = `${stgPct}%`;
+          if (stagePercentText) stagePercentText.textContent = `${stgPct}%`;
+          if (stageLabel) stageLabel.textContent = stageText.split(" ")[0] || "Stage";
+
           if (data.status === "completed" || data.status === "completed_with_warnings") {
             currentPollingJobId = null;
             if (activeJobPollTimeout) {
               clearTimeout(activeJobPollTimeout);
               activeJobPollTimeout = null;
+            }
+            if (jobElapsedInterval) {
+              clearInterval(jobElapsedInterval);
+              jobElapsedInterval = null;
             }
             setSourceButtonsDisabled(false);
 
@@ -2459,12 +2544,16 @@
             if (data.status === "completed_with_warnings") {
               statusText.textContent = data.message || `Pipeline complete with warnings: ${reportMsg}`;
               fill.style.background = "#eab308";
+              if (stageFill) stageFill.style.background = "#eab308";
             } else {
               statusText.textContent = data.message || `Pipeline completed: ${reportMsg}`;
               fill.style.background = "#22c55e";
+              if (stageFill) stageFill.style.background = "#22c55e";
             }
             percentText.textContent = "100%";
             fill.style.width = "100%";
+            if (stageFill) stageFill.style.width = "100%";
+            if (stagePercentText) stagePercentText.textContent = "100%";
 
             const summaryDetails = document.getElementById("job-summary-details");
             if (summaryDetails) {
@@ -2493,11 +2582,16 @@
               clearTimeout(activeJobPollTimeout);
               activeJobPollTimeout = null;
             }
+            if (jobElapsedInterval) {
+              clearInterval(jobElapsedInterval);
+              jobElapsedInterval = null;
+            }
             setSourceButtonsDisabled(false);
             statusText.textContent = data.status === "stalled"
-              ? `Pipeline stalled: ${data.error || "No worker heartbeat in >60s"}`
+              ? `Pipeline stalled: ${data.error || "No progress in >60s"}`
               : `Pipeline error: ${data.error || "Job failed"}`;
             fill.style.background = "var(--danger)";
+            if (stageFill) stageFill.style.background = "var(--danger)";
             return;
           }
         } catch (err) {
@@ -2779,14 +2873,16 @@
         } else if (data && (data.status === "stalled" || data.status === "failed")) {
           stopJobPolling();
           const banner = document.getElementById("job-progress-banner");
-          const statusText = document.getElementById("job-progress-status");
+          const statusText = document.getElementById("job-status-text");
           const fill = document.getElementById("job-progress-fill");
+          const stageFill = document.getElementById("job-stage-progress-fill");
           if (banner && statusText && fill) {
             banner.style.display = "block";
             statusText.textContent = data.status === "stalled"
-              ? `Pipeline stalled: ${data.error || "No worker heartbeat in >60s"}`
+              ? `Pipeline stalled: ${data.error || "No progress in >60s"}`
               : `Pipeline failed: ${data.error || "Worker process is no longer running"}`;
             fill.style.background = "var(--danger)";
+            if (stageFill) stageFill.style.background = "var(--danger)";
           }
           setSourceButtonsDisabled(false);
         } else {

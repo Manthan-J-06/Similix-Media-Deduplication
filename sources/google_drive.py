@@ -42,9 +42,9 @@ logger = logging.getLogger("argus.gdrive")
 DRIVE_READONLY_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
 SCOPES = [DRIVE_READONLY_SCOPE]
 
-DEFAULT_CLIENT_SECRET_PATH = Path.home() / ".argus" / "client_secret.json"
-DEFAULT_TOKEN_PATH = Path.home() / ".argus" / "drive_token.json"
-DEFAULT_CACHE_DIR = Path.home() / ".argus" / "drive_cache"
+DEFAULT_CLIENT_SECRET_PATH = Path(os.environ.get("ARGUS_DATA_DIR", "~/.argus")).expanduser() / "client_secret.json"
+DEFAULT_TOKEN_PATH = Path(os.environ.get("ARGUS_DATA_DIR", "~/.argus")).expanduser() / "drive_token.json"
+DEFAULT_CACHE_DIR = Path(os.environ.get("ARGUS_DATA_DIR", "~/.argus")).expanduser() / "drive_cache"
 DEFAULT_MAX_CACHE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 
 DRIVE_LIST_FIELDS = (
@@ -552,8 +552,13 @@ class GoogleDriveSource(ImageSource):
             self._drive_item_cache[drive_id]["thumbnailLink"] = link
         return link
 
-    def _download_thumbnail_bytes(self, link: str) -> bytes | None:
-        """Download thumbnail bytes from URL."""
+    def _download_thumbnail_bytes(
+        self,
+        link: str,
+        timeout: float = 20.0,
+        max_retries: int = 3,
+    ) -> bytes | None:
+        """Download thumbnail bytes from URL with per-request 20s timeout and 3 retries with backoff."""
         headers = {"User-Agent": "Argus/1.0"}
         try:
             creds = self.credentials
@@ -562,21 +567,103 @@ class GoogleDriveSource(ImageSource):
         except Exception:
             pass
 
-        req = urllib.request.Request(link, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                if resp.status == 200:
-                    return resp.read()
-        except urllib.error.HTTPError as exc:
-            if exc.code in (401, 403, 404, 410):
-                # Expired or unauthorized link
+        attempt = 0
+        while True:
+            try:
+                req = urllib.request.Request(link, headers=headers)
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    if resp.status == 200:
+                        return resp.read()
                 return None
-            logger.debug("HTTP error downloading thumbnail: %s", exc)
-            return None
-        except Exception as exc:
-            logger.debug("Error downloading thumbnail: %s", exc)
-            return None
-        return None
+            except urllib.error.HTTPError as exc:
+                if exc.code in (401, 403, 404, 410):
+                    # Expired or unauthorized link
+                    return None
+                if exc.code in (429, 500, 502, 503, 504) and attempt < max_retries:
+                    attempt += 1
+                    delay = 0.5 * (2 ** (attempt - 1)) + random.uniform(0, 0.25)
+                    logger.warning(
+                        "HTTP error %d downloading thumbnail, retrying in %.2fs (attempt %d/%d)...",
+                        exc.code,
+                        delay,
+                        attempt,
+                        max_retries,
+                    )
+                    time.sleep(delay)
+                    continue
+                logger.debug("HTTP error downloading thumbnail: %s", exc)
+                return None
+            except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as exc:
+                if attempt < max_retries:
+                    attempt += 1
+                    delay = 0.5 * (2 ** (attempt - 1)) + random.uniform(0, 0.25)
+                    logger.warning(
+                        "Network error %s downloading thumbnail, retrying in %.2fs (attempt %d/%d)...",
+                        exc,
+                        delay,
+                        attempt,
+                        max_retries,
+                    )
+                    time.sleep(delay)
+                    continue
+                logger.debug("Error downloading thumbnail: %s", exc)
+                return None
+            except Exception as exc:
+                logger.debug("Unexpected error downloading thumbnail: %s", exc)
+                return None
+
+    def fetch_thumbnails(
+        self,
+        file_ids: list[str],
+        max_workers: int = 8,
+        progress_callback: Callable[[int, int, str], None] | None = None,
+        size: tuple[int, int] = (256, 256),
+    ) -> dict[str, Image.Image]:
+        """
+        Fetch Drive thumbnails with a thread pool (8 workers), per-request timeout 20s,
+        3 retries with backoff, and report "N of M" after every file.
+        Cache by file id + modifiedTime; skip files already processed.
+        """
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        total = len(file_ids)
+        if total == 0:
+            return {}
+
+        results: dict[str, Image.Image] = {}
+        completed = 0
+        lock = threading.Lock()
+
+        def _fetch_single(fid: str) -> tuple[str, Image.Image | None]:
+            nonlocal completed
+            img = None
+            try:
+                img = self.get_thumbnail(fid, size=size)
+            except Exception as exc:
+                logger.warning("Failed to fetch thumbnail for %s: %s", fid, exc)
+            with lock:
+                completed += 1
+                cur = completed
+            if progress_callback is not None:
+                try:
+                    progress_callback(cur, total, fid)
+                except Exception:
+                    pass
+            return fid, img
+
+        workers = min(max(1, max_workers), max(1, total))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(_fetch_single, fid) for fid in file_ids]
+            for fut in as_completed(futures):
+                try:
+                    fid, img = fut.result()
+                    if img is not None:
+                        results[fid] = img
+                except Exception:
+                    pass
+
+        return results
 
     def get_thumbnail(self, file_id: str, size: tuple[int, int] = (256, 256)) -> Image.Image:
         """

@@ -19,7 +19,7 @@ import hashlib
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 import pillow_heif
 pillow_heif.register_heif_opener()
@@ -85,6 +85,7 @@ def _scan_and_sync_files(
     source: ImageSource,
     conn: sqlite3.Connection,
     raw_exts: frozenset[str] = RAW_EXTENSIONS,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> tuple[int, int, list[tuple[str, str]]]:
     """
     Sync source files with the database.
@@ -108,8 +109,15 @@ def _scan_and_sync_files(
     skipped_files: list[tuple[str, str]] = []
     inserts: list[tuple[str, int, float, int | None, int | None, str | None]] = []
     updates: list[tuple[int, float, int | None, int | None, str | None, int]] = []
+    processed_count = 0
 
     for file_id in source.list_files():
+        processed_count += 1
+        if progress_callback:
+            try:
+                progress_callback(processed_count, 0, file_id)
+            except Exception:
+                pass
         try:
             meta = source.get_metadata(file_id)
         except Exception as exc:
@@ -323,6 +331,7 @@ def run_stage0(
     source_or_root: ImageSource | Path | str,
     conn: sqlite3.Connection,
     config: dict,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> Stage0Result:
     """
     Execute Stage 0 end-to-end.
@@ -337,13 +346,16 @@ def run_stage0(
         source = LocalFolderSource(source_or_root)
 
     # Step 1: Scan and sync files (skipping unchanged files)
-    discovered, unchanged, skipped = _scan_and_sync_files(source, conn, raw_exts)
+    discovered, unchanged, skipped = _scan_and_sync_files(source, conn, raw_exts, progress_callback=progress_callback)
     result.files_discovered = discovered
     result.files_unchanged = unchanged
     result.files_skipped = len(skipped)
     result.skipped_reasons.extend(skipped)
 
     # Step 2: Compute MD5 for discovered files in batches
+    hashed_so_far = 0
+    total_to_hash = conn.execute("SELECT COUNT(*) FROM images WHERE status = 'discovered'").fetchone()[0]
+
     while True:
         batch = conn.execute(
             "SELECT id, file_path FROM images WHERE status = 'discovered' LIMIT ?",
@@ -356,6 +368,12 @@ def run_stage0(
         failed_ids: list[int] = []
         for row in batch:
             path_str = row["file_path"]
+            hashed_so_far += 1
+            if progress_callback:
+                try:
+                    progress_callback(hashed_so_far, total_to_hash, path_str)
+                except Exception:
+                    pass
             try:
                 p = Path(path_str)
                 if p.is_file():
