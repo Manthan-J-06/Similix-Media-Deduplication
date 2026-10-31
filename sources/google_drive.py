@@ -294,11 +294,13 @@ class GoogleDriveSource(ImageSource):
         max_file_download_size: int = 100 * 1024 * 1024,
         max_cache_bytes: int = DEFAULT_MAX_CACHE_BYTES,
         config: dict | None = None,
+        token_path: str | Path | None = None,
     ):
         self.folder_id = folder_id
         self.all_drive = all_drive
         self._service = service
         self._credentials = credentials
+        self.token_path = Path(token_path).expanduser() if token_path else None
         self.config = config or {}
         cfg_cache = self.config.get("sources", {}).get("google_drive", {}).get("cache_dir")
         self.cache_dir = Path(cache_dir or cfg_cache or DEFAULT_CACHE_DIR).expanduser()
@@ -351,13 +353,13 @@ class GoogleDriveSource(ImageSource):
     @property
     def service(self) -> Any:
         if self._service is None:
-            self._service = get_drive_service(credentials=self._credentials)
+            self._service = get_drive_service(credentials=self.credentials, token_path=self.token_path)
         return self._service
 
     @property
     def credentials(self) -> Any:
         if self._credentials is None:
-            self._credentials = get_drive_credentials(prompt_if_missing=False)
+            self._credentials = get_drive_credentials(token_path=self.token_path, prompt_if_missing=False)
         return self._credentials
 
     def parse_file_id(self, file_id_or_uri: str) -> tuple[str, str]:

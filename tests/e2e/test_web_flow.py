@@ -644,3 +644,159 @@ def test_library_all_photos_and_downloads(live_server, tmp_path):
         context.close()
         browser.close()
 
+
+def test_category_edit_drive_oauth_and_refused_deletions(live_server, tmp_path):
+    """Playwright E2E test verifying:
+    1. Cluster label editing & clearing: no 500, cluster remains visible.
+    2. Drive sign-in button, admin message if client_secret missing, 'Connected as ...' / Disconnect button.
+    3. Refused deletions UI and Confirm button disabling on click.
+    """
+    from playwright.sync_api import sync_playwright
+
+    base_url = live_server
+
+    # Create 2 identical test images to form a cluster
+    p_orig = tmp_path / "img_cat1.jpg"
+    p_copy = tmp_path / "img_cat2.jpg"
+    _create_image(p_orig, color=(120, 80, 200), size=(180, 180))
+    p_copy.write_bytes(p_orig.read_bytes())
+
+    email = f"user_bugs_{uuid.uuid4().hex[:8]}@argus.local"
+    password = "ArgusPassword123!"
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context()
+        page = context.new_page()
+
+        # Register & Login
+        page.goto(f"{base_url}/login")
+        page.wait_for_selector("#tab-register", timeout=10000)
+        page.click("#tab-register")
+        page.fill("#email", email)
+        page.fill("#password", password)
+        page.click("#submit-btn")
+
+        try:
+            page.wait_for_url(f"{base_url}/", timeout=15000)
+        except Exception:
+            if page.is_visible("#tab-login.active"):
+                page.fill("#email", email)
+                page.fill("#password", password)
+                page.click("#submit-btn")
+                page.wait_for_url(f"{base_url}/", timeout=15000)
+
+        page.wait_for_selector("#user-email-display", timeout=10000)
+
+        # ==========================================
+        # 1. Test Drive OAuth UI in Add Sources modal
+        # ==========================================
+        page.click("#btn-open-sources")
+        page.wait_for_selector("#sources-modal", state="visible", timeout=5000)
+
+        # Switch to Google Drive tab
+        page.click("button[data-tab='tab-drive']")
+        page.wait_for_selector("#tab-drive", state="visible", timeout=5000)
+
+        # Verify "Connect Google Drive" button is present
+        assert page.locator("#btn-connect-drive").is_visible()
+
+        # Check drive status response in browser
+        res_status = page.evaluate("async () => { const r = await fetch('/drive/status'); return await r.json(); }")
+        if not res_status["configured"]:
+            # If client_secret is missing, verify clear admin message
+            page.wait_for_selector("#drive-status-message", state="visible", timeout=5000)
+            status_text = page.locator("#drive-status-message").inner_text()
+            assert "administrator must provide client_secret.json in the data directory" in status_text.lower()
+            assert "argus drive-auth" not in status_text.lower()
+        else:
+            # If client_secret is configured, verify Connect button is enabled
+            assert page.locator("#btn-connect-drive").is_enabled()
+
+        # Close sources modal
+        page.click("#btn-close-sources")
+
+        # ==========================================
+        # Upload images to form a cluster
+        # ==========================================
+        page.click("#btn-open-sources")
+        page.wait_for_selector("#sources-modal", state="visible", timeout=5000)
+        page.click("button[data-tab='tab-upload']")
+        page.set_input_files("#file-input", [str(p_orig), str(p_copy)])
+        page.wait_for_selector("#btn-start-upload", state="visible", timeout=5000)
+        page.click("#btn-start-upload")
+
+        # Wait for pipeline completion
+        page.wait_for_selector("#job-progress-banner", state="visible", timeout=10000)
+        page.wait_for_function(
+            "() => document.getElementById('job-percent-text')?.textContent === '100%' || "
+            "(document.getElementById('job-status-text')?.textContent || '').includes('Pipeline complete') || "
+            "(document.getElementById('job-status-text')?.textContent || '').includes('Pipeline completed')",
+            timeout=60000,
+        )
+
+        # Select first cluster
+        page.wait_for_selector("#cluster-list .cluster-item", timeout=10000)
+        page.click("#cluster-list .cluster-item")
+        page.wait_for_selector("#detail-content", state="visible", timeout=5000)
+
+        # ==========================================
+        # 2. Test Editing and Clearing Cluster Label
+        # ==========================================
+        # Set label to "Mountains Retreat" via prompt
+        prompt_value = "Mountains Retreat"
+        def handle_prompt_set(dialog):
+            dialog.accept(prompt_value)
+        page.once("dialog", handle_prompt_set)
+
+        page.click("#btn-edit-cluster-cat")
+        page.wait_for_timeout(1000)
+
+        # Verify detail category chip updated
+        detail_cat = page.locator("#detail-cluster-category").inner_text()
+        assert "Mountains Retreat" in detail_cat
+
+        # Verify cluster in cluster-list did NOT disappear (no 500)
+        clusters = page.locator("#cluster-list .cluster-item").all()
+        assert len(clusters) >= 1
+
+        # Now clear label by submitting empty string
+        def handle_prompt_clear(dialog):
+            dialog.accept("")
+        page.once("dialog", handle_prompt_clear)
+
+        page.click("#btn-edit-cluster-cat")
+        page.wait_for_timeout(1000)
+
+        # Verify cluster list still intact after clearing
+        clusters_after = page.locator("#cluster-list .cluster-item").all()
+        assert len(clusters_after) >= 1
+
+        # ==========================================
+        # 3. Test Refused Deletions & Confirm Button
+        # ==========================================
+        page.wait_for_selector("#btn-select-safe", timeout=5000)
+        page.click("#btn-select-safe")
+        page.click("#btn-plan-deletion")
+        page.wait_for_selector("#confirm-modal", state="visible", timeout=5000)
+
+        confirm_btn = page.locator("#btn-confirm-apply")
+        assert confirm_btn.is_enabled()
+
+        # Click confirm: it should immediately be disabled to prevent double submits
+        confirm_btn.click()
+        assert confirm_btn.is_disabled() or not confirm_btn.is_visible()
+
+        # Wait for apply result
+        page.wait_for_selector("#apply-success-box", state="visible", timeout=10000)
+
+        # View History
+        page.click("#btn-view-history")
+        page.wait_for_selector("#history-modal", state="visible", timeout=5000)
+        page.wait_for_selector("#history-table tbody tr", timeout=5000)
+        history_rows = page.locator("#history-table tbody tr").all()
+        assert len(history_rows) >= 1
+
+        context.close()
+        browser.close()
+

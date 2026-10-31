@@ -1176,9 +1176,13 @@
           <!-- Files listed here -->
         </div>
 
-        <div id="apply-success-box" style="display:none; font-size:0.9rem; color:var(--success);">
-          <p><strong>✓ Files successfully moved to trash.</strong></p>
-          <div style="margin-top:10px; display:flex; gap:10px;">
+        <div id="apply-success-box" style="display:none; font-size:0.9rem;">
+          <p id="apply-success-text" style="color:var(--success); margin-bottom:8px;"><strong>✓ Files successfully moved to trash.</strong></p>
+          <div id="apply-refused-box" style="display:none; margin:12px 0; padding:10px 14px; border-radius:6px; background:rgba(239,68,68,0.08); border:1px solid var(--danger);">
+            <div style="font-weight:600; color:var(--danger); margin-bottom:6px; font-size:0.85rem;" id="apply-refused-title">Refused Deletions:</div>
+            <div id="apply-refused-list" style="font-size:0.8rem; display:flex; flex-direction:column; gap:4px;"></div>
+          </div>
+          <div style="margin-top:12px; display:flex; gap:10px;">
             <button type="button" class="btn" id="btn-undo-apply">↺ Undo This Deletion</button>
             <button type="button" class="btn" id="btn-view-history">View History</button>
           </div>
@@ -1249,10 +1253,23 @@
 
         <!-- Tab 2: Drive -->
         <div id="tab-drive" class="source-tab-pane" style="display:none;">
-          <label style="font-size:0.85rem; font-weight:500; display:block; margin-bottom:6px;">Google Drive Folder URL or ID:</label>
-          <input type="text" id="drive-link-input" class="search-input" style="width:100%; box-sizing:border-box;" placeholder="https://drive.google.com/drive/folders/...">
-          <div style="font-size:0.8rem; color:var(--text-muted); margin-top:6px;">Read-only scan. Ensure 'argus drive-auth' has been run.</div>
-          <button type="button" class="btn btn-primary" id="btn-scan-drive" style="margin-top:12px; width:100%;">Scan Drive (Read-Only)</button>
+          <div id="drive-auth-panel" style="margin-bottom:14px; padding:12px 14px; border-radius:6px; background:rgba(255,255,255,0.03); border:1px solid var(--border);">
+            <div id="drive-status-message" style="font-size:0.85rem; margin-bottom:8px; display:none;"></div>
+            <div id="drive-connect-view">
+              <p style="font-size:0.82rem; color:var(--text-muted); margin-bottom:10px;">Connect Google Drive with read-only access to scan folders for duplicates.</p>
+              <button type="button" class="btn btn-primary" id="btn-connect-drive">Connect Google Drive</button>
+            </div>
+            <div id="drive-connected-view" style="display:none; align-items:center; justify-content:space-between; gap:10px;">
+              <span style="font-size:0.85rem; color:var(--success); font-weight:500;" id="drive-connected-user">Connected as ...</span>
+              <button type="button" class="btn" id="btn-disconnect-drive" style="padding:4px 10px; font-size:0.8rem;">Disconnect</button>
+            </div>
+          </div>
+          <div id="drive-scan-panel">
+            <label style="font-size:0.85rem; font-weight:500; display:block; margin-bottom:6px;">Google Drive Folder URL or ID:</label>
+            <input type="text" id="drive-link-input" class="search-input" style="width:100%; box-sizing:border-box;" placeholder="https://drive.google.com/drive/folders/...">
+            <div style="font-size:0.8rem; color:var(--text-muted); margin-top:6px;">Read-only scan. Scopes strictly limited to drive.readonly.</div>
+            <button type="button" class="btn btn-primary" id="btn-scan-drive" style="margin-top:12px; width:100%;">Scan Drive (Read-Only)</button>
+          </div>
         </div>
 
         <!-- Tab 3: Dataset -->
@@ -2137,7 +2154,34 @@
 
         const result = await res.json();
         document.getElementById("modal-footer-actions").style.display = "none";
-        document.getElementById("apply-success-box").style.display = "block";
+        const successBox = document.getElementById("apply-success-box");
+        const successText = document.getElementById("apply-success-text");
+        const refusedBox = document.getElementById("apply-refused-box");
+        const refusedList = document.getElementById("apply-refused-list");
+        const undoBtn = document.getElementById("btn-undo-apply");
+
+        successBox.style.display = "block";
+        if (result.moved_count > 0) {
+          successText.innerHTML = `<strong>✓ ${result.moved_count} file(s) successfully moved to trash.</strong>`;
+          successText.style.color = "var(--success)";
+          if (undoBtn) undoBtn.style.display = "inline-flex";
+        } else {
+          successText.innerHTML = `<strong style="color:var(--text-muted);">No files were moved (${result.refused_count || 0} refused).</strong>`;
+          if (undoBtn) undoBtn.style.display = "none";
+        }
+
+        if (result.refusals && result.refusals.length > 0) {
+          refusedBox.style.display = "block";
+          refusedList.innerHTML = result.refusals.map(r => `
+            <div style="display:flex; justify-content:space-between; align-items:center; padding:3px 0; border-bottom:1px solid rgba(255,255,255,0.05);">
+              <span style="font-family:monospace; font-size:0.8rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:70%;" title="${escapeHtml(r.path)}">${escapeHtml(getBasename(r.path))}</span>
+              <span class="chip chip-review" style="font-size:0.72rem; padding:1px 6px;">${escapeHtml(r.reason)}</span>
+            </div>
+          `).join("");
+        } else {
+          refusedBox.style.display = "none";
+          refusedList.innerHTML = "";
+        }
 
         // Refresh clusters and current view
         await refreshAll({ preserveActiveCluster: true });
@@ -2323,15 +2367,22 @@
         historyList.forEach(b => {
           const tr = document.createElement("tr");
           const canUndo = b.status === "executed";
+          let refusedHtml = "";
+          if (b.refused_files && b.refused_files.length > 0) {
+            refusedHtml = `<div class="history-refused-details" style="margin-top:6px; font-size:0.75rem; color:var(--danger); display:flex; flex-direction:column; gap:2px;">
+              <strong>Refused (${b.refused_files.length}):</strong>
+              ${b.refused_files.map(rf => `<div><code style="font-size:0.72rem;">${escapeHtml(getBasename(rf.path))}</code>: <span class="chip chip-review" style="font-size:0.68rem; padding:1px 5px;">${escapeHtml(rf.reason)}</span></div>`).join("")}
+            </div>`;
+          }
           tr.innerHTML = `
-            <td><code>${b.batch_id}</code></td>
-            <td>${b.executed_at || b.created_at || "N/A"}</td>
-            <td>${b.mode || "N/A"}</td>
+            <td><code>${escapeHtml(b.batch_id)}</code>${refusedHtml}</td>
+            <td>${escapeHtml(b.executed_at || b.created_at || "N/A")}</td>
+            <td>${escapeHtml(b.mode || "N/A")}</td>
             <td>${b.file_count || 0}</td>
             <td>${formatBytes(b.bytes_freed)}</td>
-            <td><span class="chip ${b.status === 'executed' ? 'chip-review' : 'chip-category'}">${b.status}</span></td>
+            <td><span class="chip ${b.status === 'executed' ? 'chip-review' : 'chip-category'}">${escapeHtml(b.status)}</span></td>
             <td>
-              ${canUndo ? `<button type="button" class="btn btn-undo-row" data-batch="${b.batch_id}" style="padding:2px 8px; font-size:0.75rem;">Undo</button>` : "-"}
+              ${canUndo ? `<button type="button" class="btn btn-undo-row" data-batch="${escapeHtml(b.batch_id)}" style="padding:2px 8px; font-size:0.75rem;">Undo</button>` : "-"}
             </td>
           `;
           tbody.appendChild(tr);
@@ -2668,6 +2719,7 @@
     document.getElementById("btn-open-sources").addEventListener("click", () => {
       sourcesModal.style.display = "flex";
       document.getElementById("source-status-msg").style.display = "none";
+      updateDriveAuthStatus();
     });
     document.getElementById("btn-close-sources").addEventListener("click", () => {
       sourcesModal.style.display = "none";
@@ -2681,6 +2733,9 @@
         document.querySelectorAll(".source-tab-pane").forEach(p => {
           p.style.display = p.id === target ? "block" : "none";
         });
+        if (target === "tab-drive") {
+          updateDriveAuthStatus();
+        }
       });
     });
 
@@ -2767,7 +2822,131 @@
       }
     });
 
-    // Tab 2: Google Drive
+    // Tab 2: Google Drive OAuth & Scan
+    async function updateDriveAuthStatus() {
+      const msgEl = document.getElementById("drive-status-message");
+      const connectView = document.getElementById("drive-connect-view");
+      const connectedView = document.getElementById("drive-connected-view");
+      const connectedUser = document.getElementById("drive-connected-user");
+      const btnConnect = document.getElementById("btn-connect-drive");
+      const btnScan = document.getElementById("btn-scan-drive");
+
+      if (!msgEl || !connectView || !connectedView) return;
+      msgEl.style.display = "none";
+
+      try {
+        const res = await fetch("/drive/status");
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!data.enabled) {
+          connectView.style.display = "block";
+          connectedView.style.display = "none";
+          if (btnConnect) btnConnect.disabled = true;
+          if (btnScan) btnScan.disabled = true;
+          msgEl.style.display = "block";
+          msgEl.style.color = "var(--text-muted)";
+          msgEl.style.background = "rgba(148, 163, 184, 0.1)";
+          msgEl.style.border = "1px solid var(--border)";
+          msgEl.textContent = data.message || "Google Drive integration is disabled in hosted mode.";
+          return;
+        }
+
+        if (!data.configured) {
+          connectView.style.display = "block";
+          connectedView.style.display = "none";
+          if (btnConnect) btnConnect.disabled = true;
+          if (btnScan) btnScan.disabled = true;
+          msgEl.style.display = "block";
+          msgEl.style.color = "var(--danger)";
+          msgEl.style.background = "rgba(239, 68, 68, 0.08)";
+          msgEl.style.border = "1px solid var(--danger)";
+          msgEl.textContent = data.message || "Google Drive integration is not configured. An administrator must provide client_secret.json in the data directory.";
+          return;
+        }
+
+        if (btnConnect) btnConnect.disabled = false;
+        if (data.connected) {
+          connectView.style.display = "none";
+          connectedView.style.display = "flex";
+          connectedUser.textContent = `Connected as ${data.email || "Google Account"}`;
+          if (btnScan) btnScan.disabled = false;
+        } else {
+          connectView.style.display = "block";
+          connectedView.style.display = "none";
+          if (btnScan) btnScan.disabled = false;
+        }
+      } catch (err) {
+        console.error("Drive status error:", err);
+      }
+    }
+
+    const btnConnectDrive = document.getElementById("btn-connect-drive");
+    if (btnConnectDrive) {
+      btnConnectDrive.addEventListener("click", async () => {
+        btnConnectDrive.disabled = true;
+        btnConnectDrive.textContent = "Connecting...";
+        const msgEl = document.getElementById("drive-status-message");
+        if (msgEl) msgEl.style.display = "none";
+        try {
+          const res = await fetch("/drive/auth-url");
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.detail || "Failed to initiate Drive authorization");
+          }
+          const data = await res.json();
+          if (data.auth_url) {
+            window.location.href = data.auth_url;
+          }
+        } catch (err) {
+          btnConnectDrive.disabled = false;
+          btnConnectDrive.textContent = "Connect Google Drive";
+          if (msgEl) {
+            msgEl.style.display = "block";
+            msgEl.style.color = "var(--danger)";
+            msgEl.style.background = "rgba(239, 68, 68, 0.08)";
+            msgEl.style.border = "1px solid var(--danger)";
+            msgEl.textContent = err.message || "Failed to connect Google Drive";
+          }
+        }
+      });
+    }
+
+    const btnDisconnectDrive = document.getElementById("btn-disconnect-drive");
+    if (btnDisconnectDrive) {
+      btnDisconnectDrive.addEventListener("click", async () => {
+        btnDisconnectDrive.disabled = true;
+        btnDisconnectDrive.textContent = "Disconnecting...";
+        try {
+          const csrf = await getCsrfToken();
+          const res = await fetch("/drive/disconnect", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "X-CSRF-Token": csrf,
+            },
+          });
+          if (res.ok) {
+            showInlineNotice("Google Drive disconnected", "success");
+            await updateDriveAuthStatus();
+          } else {
+            showInlineNotice("Failed to disconnect Drive", "error");
+          }
+        } catch (err) {
+          showInlineNotice("Disconnect error: " + (err.message || err), "error");
+        } finally {
+          btnDisconnectDrive.disabled = false;
+          btnDisconnectDrive.textContent = "Disconnect";
+        }
+      });
+    }
+
+    if (window.location.hash === "#drive=connected") {
+      history.replaceState(null, "", window.location.pathname + window.location.search);
+      showInlineNotice("Google Drive connected successfully!", "success");
+      updateDriveAuthStatus();
+    }
+
+    // Tab 2: Google Drive Scan
     document.getElementById("btn-scan-drive").addEventListener("click", async () => {
       const link = document.getElementById("drive-link-input").value.trim();
       if (!link) {

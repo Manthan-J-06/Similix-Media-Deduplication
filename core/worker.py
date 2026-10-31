@@ -329,7 +329,16 @@ def run_pipeline(
 
         if source_type == "drive":
             from sources.google_drive import GoogleDriveSource
-            source0 = GoogleDriveSource(folder_id=drive_folder_id, conn=conn, stage="stage0")
+            user_tok = db_path.parent / "drive_token.json"
+            tok_path = user_tok if user_tok.exists() else None
+            cache_p = db_path.parent / "drive_cache"
+            source0 = GoogleDriveSource(
+                folder_id=drive_folder_id,
+                conn=conn,
+                stage="stage0",
+                token_path=tok_path,
+                cache_dir=cache_p,
+            )
 
             def on_drive_scan(cur: int, tot: int, fpath: str):
                 worker_state.current_file_path = fpath
@@ -350,7 +359,13 @@ def run_pipeline(
             s0_res = run_stage0(source0, conn, cfg, progress_callback=on_drive_scan)
             for p, r in s0_res.skipped_reasons:
                 all_warnings.append(f"{Path(p).name}: {r}")
-            source_active = GoogleDriveSource(folder_id=drive_folder_id, conn=conn, stage="stage1")
+            source_active = GoogleDriveSource(
+                folder_id=drive_folder_id,
+                conn=conn,
+                stage="stage1",
+                token_path=tok_path,
+                cache_dir=cache_p,
+            )
         else:
             from sources.local_folder import LocalFolderSource
             scan_dir = Path(folder or cfg.get("sources", {}).get("library_dir", "~/.argus/library")).expanduser().resolve()

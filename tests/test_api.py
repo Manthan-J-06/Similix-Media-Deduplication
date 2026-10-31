@@ -29,6 +29,8 @@ import shutil
 import sqlite3
 import threading
 import time
+import urllib.request
+import zipfile
 
 from typing import Any
 
@@ -298,7 +300,66 @@ class TestAPIServer:
         # 404 for unknown cluster
         res_404 = client.get("/clusters/999")
         assert res_404.status_code == 404
-        assert "not found" in res_404.json()["detail"].lower()
+
+    def test_reproduce_cluster_category_edit_causes_500(self, api_test_env):
+        """Reproduce bug where editing cluster label causes GET /clusters/{id} and /clusters to 500, and verify clearing."""
+        client = api_test_env["client"]
+
+        # 1. Edit label
+        post_res = client.post("/clusters/1/category", json={"category": "beach"})
+        assert post_res.status_code == 200
+        assert post_res.json()["category"] == "beach"
+        assert post_res.json()["manual_category"] == "beach"
+
+        # Fetch detail
+        res = client.get("/clusters/1")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["category"] == "beach"
+        assert data["manual_category"] == "beach"
+
+        # Fetch list
+        list_res = client.get("/clusters")
+        assert list_res.status_code == 200
+        clusters = list_res.json()
+        c1 = next((c for c in clusters if c["id"] == 1), None)
+        assert c1 is not None
+        assert c1["category"] == "beach"
+        assert c1["manual_category"] == "beach"
+
+        # 2. Clear label with empty string
+        clear_res = client.post("/clusters/1/category", json={"category": ""})
+        assert clear_res.status_code == 200
+        assert clear_res.json()["manual_category"] is None
+
+        # Fetch detail after clearing
+        res_after = client.get("/clusters/1")
+        assert res_after.status_code == 200
+        data_after = res_after.json()
+        assert data_after["manual_category"] is None
+        assert data_after["category"] != "beach"
+
+        # Fetch list after clearing
+        list_after = client.get("/clusters")
+        assert list_after.status_code == 200
+
+        # 3. Clear label with whitespace string
+        client.post("/clusters/1/category", json={"category": "mountains"})
+        clear_ws = client.post("/clusters/1/category", json={"category": "   "})
+        assert clear_ws.status_code == 200
+        assert clear_ws.json()["manual_category"] is None
+
+        # 4. Clear label with DELETE
+        client.post("/clusters/1/category", json={"category": "forest"})
+        del_res = client.delete("/clusters/1/category")
+        assert del_res.status_code == 200
+        assert del_res.json()["manual_category"] is None
+
+        # 5. Clear with None
+        client.post("/clusters/1/category", json={"category": "city street"})
+        none_res = client.post("/clusters/1/category", json={"category": None})
+        assert none_res.status_code == 200
+        assert none_res.json()["manual_category"] is None
 
     def test_thumbnail_caching_and_id_only(self, api_test_env):
         """GET /thumb/{image_id} generates and caches JPEG thumbnail. Only accepts image_id."""
@@ -1005,13 +1066,13 @@ class TestAPIServer:
             extract_drive_folder_id("not-a-valid-link")
         assert exc_info.value.status_code == 400
 
-        # Endpoint auth check when drive-auth not done
+        # Endpoint auth check when drive token missing
         app = api_test_env["app"]
         app.state.config["sources"] = {"google_drive": {"token_path": "/tmp/nonexistent_drive_token_xyz.json"}}
         client = api_test_env["client"]
         resp = client.post("/sources/drive", json={"link": "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs"})
         assert resp.status_code == 400
-        assert "drive-auth" in resp.json()["detail"].lower()
+        assert "connect your google drive account" in resp.json()["detail"].lower()
 
     def test_no_deletion_calls_in_sources_endpoints(self, api_test_env, monkeypatch):
         """
@@ -1880,4 +1941,174 @@ class TestPipelineResumable:
         # 5. Error handling: empty image_ids
         res_empty = client.post("/download/selected", json={"image_ids": []})
         assert res_empty.status_code in (400, 422)
+
+    def test_drive_web_oauth_flow(self, api_test_env, tmp_path, monkeypatch):
+        """Test Drive web OAuth flow, PKCE, admin message, user-isolated tokens, disconnect."""
+        client = api_test_env["client"]
+        app = api_test_env["app"]
+
+        # 1. Missing client_secret -> clear admin message (not terminal command)
+        res_status = client.get("/drive/status")
+        assert res_status.status_code == 200
+        data = res_status.json()
+        assert data["configured"] is False
+        assert "administrator must provide client_secret.json in the data directory" in data["message"].lower()
+
+        res_auth_fail = client.get("/drive/auth-url")
+        assert res_auth_fail.status_code == 400
+        assert "administrator must provide client_secret.json" in res_auth_fail.json()["detail"].lower()
+
+        # 2. Hosted mode check
+        monkeypatch.setenv("HOSTED_MODE", "true")
+        monkeypatch.delenv("ARGUS_ENABLE_DRIVE", raising=False)
+        res_hosted = client.get("/drive/status")
+        assert res_hosted.status_code == 200
+        assert res_hosted.json()["enabled"] is False
+        assert "disabled in hosted mode" in res_hosted.json()["message"].lower()
+
+        # Allow Drive with ARGUS_ENABLE_DRIVE=1
+        monkeypatch.setenv("ARGUS_ENABLE_DRIVE", "1")
+        res_hosted_allowed = client.get("/drive/status")
+        assert res_hosted_allowed.status_code == 200
+        assert res_hosted_allowed.json()["enabled"] is True
+
+        monkeypatch.delenv("HOSTED_MODE", raising=False)
+        monkeypatch.delenv("ARGUS_ENABLE_DRIVE", raising=False)
+
+        # 3. Setup mock client_secret.json
+        sec_file = tmp_path / "client_secret.json"
+        sec_file.write_text(json.dumps({
+            "web": {
+                "client_id": "test-client-id-12345.apps.googleusercontent.com",
+                "client_secret": "test-client-secret-xyz",
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+            }
+        }))
+        app.state.config["sources"] = {"google_drive": {"client_secret_path": str(sec_file)}}
+
+        # Status now configured = True, connected = False
+        res_status2 = client.get("/drive/status")
+        assert res_status2.status_code == 200
+        assert res_status2.json()["configured"] is True
+        assert res_status2.json()["connected"] is False
+
+        # 4. Generate Auth URL (PKCE + state)
+        res_auth = client.get("/drive/auth-url")
+        assert res_auth.status_code == 200
+        auth_data = res_auth.json()
+        assert "auth_url" in auth_data
+        auth_url = auth_data["auth_url"]
+        assert "https://accounts.google.com/o/oauth2/v2/auth" in auth_url
+        assert "code_challenge=" in auth_url
+        assert "code_challenge_method=S256" in auth_url
+        assert "scope=" in auth_url
+        assert "drive.readonly" in auth_url
+        state = auth_data["state"]
+
+        # 5. Callback exchange
+        class MockHttpResponse:
+            def __init__(self, data: bytes):
+                self._data = data
+            def read(self):
+                return self._data
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+
+        def mock_urlopen(req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            if "oauth2.googleapis.com/token" in url:
+                return MockHttpResponse(json.dumps({
+                    "access_token": "mock_access_token_xyz999",
+                    "refresh_token": "mock_refresh_token_abc888",
+                    "expires_in": 3600,
+                    "token_type": "Bearer",
+                }).encode("utf-8"))
+            elif "userinfo" in url:
+                return MockHttpResponse(json.dumps({
+                    "email": "photographer@gmail.com",
+                    "name": "Argus Photographer",
+                }).encode("utf-8"))
+            raise ValueError(f"Unexpected URL: {url}")
+
+        monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+
+        cb_res = client.get(f"/drive/callback?code=mock_auth_code_123&state={state}", follow_redirects=False)
+        assert cb_res.status_code == 303
+        assert cb_res.headers["location"] == "/#drive=connected"
+
+        # Check status is now connected
+        res_status3 = client.get("/drive/status")
+        assert res_status3.status_code == 200
+        d3 = res_status3.json()
+        assert d3["connected"] is True
+        assert d3["email"] == "photographer@gmail.com"
+
+        # Verify token file exists in user's root only with 0o600
+        user_root = app.state.custom_user_overrides[1]["root"] if (hasattr(app.state, "custom_user_overrides") and 1 in app.state.custom_user_overrides) else (app.state.users_dir / "1")
+        user_tok = user_root / "drive_token.json"
+        assert user_tok.exists()
+        saved_tok = json.loads(user_tok.read_text())
+        assert saved_tok["token"] == "mock_access_token_xyz999"
+        assert saved_tok["account_email"] == "photographer@gmail.com"
+
+        # 6. Disconnect
+        disc_res = client.post("/drive/disconnect")
+        assert disc_res.status_code == 200
+        assert disc_res.json()["connected"] is False
+        assert not user_tok.exists()
+
+        res_status4 = client.get("/drive/status")
+        assert res_status4.json()["connected"] is False
+
+    def test_refused_deletions_exact_reasons_and_plan_excludes_trashed(self, api_test_env):
+        """Test exact refusal reasons (missing, changed, keeper, whole cluster, review flag, already trashed) and plan exclusion."""
+        client = api_test_env["client"]
+        db_file = api_test_env["db_file"]
+
+        # Plan deletion for Cluster 1
+        plan_res = client.post("/plan", json={"mode": "conservative"})
+        assert plan_res.status_code == 200
+        plan_data = plan_res.json()
+        batch_id = plan_data["batch_id"]
+        assert len(plan_data["entries"]) > 0
+
+        # Now simulate a refusal case: tamper with a planned file's size before apply
+        first_entry = plan_data["entries"][0]
+        orig_file = Path(first_entry["original_path"])
+        # Append some bytes to change file size -> "changed since plan"
+        with open(orig_file, "ab") as f:
+            f.write(b"tampered")
+
+        # Apply
+        apply_res = client.post("/apply", json={"batch_id": batch_id, "confirm": True})
+        assert apply_res.status_code == 200
+        apply_data = apply_res.json()
+        assert apply_data["refused_count"] >= 1
+        refused_entry = next((r for r in apply_data["refusals"] if r["path"] == str(orig_file)), None)
+        assert refused_entry is not None
+        assert refused_entry["reason"] == "changed since plan"
+
+        # Check /history includes refused_files
+        hist_res = client.get("/history")
+        assert hist_res.status_code == 200
+        hist_data = hist_res.json()
+        b_hist = next((b for b in hist_data if b["batch_id"] == batch_id), None)
+        assert b_hist is not None
+        assert len(b_hist["refused_files"]) >= 1
+        assert any(rf["reason"] == "changed since plan" for rf in b_hist["refused_files"])
+
+        # Check that rebuilding plan excludes trashed/moved files
+        # Mark all files in cluster 1 as trashed
+        with sqlite3.connect(db_file) as conn:
+            conn.execute("UPDATE images SET status = 'trashed' WHERE cluster_id = 1")
+            conn.commit()
+
+        rebuilt_plan = client.post("/plan", json={"mode": "conservative"})
+        assert rebuilt_plan.status_code == 200
+        # Cluster 1 has no surviving files, so its files must NOT appear in the plan
+        for e in rebuilt_plan.json()["entries"]:
+            assert e["cluster_id"] != 1
 

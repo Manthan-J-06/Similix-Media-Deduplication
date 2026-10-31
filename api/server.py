@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+import base64
+import hashlib
 import io
 import json
 import logging
@@ -58,6 +60,7 @@ from core.ledger import (
     ensure_ledger_tables,
     execute,
     get_history,
+    normalize_refusal_reason,
     plan,
     undo,
 )
@@ -146,7 +149,7 @@ class DatasetSourceRequest(BaseModel):
 
 
 class ClusterCategoryRequest(BaseModel):
-    category: str
+    category: Optional[str] = None
     model_config = ConfigDict(extra="ignore")
 
 
@@ -204,6 +207,34 @@ def extract_drive_folder_id(link: str) -> str:
     if re.fullmatch(r"[a-zA-Z0-9_-]{20,60}", link):
         return link
     raise HTTPException(status_code=400, detail=f"Invalid Drive folder link or ID: {link}")
+
+
+def find_drive_client_secret(config: dict | None = None, data_dir: Path | None = None) -> tuple[Path | None, dict | None]:
+    """Find and read OAuth client_secret.json across configuration and data directories."""
+    cfg = config or {}
+    candidates = []
+    cfg_path = cfg.get("sources", {}).get("google_drive", {}).get("client_secret_path")
+    if cfg_path:
+        candidates.append(Path(cfg_path).expanduser())
+    if data_dir:
+        candidates.append(data_dir / "client_secret.json")
+    env_data_dir = os.environ.get("ARGUS_DATA_DIR")
+    if env_data_dir:
+        candidates.append(Path(env_data_dir).expanduser() / "client_secret.json")
+    candidates.append(Path.home() / ".argus" / "client_secret.json")
+    candidates.append(Path("client_secret.json").resolve())
+
+    for cand in candidates:
+        if cand.is_file():
+            try:
+                with open(cand, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                info = data.get("web") or data.get("installed") or {}
+                if "client_id" in info:
+                    return cand, info
+            except Exception:
+                continue
+    return None, None
 
 
 def write_job_state(job_file: Path, data: dict) -> None:
@@ -1319,10 +1350,10 @@ def create_app(
             savings_ratio = round(savings_bytes / total_bytes, 4) if total_bytes > 0 else 0.0
 
             manual_cat = c_row["manual_category"] if "manual_category" in c_row.keys() else None
+            keeper_m = next((m for m in member_dicts if m["id"] == keeper_id), None)
             if manual_cat:
                 display_category = manual_cat
             else:
-                keeper_m = next((m for m in member_dicts if m["id"] == keeper_id), None)
                 cluster_cat = c_row["category"] or (keeper_m.get("category_top1") if keeper_m else None)
 
                 # Majority-vote display category
@@ -1487,11 +1518,11 @@ def create_app(
                 "reason": reasons.get(mid, ""),
             })
 
+        keeper_m = next((m for m in formatted_members if m["is_recommended_keeper"]), None)
         manual_cat = c_row["manual_category"] if "manual_category" in c_row.keys() else None
         if manual_cat:
             display_category = manual_cat
         else:
-            keeper_m = next((m for m in formatted_members if m["is_recommended_keeper"]), None)
             cluster_cat = c_row["category"] or (keeper_m.get("category") if keeper_m else None)
 
             member_cats = [m.get("category") for m in formatted_members if m.get("category")]
@@ -1531,9 +1562,18 @@ def create_app(
         if not c_row:
             raise HTTPException(status_code=404, detail=f"Cluster {cluster_id} not found")
 
-        clean_cat = req.category.strip()
+        clean_cat = req.category.strip() if req.category else ""
         if not clean_cat:
-            raise HTTPException(status_code=400, detail="Category label cannot be empty")
+            conn.execute(
+                "UPDATE clusters SET manual_category = NULL WHERE id = ?",
+                (cluster_id,),
+            )
+            conn.commit()
+            return {
+                "cluster_id": cluster_id,
+                "category": None,
+                "manual_category": None,
+            }
 
         conn.execute(
             "UPDATE clusters SET manual_category = ?, category = ? WHERE id = ?",
@@ -1544,6 +1584,27 @@ def create_app(
             "cluster_id": cluster_id,
             "category": clean_cat,
             "manual_category": clean_cat,
+        }
+
+    @app.delete("/clusters/{cluster_id}/category")
+    def delete_cluster_category(
+        cluster_id: int,
+        user: UserContext = Depends(get_current_user),
+        conn: sqlite3.Connection = Depends(get_db),
+    ) -> dict[str, Any]:
+        c_row = conn.execute("SELECT id FROM clusters WHERE id = ?", (cluster_id,)).fetchone()
+        if not c_row:
+            raise HTTPException(status_code=404, detail=f"Cluster {cluster_id} not found")
+
+        conn.execute(
+            "UPDATE clusters SET manual_category = NULL WHERE id = ?",
+            (cluster_id,),
+        )
+        conn.commit()
+        return {
+            "cluster_id": cluster_id,
+            "category": None,
+            "manual_category": None,
         }
 
     @app.get("/thumb/{image_id}")
@@ -1908,7 +1969,15 @@ def create_app(
             "refused_count": res.refused_count,
             "failed_count": res.failed_count,
             "bytes_moved": res.bytes_moved,
-            "refusals": res.refusals,
+            "refusals": [
+                {
+                    "entry_id": r.get("entry_id"),
+                    "path": r.get("path"),
+                    "reason": normalize_refusal_reason(r.get("reason")),
+                    "raw_reason": r.get("reason"),
+                }
+                for r in res.refusals
+            ],
             "failures": res.failures,
         }
 
@@ -2071,6 +2140,233 @@ def create_app(
             "files": [Path(p).name for p in saved_files],
         }
 
+    # ==========================
+    # Google Drive Web OAuth
+    # ==========================
+
+    @app.get("/drive/status")
+    def get_drive_status(
+        request: Request,
+        user: UserContext = Depends(get_current_user),
+    ) -> dict[str, Any]:
+        cfg = getattr(request.app.state, "config", {}) or {}
+        hosted_mode = bool(cfg.get("hosted_mode", False) or cfg.get("general", {}).get("hosted_mode", False))
+        if "HOSTED_MODE" in os.environ:
+            hosted_mode = os.environ.get("HOSTED_MODE", "").lower() in ("true", "1", "yes")
+
+        if hosted_mode and os.environ.get("ARGUS_ENABLE_DRIVE") != "1":
+            return {
+                "enabled": False,
+                "configured": False,
+                "connected": False,
+                "email": None,
+                "message": "Google Drive integration is disabled in hosted mode.",
+            }
+
+        data_root = getattr(request.app.state, "data_root", None)
+        sec_path, _ = find_drive_client_secret(cfg, data_root)
+        if not sec_path:
+            return {
+                "enabled": True,
+                "configured": False,
+                "connected": False,
+                "email": None,
+                "message": "Google Drive integration is not configured. An administrator must provide client_secret.json in the data directory.",
+            }
+
+        user_tok_path = user.root / "drive_token.json"
+        from sources.google_drive import DEFAULT_TOKEN_PATH
+        global_tok_path = Path(cfg.get("sources", {}).get("google_drive", {}).get("token_path", DEFAULT_TOKEN_PATH)).expanduser()
+        tok_file = user_tok_path if user_tok_path.exists() else (global_tok_path if global_tok_path.exists() else None)
+
+        connected = False
+        account_email = None
+        if tok_file and tok_file.exists():
+            try:
+                with open(tok_file, "r", encoding="utf-8") as f:
+                    tok_data = json.load(f)
+                account_email = tok_data.get("account_email")
+                connected = bool(tok_data.get("token") or tok_data.get("refresh_token"))
+            except Exception:
+                connected = False
+
+        return {
+            "enabled": True,
+            "configured": True,
+            "connected": connected,
+            "email": account_email,
+            "message": None,
+        }
+
+    @app.get("/drive/auth-url")
+    def get_drive_auth_url(
+        request: Request,
+        user: UserContext = Depends(get_current_user),
+    ) -> dict[str, Any]:
+        cfg = getattr(request.app.state, "config", {}) or {}
+        hosted_mode = bool(cfg.get("hosted_mode", False) or cfg.get("general", {}).get("hosted_mode", False))
+        if "HOSTED_MODE" in os.environ:
+            hosted_mode = os.environ.get("HOSTED_MODE", "").lower() in ("true", "1", "yes")
+
+        if hosted_mode and os.environ.get("ARGUS_ENABLE_DRIVE") != "1":
+            raise HTTPException(status_code=403, detail="Google Drive integration is disabled in hosted mode.")
+
+        data_root = getattr(request.app.state, "data_root", None)
+        sec_path, sec_info = find_drive_client_secret(cfg, data_root)
+        if not sec_path or not sec_info:
+            raise HTTPException(
+                status_code=400,
+                detail="Google Drive integration is not configured. An administrator must provide client_secret.json in the data directory.",
+            )
+
+        client_id = sec_info.get("client_id")
+        if not client_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid client_secret.json: missing client_id.",
+            )
+
+        # Generate PKCE verifier + S256 challenge
+        code_verifier = secrets.token_urlsafe(64)
+        digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+        code_challenge = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+        state = secrets.token_urlsafe(32)
+
+        base = os.environ.get("BASE_URL")
+        if not base:
+            base = str(request.base_url).rstrip("/")
+        redirect_uri = f"{base}/drive/callback"
+
+        if not hasattr(request.app.state, "drive_oauth_states"):
+            request.app.state.drive_oauth_states = {}
+
+        now = time.time()
+        request.app.state.drive_oauth_states = {
+            k: v for k, v in request.app.state.drive_oauth_states.items()
+            if now - v.get("created_at", 0) < 900
+        }
+
+        request.app.state.drive_oauth_states[state] = {
+            "user_id": user.id,
+            "code_verifier": code_verifier,
+            "redirect_uri": redirect_uri,
+            "created_at": now,
+        }
+
+        params = {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "scope": "https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/userinfo.email",
+            "access_type": "offline",
+            "include_granted_scopes": "true",
+            "prompt": "consent",
+            "state": state,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+        }
+        auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urllib.parse.urlencode(params)}"
+        return {"auth_url": auth_url, "state": state}
+
+    @app.get("/drive/callback")
+    def drive_callback(
+        code: str = Query(None),
+        state: str = Query(None),
+        request: Request = None,
+        user: UserContext = Depends(get_current_user),
+    ) -> Response:
+        if not code or not state:
+            raise HTTPException(status_code=400, detail="Missing code or state parameter")
+
+        states = getattr(request.app.state, "drive_oauth_states", {})
+        state_info = states.pop(state, None)
+        if not state_info or (time.time() - state_info.get("created_at", 0) > 900):
+            raise HTTPException(status_code=400, detail="Invalid or expired OAuth state")
+
+        user_id = state_info["user_id"]
+        if user.id != user_id:
+            raise HTTPException(status_code=403, detail="OAuth user mismatch")
+        code_verifier = state_info["code_verifier"]
+        redirect_uri = state_info["redirect_uri"]
+
+        cfg = getattr(request.app.state, "config", {}) or {}
+        data_root = getattr(request.app.state, "data_root", None)
+        _, sec_info = find_drive_client_secret(cfg, data_root)
+        if not sec_info:
+            raise HTTPException(status_code=500, detail="OAuth credentials configuration missing")
+
+        client_id = sec_info.get("client_id")
+        client_secret = sec_info.get("client_secret")
+
+        token_payload = urllib.parse.urlencode({
+            "code": code,
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "redirect_uri": redirect_uri,
+            "grant_type": "authorization_code",
+            "code_verifier": code_verifier,
+        }).encode("utf-8")
+
+        token_req = urllib.request.Request(
+            "https://oauth2.googleapis.com/token",
+            data=token_payload,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        try:
+            with urllib.request.urlopen(token_req, timeout=20) as token_resp:
+                token_data = json.loads(token_resp.read().decode("utf-8"))
+        except Exception as exc:
+            logger.error("Failed to exchange OAuth code: %s", type(exc).__name__)
+            raise HTTPException(status_code=400, detail="OAuth token exchange failed")
+
+        access_token = token_data.get("access_token")
+        refresh_token = token_data.get("refresh_token")
+
+        account_email = None
+        if access_token:
+            try:
+                userinfo_req = urllib.request.Request(
+                    "https://www.googleapis.com/oauth2/v2/userinfo",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+                with urllib.request.urlopen(userinfo_req, timeout=10) as u_resp:
+                    u_info = json.loads(u_resp.read().decode("utf-8"))
+                    account_email = u_info.get("email")
+            except Exception:
+                pass
+
+        overrides = getattr(request.app.state, "custom_user_overrides", {}).get(user_id)
+        user_dirs = get_user_dirs(request.app.state.users_dir, user_id, custom_overrides=overrides)
+        user_tok_path = user_dirs["root"] / "drive_token.json"
+
+        stored_tok = {
+            "token": access_token,
+            "refresh_token": refresh_token,
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "scopes": ["https://www.googleapis.com/auth/drive.readonly"],
+            "account_email": account_email,
+        }
+
+        user_tok_path.parent.mkdir(parents=True, exist_ok=True)
+        user_tok_path.write_text(json.dumps(stored_tok, indent=2))
+        try:
+            user_tok_path.chmod(0o600)
+        except OSError:
+            pass
+
+        return RedirectResponse(url="/#drive=connected", status_code=303)
+
+    @app.post("/drive/disconnect")
+    def disconnect_drive(
+        user: UserContext = Depends(get_current_user),
+    ) -> dict[str, Any]:
+        user_tok_path = user.root / "drive_token.json"
+        if user_tok_path.exists():
+            user_tok_path.unlink(missing_ok=True)
+        return {"connected": False}
+
     @app.post("/sources/drive")
     def add_drive_source(
         req: DriveSourceRequest,
@@ -2082,17 +2378,19 @@ def create_app(
         hosted_mode = bool(cfg.get("hosted_mode", False) or cfg.get("general", {}).get("hosted_mode", False))
         if "HOSTED_MODE" in os.environ:
             hosted_mode = os.environ.get("HOSTED_MODE", "").lower() in ("true", "1", "yes")
-        if hosted_mode:
-            raise HTTPException(status_code=403, detail="Google Drive sources are disabled in hosted mode")
+        if hosted_mode and os.environ.get("ARGUS_ENABLE_DRIVE") != "1":
+            raise HTTPException(status_code=403, detail="Google Drive integration is disabled in hosted mode.")
 
         folder_id = extract_drive_folder_id(req.link)
 
         from sources.google_drive import DEFAULT_TOKEN_PATH, get_drive_credentials
-        token_path = Path(request.app.state.config.get("sources", {}).get("google_drive", {}).get("token_path", DEFAULT_TOKEN_PATH)).expanduser()
-        if not token_path.exists():
+        user_tok = user.root / "drive_token.json"
+        global_tok = Path(request.app.state.config.get("sources", {}).get("google_drive", {}).get("token_path", DEFAULT_TOKEN_PATH)).expanduser()
+        token_path = user_tok if user_tok.exists() else (global_tok if global_tok.exists() else None)
+        if not token_path or not token_path.exists():
             raise HTTPException(
                 status_code=400,
-                detail="Google Drive authentication required. Please run 'argus drive-auth' first.",
+                detail="Google Drive authentication required. Please connect your Google Drive account first.",
             )
 
         try:
@@ -2100,14 +2398,14 @@ def create_app(
             if not creds or not creds.valid:
                 raise HTTPException(
                     status_code=400,
-                    detail="Google Drive authentication expired or invalid. Please re-run 'argus drive-auth'.",
+                    detail="Google Drive authentication expired or invalid. Please reconnect your account.",
                 )
         except HTTPException:
             raise
         except Exception as exc:
             raise HTTPException(
                 status_code=400,
-                detail=f"Google Drive authentication error: {exc}. Please run 'argus drive-auth' first.",
+                detail=f"Google Drive authentication error: {exc}. Please reconnect your account.",
             )
 
         job_id = launch_pipeline_job(request.app, user=user, source_type="drive", drive_folder_id=folder_id)
