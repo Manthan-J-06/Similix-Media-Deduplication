@@ -807,6 +807,12 @@ def select_reference_member(
     if sl_info.get("cap_hit"):
         reference_uncertain = 1
 
+    # Requirement: Mark reference_uncertain = 0 when all non-identical members
+    # of a cluster are byte-identical to the reference (exact-copy-only clusters).
+    ref_ck = _member_content_key(ref)
+    if len(member_dicts) > 1 and all(_member_content_key(m) == ref_ck for m in member_dicts):
+        reference_uncertain = 0
+
     ref["reference_uncertain"] = reference_uncertain
     ref["top_candidate_gap"] = top_candidate_gap
     ref["head_to_head_result"] = head_to_head_result
@@ -1281,7 +1287,7 @@ def run_quality_pipeline(
         cid = c["id"]
         members = conn.execute(
             """
-            SELECT id, cluster_id, file_path, width, height, file_size, format, modified_time, jpeg_quality_est, source_likelihood
+            SELECT id, cluster_id, file_path, width, height, file_size, format, modified_time, jpeg_quality_est, source_likelihood, md5
             FROM images
             WHERE cluster_id = ?
             ORDER BY id
@@ -1353,6 +1359,13 @@ def run_quality_pipeline(
         ref_orig = (ref_member["width"] or 0, ref_member["height"] or 0)
         ref_sz = ref_member["file_size"] or 0
         ref_uncertain = ref_member.get("reference_uncertain", 0)
+
+        # Mark reference_uncertain = 0 when all non-identical members of a cluster
+        # are byte-identical to the reference (exact-copy-only clusters).
+        ref_ck = _member_content_key(ref_member)
+        if len(member_rows) > 1 and all(_member_content_key(m) == ref_ck for m in member_rows):
+            ref_uncertain = 0
+            ref_member["reference_uncertain"] = 0
 
         # Update cluster representative and reference_uncertain in SQLite
         conn.execute(

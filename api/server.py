@@ -794,20 +794,9 @@ def create_app(
     # ==========================
 
     @app.get("/healthz")
-    def health_check(request: Request):
+    def health_check():
         """Public health check endpoint for reverse proxies and orchestrators."""
-        cfg = getattr(request.app.state, "config", {}) or {}
-        secret_is_set = bool(
-            os.environ.get("SECRET_KEY")
-            or cfg.get("auth", {}).get("secret_key")
-        )
-        return {
-            "status": "ok",
-            "service": "argus",
-            "data_dir": str(getattr(request.app.state, "data_root", "")),
-            "db_path": str(getattr(request.app.state, "db_path", "")),
-            "secret_key_set": "yes" if secret_is_set else "no",
-        }
+        return {"status": "ok", "service": "argus"}
 
     @app.get("/login")
     def serve_login():
@@ -1530,7 +1519,7 @@ def create_app(
             "category_top2": keeper_m.get("category_top2") if keeper_m else None,
             "category_top2_prob": keeper_m.get("category_top2_prob") if keeper_m else None,
             "manual_category": manual_cat,
-            "reference_uncertain": bool(ref_unc),
+            "reference_uncertain": bool(keeper_res.get("reference_uncertain", ref_unc)),
             "swap_proposal": keeper_res.get("swap_proposal"),
             "no_swap_reason": keeper_res.get("no_swap_reason"),
             "members": formatted_members,

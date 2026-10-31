@@ -23,6 +23,7 @@ from __future__ import annotations
 import io
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import time
 
@@ -336,6 +337,23 @@ class TestReferenceMemberSelection:
             assert res["reference_uncertain"] == 0
             assert 2 in res["delete_safe_ids"], f"Exact copy (id=2) was not delete_safe in mode {mode}"
             assert res["keeper_id"] != 2
+
+    def test_exact_copy_only_cluster_select_reference_uncertain_zero(self, tmp_path: Path):
+        im = _make_rich_test_image(400, 300)
+        p1 = tmp_path / "orig.jpg"
+        im.save(p1, format="JPEG", quality=90)
+        p2 = tmp_path / "copy1.jpg"
+        shutil.copyfile(p1, p2)
+        p3 = tmp_path / "copy2.jpg"
+        shutil.copyfile(p1, p3)
+
+        members = [
+            {"id": 1, "width": 400, "height": 300, "file_size": p1.stat().st_size, "file_path": str(p1)},
+            {"id": 2, "width": 400, "height": 300, "file_size": p2.stat().st_size, "file_path": str(p2)},
+            {"id": 3, "width": 400, "height": 300, "file_size": p3.stat().st_size, "file_path": str(p3)},
+        ]
+        ref = select_reference_member(members)
+        assert ref["reference_uncertain"] == 0
 
     def test_shuffled_and_renamed_files_give_same_reference(self, tmp_path: Path):
         # 5(c) shuffled and renamed files give the same result

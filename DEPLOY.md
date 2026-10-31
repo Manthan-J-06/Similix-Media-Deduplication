@@ -35,14 +35,7 @@ Argus is containerized using `python:3.11-slim`, runs as a non-root user (`argus
 3. **Verify Service Health & Startup Self-Check**
    ```bash
    curl http://localhost:8000/healthz
-   # Response:
-   # {
-   #   "status": "ok",
-   #   "service": "argus",
-   #   "data_dir": "/data",
-   #   "db_path": "/data/argus.db",
-   #   "secret_key_set": "yes"
-   # }
+   # Response: {"status":"ok","service":"argus"}
    ```
 
    Argus logs a startup self-check banner upon boot:

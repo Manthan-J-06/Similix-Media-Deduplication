@@ -858,6 +858,59 @@ class TestConservativeUncertaintyPreservesByteIdentical:
         assert res["reasons"][2] == "Byte-identical copy of recommended keeper"
         assert "uncertain" in res["reasons"][3].lower()
 
+    def test_exact_copy_only_cluster_clears_reference_uncertain(self):
+        """
+        When all non-identical members of a cluster are byte-identical to the reference
+        (exact-copy-only clusters), reference_uncertain must be marked 0.
+        """
+        members = [
+            {
+                "id": 1,
+                "file_path": "/photos/original.jpg",
+                "file_size": 100_000,
+                "width": 1000,
+                "height": 1000,
+                "md5": "md5_original",
+                "quality_status": "reference",
+                "ssim": 1.0,
+                "ssim_color": 1.0,
+                "pixel_ratio": 1.0,
+                "is_low_confidence": 0,
+            },
+            {
+                "id": 2,
+                "file_path": "/photos/copy1.jpg",
+                "file_size": 100_000,
+                "width": 1000,
+                "height": 1000,
+                "md5": "md5_original",
+                "quality_status": "aligned",
+                "ssim": 1.0,
+                "ssim_color": 1.0,
+                "pixel_ratio": 1.0,
+                "is_low_confidence": 0,
+            },
+            {
+                "id": 3,
+                "file_path": "/photos/copy2.jpg",
+                "file_size": 100_000,
+                "width": 1000,
+                "height": 1000,
+                "md5": "md5_original",
+                "quality_status": "aligned",
+                "ssim": 1.0,
+                "ssim_color": 1.0,
+                "pixel_ratio": 1.0,
+                "is_low_confidence": 0,
+            },
+        ]
+        # Even if reference_uncertain=1 was passed in, exact-copy-only cluster marks it 0
+        for mode in ["conservative", "balanced", "aggressive"]:
+            res = choose_keeper(members, mode=mode, reference_uncertain=1)
+            assert res["reference_uncertain"] == 0
+            assert set(res["delete_safe_ids"]) == {2, 3}
+            assert res["review_ids"] == []
+
 
 class TestByteIdenticalAnchorPrefersEarliestMtime:
     def test_anchor_prefers_earliest_mtime_over_path_and_renaming(self):

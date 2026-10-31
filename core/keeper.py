@@ -25,6 +25,7 @@ core/keeper.py — Stage 4: Recommendation and keeper selection.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -239,6 +240,50 @@ def choose_keeper(
         is_uncertain = any(bool(m.get("reference_uncertain")) for m in members if hasattr(m, "get"))
         if not is_uncertain and ref_member and hasattr(ref_member, "get"):
             is_uncertain = bool(ref_member.get("reference_uncertain"))
+
+    # Requirement: Mark reference_uncertain = 0 when all non-identical members
+    # of a cluster are byte-identical to the reference (exact-copy-only clusters).
+    ref_md5 = ref_member.get("md5")
+    ref_sz = ref_member.get("file_size") or 0
+    ref_path = str(ref_member.get("file_path") or "")
+
+    if not ref_md5 and ref_path and os.path.exists(ref_path):
+        try:
+            with open(ref_path, "rb") as f:
+                ref_md5 = hashlib.md5(f.read()).hexdigest()
+            ref_sz = os.path.getsize(ref_path)
+        except Exception:
+            pass
+
+    def _is_byte_identical_to_ref(m: dict[str, Any]) -> bool:
+        m_md5 = m.get("md5")
+        m_sz = m.get("file_size") or 0
+        m_path = str(m.get("file_path") or "")
+        if not m_md5 and m_path and os.path.exists(m_path):
+            try:
+                with open(m_path, "rb") as f:
+                    m_md5 = hashlib.md5(f.read()).hexdigest()
+                m_sz = os.path.getsize(m_path)
+            except Exception:
+                pass
+        if ref_md5 and m_md5:
+            return bool(m_md5 == ref_md5 and m_sz == ref_sz)
+        if ref_path and m_path and os.path.exists(ref_path) and os.path.exists(m_path):
+            try:
+                if os.path.getsize(ref_path) != os.path.getsize(m_path):
+                    return False
+                with open(ref_path, "rb") as f1, open(m_path, "rb") as f2:
+                    return f1.read() == f2.read()
+            except Exception:
+                pass
+        return False
+
+    is_exact_copy_only = (
+        len(members) > 1
+        and all(_is_byte_identical_to_ref(m) for m in members if m.get("id") != ref_member.get("id"))
+    )
+    if is_exact_copy_only:
+        is_uncertain = False
 
     # 1. Select Candidates & Pick Keeper
     # Conservative mode: keeper = the reference.
