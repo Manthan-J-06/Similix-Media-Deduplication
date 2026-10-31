@@ -1715,10 +1715,14 @@
             document.getElementById("detail-content").style.display = "none";
             const emptyEl = document.getElementById("detail-empty");
             emptyEl.style.display = "flex";
-            const countMsg = (window._totalImagesCount !== undefined && window._totalImagesCount !== null && !isNaN(window._totalImagesCount))
-              ? ` in ${window._totalImagesCount} images`
+            const totCnt = (window._totalImagesCount !== undefined && window._totalImagesCount !== null && !isNaN(window._totalImagesCount))
+              ? window._totalImagesCount
+              : 0;
+            const countMsg = totCnt > 0 ? ` in ${totCnt} images` : "";
+            const viewUniqueBtn = totCnt > 0
+              ? `<div style="margin-top:14px;"><button type="button" class="btn btn-primary" id="btn-view-unique-photos" onclick="switchView('all-photos')" style="font-size:0.88rem; padding:6px 16px;">📷 View All ${totCnt} Unique Photos</button></div>`
               : "";
-            emptyEl.innerHTML = `<p style="color:var(--text-muted); font-size:1.1rem;">No duplicate clusters found${countMsg}.</p>`;
+            emptyEl.innerHTML = `<p style="color:var(--text-muted); font-size:1.1rem;">No duplicate clusters found${countMsg}.</p>${viewUniqueBtn}`;
           }
 
           if (currentView === "all-photos") {
@@ -2105,6 +2109,24 @@
             `;
             listContainer.appendChild(row);
           });
+        }
+
+        if (planData.skipped_entries && planData.skipped_entries.length > 0) {
+          const skipBox = document.createElement("div");
+          skipBox.id = "plan-skipped-box";
+          skipBox.style = "margin-top:12px; padding:10px 12px; background:rgba(234,179,8,0.08); border:1px solid rgba(234,179,8,0.3); border-radius:6px; font-size:0.83rem;";
+          skipBox.innerHTML = `
+            <div style="font-weight:600; color:#ca8a04; margin-bottom:6px;">Excluded from deletion:</div>
+            <div style="display:flex; flex-direction:column; gap:4px;">
+              ${planData.skipped_entries.map(s => `
+                <div style="display:flex; justify-content:space-between; gap:8px;">
+                  <span style="font-family:monospace; color:var(--text); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtml(s.file_path)}">${escapeHtml(getBasename(s.file_path))}</span>
+                  <span class="chip" style="font-size:0.7rem; background:rgba(234,179,8,0.15); color:#ca8a04; border:none; padding:1px 6px;">${escapeHtml(s.reason)}</span>
+                </div>
+              `).join("")}
+            </div>
+          `;
+          listContainer.appendChild(skipBox);
         }
 
         // Show modal and reset apply status

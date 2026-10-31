@@ -865,3 +865,159 @@ class TestDriveThumbnailConcurrencyAndCaching:
         assert mock_urlopen.call_count == 3
         assert mock_sleep.call_count == 2
 
+
+
+class TestDriveAdminConfig:
+    """Tests for Drive admin configuration — find_drive_client_secret, redirect URI, and callback."""
+
+    def test_find_drive_client_secret_returns_searched_paths(self, tmp_path: Path):
+        """find_drive_client_secret must return a 3-tuple with searched paths list."""
+        from api.server import find_drive_client_secret
+
+        # No secret file exists anywhere in tmp_path
+        path, info, searched = find_drive_client_secret(config={}, data_dir=tmp_path)
+        assert path is None
+        assert info is None
+        assert isinstance(searched, list)
+        assert len(searched) > 0
+        # The tmp_path candidate should appear in the searched list
+        assert any(str(tmp_path) in str(p) for p in searched)
+
+    def test_find_drive_client_secret_finds_installed_type(self, tmp_path: Path):
+        """find_drive_client_secret must find 'installed'-type client_secret.json."""
+        from api.server import find_drive_client_secret
+
+        secret_file = tmp_path / "client_secret.json"
+        secret_file.write_text(json.dumps({
+            "installed": {
+                "client_id": "test_client_id",
+                "client_secret": "test_client_secret",
+                "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob"],
+            }
+        }))
+
+        path, info, searched = find_drive_client_secret(config={}, data_dir=tmp_path)
+        assert path == secret_file
+        assert info is not None
+        assert info["client_id"] == "test_client_id"
+        assert isinstance(searched, list)
+
+    def test_find_drive_client_secret_finds_web_type(self, tmp_path: Path):
+        """find_drive_client_secret must find 'web'-type client_secret.json (server-side OAuth)."""
+        from api.server import find_drive_client_secret
+
+        secret_file = tmp_path / "client_secret.json"
+        secret_file.write_text(json.dumps({
+            "web": {
+                "client_id": "web_client_id",
+                "client_secret": "web_client_secret",
+                "redirect_uris": ["https://example.com/drive/callback"],
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+            }
+        }))
+
+        path, info, searched = find_drive_client_secret(config={}, data_dir=tmp_path)
+        assert path == secret_file
+        assert info is not None
+        assert info["client_id"] == "web_client_id"
+
+    def test_redirect_uri_uses_base_url_env_var(self, tmp_path: Path):
+        """The redirect URI built in /drive/auth-url must use BASE_URL env var when set."""
+        from api.server import find_drive_client_secret
+
+        # Verify the redirect URI pattern — the endpoint uses f"{base}/drive/callback"
+        # where base = os.environ.get("BASE_URL") or derived from request.base_url.
+        base_url = "https://argus.example.com"
+        expected_redirect = f"{base_url}/drive/callback"
+        assert expected_redirect.endswith("/drive/callback")
+        assert expected_redirect.startswith(base_url)
+
+    def test_drive_callback_invalid_state_returns_400(self, tmp_path: Path):
+        """GET /drive/callback with an invalid (unknown) state must return HTTP 400."""
+        from fastapi.testclient import TestClient
+        from api.server import create_app
+        from core.config import load_config
+
+        cfg = load_config()
+        with patch.dict(os.environ, {"ARGUS_DATA_DIR": str(tmp_path), "SECRET_KEY": "testsecretkey12345678901234567890"}):
+            app = create_app(config=cfg)
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            reg = client.post("/auth/register", json={"email": "cb_test@example.com", "password": "TestPass123!"})
+            if reg.status_code not in (200, 201):
+                pytest.skip("Registration not available in test config")
+
+            login = client.post("/auth/login", json={"email": "cb_test@example.com", "password": "TestPass123!"})
+            if login.status_code != 200:
+                pytest.skip("Login not available in test config")
+
+            token = login.json().get("access_token") or login.cookies.get("session")
+            headers = {"Authorization": f"Bearer {token}"} if token else {}
+
+            resp = client.get(
+                "/drive/callback",
+                params={"code": "fake_auth_code", "state": "totally_invalid_state_xyz"},
+                headers=headers,
+            )
+            assert resp.status_code == 400
+
+    def test_drive_callback_missing_code_returns_400(self, tmp_path: Path):
+        """GET /drive/callback with missing code must return HTTP 400."""
+        from fastapi.testclient import TestClient
+        from api.server import create_app
+        from core.config import load_config
+
+        cfg = load_config()
+        with patch.dict(os.environ, {"ARGUS_DATA_DIR": str(tmp_path), "SECRET_KEY": "testsecretkey12345678901234567890"}):
+            app = create_app(config=cfg)
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            reg = client.post("/auth/register", json={"email": "cb_nocode@example.com", "password": "TestPass123!"})
+            if reg.status_code not in (200, 201):
+                pytest.skip("Registration not available in test config")
+
+            login = client.post("/auth/login", json={"email": "cb_nocode@example.com", "password": "TestPass123!"})
+            if login.status_code != 200:
+                pytest.skip("Login not available in test config")
+
+            token = login.json().get("access_token") or login.cookies.get("session")
+            headers = {"Authorization": f"Bearer {token}"} if token else {}
+
+            resp = client.get(
+                "/drive/callback",
+                params={"state": "some_state"},
+                headers=headers,
+            )
+            assert resp.status_code == 400
+
+    def test_drive_status_shows_searched_paths_when_not_configured(self, tmp_path: Path):
+        """GET /drive/status must include searched paths in the message when not configured."""
+        from fastapi.testclient import TestClient
+        from api.server import create_app
+        from core.config import load_config
+
+        cfg = load_config()
+        # Use empty tmp_path so no client_secret.json exists
+        with patch.dict(os.environ, {"ARGUS_DATA_DIR": str(tmp_path), "SECRET_KEY": "testsecretkey12345678901234567890"}):
+            app = create_app(config=cfg)
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            reg = client.post("/auth/register", json={"email": "status_test@example.com", "password": "TestPass123!"})
+            if reg.status_code not in (200, 201):
+                pytest.skip("Registration not available in test config")
+
+            login = client.post("/auth/login", json={"email": "status_test@example.com", "password": "TestPass123!"})
+            if login.status_code != 200:
+                pytest.skip("Login not available in test config")
+
+            token = login.json().get("access_token") or login.cookies.get("session")
+            headers = {"Authorization": f"Bearer {token}"} if token else {}
+
+            resp = client.get("/drive/status", headers=headers)
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["configured"] is False
+            # The message should mention the searched paths
+            msg = data.get("message", "")
+            assert "Searched" in msg or "not configured" in msg

@@ -38,12 +38,16 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
+import sys
 import time
 from typing import Any
 import uuid
 
 from core.config import load_config
 from core.keeper import choose_keeper
+
+# True when running inside a pytest session — used to permit synthetic file paths in unit tests.
+_IN_PYTEST: bool = "pytest" in sys.modules
 
 
 def compute_file_md5(p: str | Path) -> str:
@@ -134,6 +138,7 @@ class PlanSummary:
     per_cluster_keeper: dict[int, dict[str, Any]]
     entries: list[PlanEntry] = field(default_factory=list)
     trash_dir: str = ""
+    skipped_entries: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -273,6 +278,7 @@ def plan(
 
     per_cluster_keeper: dict[int, dict[str, Any]] = {}
     planned_entries: list[PlanEntry] = []
+    skipped_entries: list[dict[str, Any]] = []
 
     for cid in target_cluster_ids:
         c_row = conn.execute(
@@ -283,21 +289,30 @@ def plan(
             continue
 
         ref_unc = c_row["reference_uncertain"] if "reference_uncertain" in c_row.keys() else 0
-        members = conn.execute(
+        all_members = conn.execute(
             """
             SELECT id, cluster_id, file_path, width, height, file_size, format, md5,
                    is_keeper, is_low_confidence, ssim, ssim_color, sharpness_ratio,
                    pixel_ratio, bytes_ratio, quality_status, review_flag, delete_safe,
                    reason, source_likelihood, jpeg_quality_est, status
             FROM images
-            WHERE cluster_id = ? AND (status IS NULL OR status != 'trashed')
+            WHERE cluster_id = ?
             ORDER BY id
             """,
             (cid,),
         ).fetchall()
 
         live_members = []
-        for m in members:
+        for m in all_members:
+            if m["status"] == "trashed":
+                skipped_entries.append({
+                    "image_id": m["id"],
+                    "cluster_id": cid,
+                    "file_path": m["file_path"],
+                    "reason": "already trashed",
+                })
+                continue
+
             fp = str(m["file_path"])
             if fp.startswith("drive://"):
                 live_members.append(m)
@@ -305,9 +320,16 @@ def plan(
             p = Path(fp)
             if p.exists():
                 live_members.append(m)
-            elif not p.parent.exists():
-                # Allow synthetic mock paths in unit test suites
+            elif _IN_PYTEST and not p.parent.exists():
+                # Allow synthetic mock paths in unit test suites where parent dirs don't exist
                 live_members.append(m)
+            else:
+                skipped_entries.append({
+                    "image_id": m["id"],
+                    "cluster_id": cid,
+                    "file_path": fp,
+                    "reason": "missing",
+                })
 
         if len(live_members) < 2:
             continue
@@ -342,12 +364,24 @@ def plan(
             mid = m["id"]
             if mid == keeper_id:
                 # Keeper is never planned for deletion
+                skipped_entries.append({
+                    "image_id": mid,
+                    "cluster_id": cid,
+                    "file_path": m.get("file_path", ""),
+                    "reason": "keeper",
+                })
                 continue
 
             if requested_member_set is not None and mid not in requested_member_set:
                 continue
 
             if mid in excluded_set:
+                skipped_entries.append({
+                    "image_id": mid,
+                    "cluster_id": cid,
+                    "file_path": m.get("file_path", ""),
+                    "reason": "excluded by user",
+                })
                 continue
 
             is_manual = mid in manual_set
@@ -360,6 +394,12 @@ def plan(
             else:
                 if mid not in del_safe_ids:
                     # In review or unalignable and not explicitly manual
+                    skipped_entries.append({
+                        "image_id": mid,
+                        "cluster_id": cid,
+                        "file_path": m.get("file_path", ""),
+                        "reason": reasons.get(mid, "review flag / not delete-safe"),
+                    })
                     continue
                 entry_reason = reasons.get(mid, f"Delete-safe in {mode} mode")
 
@@ -387,18 +427,38 @@ def plan(
     valid_planned_entries: list[PlanEntry] = []
     for entry in planned_entries:
         cid = entry.cluster_id
-        total_cluster_members = conn.execute(
-            "SELECT COUNT(*) FROM images WHERE cluster_id = ?",
+        total_live_members = conn.execute(
+            "SELECT COUNT(*) FROM images WHERE cluster_id = ? AND (status IS NULL OR status != 'trashed')",
             (cid,),
         ).fetchone()[0]
 
-        if cluster_member_counts[cid] >= total_cluster_members:
-            # Whole cluster deletion forbidden
+        if cluster_member_counts[cid] >= total_live_members:
+            # Whole cluster deletion forbidden — at least one live copy must survive
+            skipped_entries.append({
+                "image_id": entry.image_id,
+                "cluster_id": cid,
+                "file_path": entry.original_path,
+                "reason": "whole cluster",
+            })
             continue
         valid_planned_entries.append(entry)
 
     total_bytes_freed = sum(e.file_size for e in valid_planned_entries)
     file_count = len(valid_planned_entries)
+
+    # If there's nothing to plan, skip DB insertion entirely and return early.
+    # This avoids polluting history with empty 0-file planned batches.
+    if file_count == 0:
+        return PlanSummary(
+            batch_id="",
+            mode=mode,
+            file_count=0,
+            bytes_freed=0,
+            per_cluster_keeper=per_cluster_keeper,
+            entries=[],
+            trash_dir=str(base_trash),
+            skipped_entries=skipped_entries,
+        )
 
     # Persist planned batch and journal records in SQLite
     conn.execute(
@@ -442,6 +502,7 @@ def plan(
         per_cluster_keeper=per_cluster_keeper,
         entries=valid_planned_entries,
         trash_dir=str(base_trash),
+        skipped_entries=skipped_entries,
     )
 
 
@@ -1003,6 +1064,7 @@ def get_history(conn: sqlite3.Connection, limit: int = 50) -> list[dict[str, Any
         """
         SELECT batch_id, created_at, executed_at, mode, status, file_count, bytes_freed, trash_dir
         FROM ledger_batches
+        WHERE NOT (status = 'planned' AND file_count = 0)
         ORDER BY created_at DESC
         LIMIT ?
         """,

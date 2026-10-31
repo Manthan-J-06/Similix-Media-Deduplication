@@ -1952,11 +1952,11 @@ class TestPipelineResumable:
         assert res_status.status_code == 200
         data = res_status.json()
         assert data["configured"] is False
-        assert "administrator must provide client_secret.json in the data directory" in data["message"].lower()
+        assert "administrator must provide client_secret.json in the data directory" in data["message"].lower() or "client_secret.json not found" in data["message"].lower()
 
         res_auth_fail = client.get("/drive/auth-url")
         assert res_auth_fail.status_code == 400
-        assert "administrator must provide client_secret.json" in res_auth_fail.json()["detail"].lower()
+        assert "administrator must provide client_secret.json" in res_auth_fail.json()["detail"].lower() or "client_secret.json not found" in res_auth_fail.json()["detail"].lower()
 
         # 2. Hosted mode check
         monkeypatch.setenv("HOSTED_MODE", "true")
@@ -2111,4 +2111,31 @@ class TestPipelineResumable:
         # Cluster 1 has no surviving files, so its files must NOT appear in the plan
         for e in rebuilt_plan.json()["entries"]:
             assert e["cluster_id"] != 1
+        # Trashed files must appear in skipped_entries
+        skipped = rebuilt_plan.json().get("skipped_entries", [])
+        assert any(s["reason"] == "already trashed" for s in skipped)
+
+    def test_history_hides_planned_zero_file_batches(self, api_test_env):
+        """Planned batches with 0 files must not be shown in /history."""
+        client = api_test_env["client"]
+        db_file = api_test_env["db_file"]
+
+        # Insert a 0-file planned batch directly to simulate legacy or edge-case batch
+        with sqlite3.connect(db_file) as conn:
+            conn.execute(
+                "INSERT INTO ledger_batches (batch_id, created_at, mode, status, file_count, bytes_freed, trash_dir) "
+                "VALUES ('batch_zero_planned', strftime('%Y-%m-%dT%H:%M:%SZ','now'), 'conservative', 'planned', 0, 0, '/tmp/trash')"
+            )
+            # Insert a non-zero planned batch
+            conn.execute(
+                "INSERT INTO ledger_batches (batch_id, created_at, mode, status, file_count, bytes_freed, trash_dir) "
+                "VALUES ('batch_valid_planned', strftime('%Y-%m-%dT%H:%M:%SZ','now'), 'conservative', 'planned', 2, 2048, '/tmp/trash')"
+            )
+            conn.commit()
+
+        hist_res = client.get("/history")
+        assert hist_res.status_code == 200
+        batch_ids = [b["batch_id"] for b in hist_res.json()]
+        assert "batch_zero_planned" not in batch_ids
+        assert "batch_valid_planned" in batch_ids
 

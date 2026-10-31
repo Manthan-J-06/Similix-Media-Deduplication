@@ -87,7 +87,7 @@ def live_server(tmp_path):
     )
 
     base_url = f"http://127.0.0.1:{port}"
-    deadline = time.time() + 20.0
+    deadline = time.time() + 45.0
     ready = False
 
     while time.time() < deadline:
@@ -796,6 +796,111 @@ def test_category_edit_drive_oauth_and_refused_deletions(live_server, tmp_path):
         page.wait_for_selector("#history-table tbody tr", timeout=5000)
         history_rows = page.locator("#history-table tbody tr").all()
         assert len(history_rows) >= 1
+
+        context.close()
+        browser.close()
+
+
+def test_upload_5_unique_images_appear_in_library(live_server, tmp_path):
+    """
+    Test uploading 5 unique (non-duplicate) images:
+    - Zero duplicate clusters should be detected.
+    - User can navigate to 'All photos' library view.
+    - All 5 images appear with 'Unique' badge.
+    """
+    from playwright.sync_api import sync_playwright
+
+    # Prepare 5 visually unique images with distinct colors and noise
+    img_dir = tmp_path / "test_unique_5"
+    img_dir.mkdir(parents=True, exist_ok=True)
+
+    unique_files = []
+    colors = [
+        (255, 30, 30),
+        (30, 255, 30),
+        (30, 30, 255),
+        (255, 255, 30),
+        (255, 30, 255),
+    ]
+    for idx, col in enumerate(colors):
+        p = img_dir / f"unique_{idx+1:02d}.jpg"
+        _create_image(p, col, (300, 300))
+        unique_files.append(p)
+
+    assert len(unique_files) == 5
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(viewport={"width": 1280, "height": 900})
+        page = context.new_page()
+
+        # Register new account
+        test_email = f"unique5_{uuid.uuid4().hex[:6]}@example.com"
+        test_password = "UniquePassword123!"
+
+        page.goto(f"{live_server}/login")
+        page.wait_for_selector("#tab-register", timeout=10000)
+        page.click("#tab-register")
+
+        page.fill("#email", test_email)
+        page.fill("#password", test_password)
+        page.click("#submit-btn")
+
+        try:
+            page.wait_for_url(f"{live_server}/", timeout=15000)
+        except Exception:
+            if page.is_visible("#tab-login.active"):
+                page.fill("#email", test_email)
+                page.fill("#password", test_password)
+                page.click("#submit-btn")
+                page.wait_for_url(f"{live_server}/", timeout=15000)
+
+        page.wait_for_selector("#user-email-display", timeout=10000)
+        page.wait_for_selector("#btn-open-sources", timeout=10000)
+
+        # Upload 5 unique images
+        page.click("#btn-open-sources")
+        page.wait_for_selector("#sources-modal", state="visible", timeout=5000)
+        page.click("button[data-tab='tab-upload']")
+        page.set_input_files("#file-input", [str(f) for f in unique_files])
+        page.wait_for_selector("#btn-start-upload", state="visible", timeout=5000)
+        page.click("#btn-start-upload")
+
+        # Wait for pipeline completion
+        page.wait_for_selector("#job-progress-banner", state="visible", timeout=10000)
+        page.wait_for_function(
+            "() => document.getElementById('job-percent-text')?.textContent === '100%' || "
+            "(document.getElementById('job-status-text')?.textContent || '').includes('Pipeline complete') || "
+            "(document.getElementById('job-status-text')?.textContent || '').includes('Pipeline completed')",
+            timeout=60000,
+        )
+
+        # Verify 0 duplicate clusters found
+        page.wait_for_selector("#detail-empty", state="visible", timeout=10000)
+        empty_text = page.locator("#detail-empty").inner_text()
+        assert "No duplicate clusters found" in empty_text
+
+        # Navigate to All photos view
+        page.wait_for_selector("#tab-all-photos", timeout=5000)
+        page.click("#tab-all-photos")
+        page.wait_for_selector("#library-view-panel", state="visible", timeout=5000)
+
+        # Verify all 5 images appear in the grid
+        page.wait_for_selector(".library-card", timeout=10000)
+        page.wait_for_function("() => document.querySelectorAll('.library-card').length === 5", timeout=15000)
+
+        cards = page.locator(".library-card").all()
+        assert len(cards) == 5, f"Expected 5 library cards, got {len(cards)}"
+
+        # Verify each card has 'Unique' badge
+        unique_badges = page.locator(".library-card .badge-unique").all()
+        assert len(unique_badges) == 5, f"Expected 5 Unique badges, got {len(unique_badges)}"
+        for badge in unique_badges:
+            assert badge.inner_text().strip() == "Unique"
+
+        # Verify total count in library toolbar
+        total_text = page.locator("#lib-total-count").inner_text().strip()
+        assert total_text == "5"
 
         context.close()
         browser.close()

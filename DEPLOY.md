@@ -189,3 +189,181 @@ Hugging Face Spaces allows hosting containerized web applications directly on ma
 |---|---|---|---|
 | **Free Tier** | `/data` or `/app` | ❌ **Ephemeral** | The container filesystem is ephemeral. Whenever the Space restarts, updates, or goes to sleep after inactivity, **all uploaded images, users, and SQLite databases will be wiped clean**. |
 | **Persistent Storage Tier** | `/data` | ✅ **Persists** | When **Persistent Storage** (Small, Medium, or Large) is purchased and enabled in Space settings, `/data` is backed by network-attached storage. Setting `ARGUS_DATA_DIR=/data` guarantees that all users, credentials, image libraries, ledgers, and deduplication states **persist permanently across restarts and rebuilds**. |
+
+---
+
+## 4. Oracle Cloud / VPS Ubuntu Server
+
+This section covers self-hosting Argus on any Ubuntu 22.04+ VPS (Oracle Cloud Free Tier, DigitalOcean, Linode, Hetzner, etc.) with Docker, an HTTPS reverse proxy via Caddy, and systemd for automatic restarts.
+
+### Prerequisites
+
+- Ubuntu 22.04+ server with a public IP address.
+- A domain name with an **A record** pointing to the server's IP (for automatic HTTPS).
+- SSH access with `sudo` privileges.
+
+### Step 1: Install Docker Engine
+
+```bash
+# Update package index and install dependencies
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl gnupg
+
+# Add Docker's official GPG key and repository
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+  https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+# Install Docker CE and Compose plugin
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+# Allow your user to run Docker without sudo
+sudo usermod -aG docker $USER
+newgrp docker
+```
+
+### Step 2: Clone the Repository and Configure
+
+```bash
+git clone https://github.com/your-org/argus.git /opt/argus
+cd /opt/argus
+
+# Create .env with your secrets
+cat > .env <<'EOF'
+SECRET_KEY=<at-least-32-random-characters>
+ALLOW_REGISTRATION=true
+HOSTED_MODE=false
+BASE_URL=https://argus.yourdomain.com
+ARGUS_DATA_DIR=/data
+EOF
+```
+
+> [!CAUTION]
+> Generate `SECRET_KEY` with `python3 -c "import secrets; print(secrets.token_hex(32))"`. Never reuse it or commit it to version control.
+
+### Step 3: Build and Start with Docker Compose
+
+```bash
+cd /opt/argus
+docker compose up --build -d
+docker compose ps        # verify argus-app is Up
+docker compose logs -f   # watch startup logs
+```
+
+### Step 4: Install Caddy for Automatic HTTPS
+
+Caddy automatically obtains and renews Let's Encrypt TLS certificates.
+
+```bash
+sudo apt-get install -y debian-keyring debian-archive-keyring apt-transport-https
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+sudo apt-get update && sudo apt-get install -y caddy
+```
+
+Create `/etc/caddy/Caddyfile`:
+
+```caddyfile
+argus.yourdomain.com {
+    reverse_proxy localhost:8000
+}
+```
+
+```bash
+sudo systemctl enable --now caddy
+sudo systemctl reload caddy
+```
+
+> [!TIP]
+> Caddy handles HTTP → HTTPS redirects and certificate renewal automatically. No `certbot` or manual renewal cron is needed.
+
+### Step 5: Configure UFW Firewall
+
+```bash
+sudo ufw allow OpenSSH
+sudo ufw allow 80/tcp    # HTTP (Caddy redirects to HTTPS)
+sudo ufw allow 443/tcp   # HTTPS
+sudo ufw enable
+sudo ufw status
+```
+
+> [!IMPORTANT]
+> Do **not** expose port 8000 publicly — all traffic must go through Caddy (port 443). Argus binds only on `localhost:8000`.
+
+### Step 6: Systemd Service for Auto-Start on Boot
+
+Create `/etc/systemd/system/argus.service`:
+
+```ini
+[Unit]
+Description=Argus Deduplication Service
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/argus
+ExecStart=/usr/bin/docker compose up -d --remove-orphans
+ExecStop=/usr/bin/docker compose down
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable argus
+sudo systemctl start argus
+```
+
+### Step 7: Automated Backup of Data Volume
+
+Add a daily cron job to back up the `argus_data` Docker volume:
+
+```bash
+sudo crontab -e
+```
+
+Add the following line:
+
+```cron
+0 3 * * * docker run --rm -v argus_argus_data:/data:ro -v /opt/backups/argus:/backup alpine tar czf /backup/argus_data_$(date +\%Y\%m\%d).tar.gz -C /data . && find /opt/backups/argus -name "*.tar.gz" -mtime +30 -delete
+```
+
+```bash
+sudo mkdir -p /opt/backups/argus
+```
+
+> [!NOTE]
+> The cron runs at 03:00 daily, creates a compressed `.tar.gz` snapshot of `/data`, and prunes backups older than 30 days.
+
+### Step 8: Google Drive Integration (Optional)
+
+To enable Google Drive sign-in, copy your `client_secret.json` into the Argus data volume:
+
+```bash
+docker cp /path/to/client_secret.json argus-app:/data/client_secret.json
+```
+
+Or mount it read-only via `docker-compose.yml` (add under `volumes:` in the `argus` service):
+
+```yaml
+# Uncomment and set path if client_secret.json exists on the host:
+# - /path/to/client_secret.json:/data/client_secret.json:ro
+```
+
+### What Persists vs What Doesn't (Oracle/VPS)
+
+| Data Category | Persistence | Storage Location / Explanation |
+|---|---|---|
+| **User Data & DBs** | ✅ **Persists** | Stored in Docker named volume `argus_data` at `/data` on the host. Survives container restarts, image rebuilds, and OS reboots (as long as the volume is not manually deleted). |
+| **TLS Certificates** | ✅ **Persists** | Managed by Caddy and stored in `/var/lib/caddy/`. Auto-renewed before expiry. |
+| **Daily Backups** | ✅ **Persists** | Written to `/opt/backups/argus/` on the host. Retained for 30 days. |
+| **Container Layers** | ❌ **Ephemeral** | Rebuilt with `docker compose up --build`. Does not affect user data in the named volume. |

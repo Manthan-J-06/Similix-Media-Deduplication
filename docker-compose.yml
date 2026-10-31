@@ -26,6 +26,10 @@ services:
     volumes:
       # Persistent storage volume for per-user directories, DBs, and library files
       - argus_data:/data
+      # To enable Google Drive integration, copy client_secret.json into the data volume:
+      #   docker cp /path/to/client_secret.json argus-app:/data/client_secret.json
+      # Or add a read-only bind mount (only if the file exists on the host):
+      # - /path/to/client_secret.json:/data/client_secret.json:ro
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
       interval: 30s

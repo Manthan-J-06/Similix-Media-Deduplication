@@ -209,10 +209,15 @@ def extract_drive_folder_id(link: str) -> str:
     raise HTTPException(status_code=400, detail=f"Invalid Drive folder link or ID: {link}")
 
 
-def find_drive_client_secret(config: dict | None = None, data_dir: Path | None = None) -> tuple[Path | None, dict | None]:
-    """Find and read OAuth client_secret.json across configuration and data directories."""
+def find_drive_client_secret(config: dict | None = None, data_dir: Path | None = None) -> tuple[Path | None, dict | None, list[Path]]:
+    """Find and read OAuth client_secret.json across configuration and data directories.
+
+    Returns a 3-tuple: (path, info_dict, searched_paths_list).
+    ``path`` and ``info_dict`` are ``None`` when no valid file is found.
+    ``searched_paths_list`` always contains every candidate that was checked.
+    """
     cfg = config or {}
-    candidates = []
+    candidates: list[Path] = []
     cfg_path = cfg.get("sources", {}).get("google_drive", {}).get("client_secret_path")
     if cfg_path:
         candidates.append(Path(cfg_path).expanduser())
@@ -231,10 +236,10 @@ def find_drive_client_secret(config: dict | None = None, data_dir: Path | None =
                     data = json.load(f)
                 info = data.get("web") or data.get("installed") or {}
                 if "client_id" in info:
-                    return cand, info
+                    return cand, info, candidates
             except Exception:
                 continue
-    return None, None
+    return None, None, candidates
 
 
 def write_job_state(job_file: Path, data: dict) -> None:
@@ -1188,7 +1193,7 @@ def create_app(
         List all images for the authenticated user (including unique, unclustered images),
         with pagination (default 60/page), search by filename, and category filtering.
         """
-        conditions = ["status != 'deleted'"]
+        conditions = ["(status IS NULL OR status NOT IN ('deleted', 'trashed'))"]
         params: list[Any] = []
 
         if search and search.strip():
@@ -1921,6 +1926,7 @@ def create_app(
                 }
                 for e in summary.entries
             ],
+            "skipped_entries": summary.skipped_entries,
         }
 
     @app.post("/apply")
@@ -2160,18 +2166,26 @@ def create_app(
                 "configured": False,
                 "connected": False,
                 "email": None,
+                "account_email": None,
                 "message": "Google Drive integration is disabled in hosted mode.",
             }
 
         data_root = getattr(request.app.state, "data_root", None)
-        sec_path, _ = find_drive_client_secret(cfg, data_root)
+        sec_path, _, searched_paths = find_drive_client_secret(cfg, data_root)
         if not sec_path:
+            searched_str = ", ".join(str(p) for p in searched_paths)
+            suggest = str(searched_paths[0]) if searched_paths else "the data directory"
             return {
                 "enabled": True,
                 "configured": False,
                 "connected": False,
                 "email": None,
-                "message": "Google Drive integration is not configured. An administrator must provide client_secret.json in the data directory.",
+                "account_email": None,
+                "message": (
+                    f"Google Drive integration is not configured. An administrator must provide client_secret.json in the data directory. "
+                    f"client_secret.json not found. Searched: {searched_str}. "
+                    f"Place it in {suggest}."
+                ),
             }
 
         user_tok_path = user.root / "drive_token.json"
@@ -2195,6 +2209,7 @@ def create_app(
             "configured": True,
             "connected": connected,
             "email": account_email,
+            "account_email": account_email,
             "message": None,
         }
 
@@ -2212,11 +2227,17 @@ def create_app(
             raise HTTPException(status_code=403, detail="Google Drive integration is disabled in hosted mode.")
 
         data_root = getattr(request.app.state, "data_root", None)
-        sec_path, sec_info = find_drive_client_secret(cfg, data_root)
+        sec_path, sec_info, searched_paths = find_drive_client_secret(cfg, data_root)
         if not sec_path or not sec_info:
+            searched_str = ", ".join(str(p) for p in searched_paths)
+            suggest = str(searched_paths[0]) if searched_paths else "the data directory"
             raise HTTPException(
                 status_code=400,
-                detail="Google Drive integration is not configured. An administrator must provide client_secret.json in the data directory.",
+                detail=(
+                    f"Google Drive integration is not configured. An administrator must provide client_secret.json in the data directory. "
+                    f"client_secret.json not found. Searched: {searched_str}. "
+                    f"Place it in {suggest}."
+                ),
             )
 
         client_id = sec_info.get("client_id")
@@ -2291,7 +2312,7 @@ def create_app(
 
         cfg = getattr(request.app.state, "config", {}) or {}
         data_root = getattr(request.app.state, "data_root", None)
-        _, sec_info = find_drive_client_secret(cfg, data_root)
+        _, sec_info, _ = find_drive_client_secret(cfg, data_root)
         if not sec_info:
             raise HTTPException(status_code=500, detail="OAuth credentials configuration missing")
 
