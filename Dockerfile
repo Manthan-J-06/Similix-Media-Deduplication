@@ -8,6 +8,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PORT=8000 \
     HOST=0.0.0.0 \
     ARGUS_DATA_DIR=/data \
+    ARGUS_TRASH_DIR=/data/trash \
+    ARGUS_LIBRARY_DIR=/data/library \
     ARGUS_USERS_DIR=/data/users \
     ARGUS_ACCOUNTS_DB=/data/auth.db \
     TMPDIR=/tmp \
@@ -22,7 +24,7 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
 
 # Create non-root user and application directory with strict permissions
 RUN useradd -m -u 1000 -s /bin/bash argus && \
-    mkdir -p /data/users /home/argus/.cache/huggingface /home/argus/.cache/torch /app && \
+    mkdir -p /data/users /data/trash /data/library /home/argus/.argus /home/argus/.cache/huggingface /home/argus/.cache/torch /app && \
     chown -R argus:argus /data /home/argus /app
 
 WORKDIR /app

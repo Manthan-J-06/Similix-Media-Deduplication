@@ -174,9 +174,15 @@ class PurgeResult:
 
 
 def _resolve_trash_dir(config: dict | None = None, trash_dir: str | Path | None = None) -> Path:
-    """Resolve base trash directory from argument, config, or ~/.argus/trash."""
+    """Resolve base trash directory from argument, environment, config, or ~/.argus/trash."""
     if trash_dir is not None:
         return Path(trash_dir).expanduser().resolve()
+    env_trash = os.environ.get("ARGUS_TRASH_DIR")
+    if env_trash:
+        return Path(env_trash).expanduser().resolve()
+    data_dir = os.environ.get("ARGUS_DATA_DIR")
+    if data_dir:
+        return (Path(data_dir).expanduser() / "trash").resolve()
     if config:
         cfg_trash = config.get("ledger", {}).get("trash_dir")
         if cfg_trash:

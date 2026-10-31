@@ -619,12 +619,11 @@ def create_app(
 
     explicit_db_path = db_path is not None
     if not explicit_db_path:
-        db_path = os.environ.get("ARGUS_DB_PATH") or config.get("database", {}).get("path") or (data_root / "argus.db")
+        db_path = os.environ.get("ARGUS_DB_PATH") or (data_root / "argus.db" if raw_data_dir else (config.get("database", {}).get("path") or (data_root / "argus.db")))
     resolved_db_path = Path(db_path).expanduser().resolve()
 
     if trash_dir is None:
-        cfg_trash = config.get("ledger", {}).get("trash_dir")
-        trash_dir = os.environ.get("ARGUS_TRASH_DIR") or cfg_trash or (data_root / "trash")
+        trash_dir = os.environ.get("ARGUS_TRASH_DIR") or (data_root / "trash" if raw_data_dir else (config.get("ledger", {}).get("trash_dir") or (data_root / "trash")))
     resolved_trash_dir = Path(trash_dir).expanduser().resolve()
     resolved_trash_dir.mkdir(parents=True, exist_ok=True)
 
@@ -634,28 +633,24 @@ def create_app(
     resolved_thumb_cache_dir.mkdir(parents=True, exist_ok=True)
 
     if library_dir is None:
-        cfg_library = config.get("sources", {}).get("library_dir")
-        library_dir = os.environ.get("ARGUS_LIBRARY_DIR") or cfg_library or (data_root / "library")
+        library_dir = os.environ.get("ARGUS_LIBRARY_DIR") or (data_root / "library" if raw_data_dir else (config.get("sources", {}).get("library_dir") or (data_root / "library")))
     resolved_library_dir = Path(library_dir).expanduser().resolve()
     resolved_library_dir.mkdir(parents=True, exist_ok=True)
 
     if jobs_dir is None:
-        cfg_jobs = config.get("general", {}).get("jobs_dir")
-        jobs_dir = os.environ.get("ARGUS_JOBS_DIR") or cfg_jobs or (data_root / "jobs")
+        jobs_dir = os.environ.get("ARGUS_JOBS_DIR") or (data_root / "jobs" if raw_data_dir else (config.get("general", {}).get("jobs_dir") or (data_root / "jobs")))
     resolved_jobs_dir = Path(jobs_dir).expanduser().resolve()
     resolved_jobs_dir.mkdir(parents=True, exist_ok=True)
 
     # Per-user storage directories root
     if users_dir is None:
-        cfg_users = config.get("general", {}).get("users_dir")
-        users_dir = os.environ.get("ARGUS_USERS_DIR") or cfg_users or (data_root / "users")
+        users_dir = os.environ.get("ARGUS_USERS_DIR") or (data_root / "users" if raw_data_dir else (config.get("general", {}).get("users_dir") or (data_root / "users")))
     resolved_users_dir = Path(users_dir).expanduser().resolve()
     resolved_users_dir.mkdir(parents=True, exist_ok=True)
 
     # Auth DB initialization
     if auth_db_path is None:
-        cfg_auth = config.get("auth", {}).get("db_path")
-        auth_db_path = os.environ.get("ARGUS_ACCOUNTS_DB") or os.environ.get("ARGUS_AUTH_DB") or cfg_auth or (data_root / "auth.db")
+        auth_db_path = os.environ.get("ARGUS_ACCOUNTS_DB") or os.environ.get("ARGUS_AUTH_DB") or (data_root / "auth.db" if raw_data_dir else (config.get("auth", {}).get("db_path") or (data_root / "auth.db")))
     resolved_auth_db_path = Path(auth_db_path).expanduser().resolve()
     resolved_auth_db_path.parent.mkdir(parents=True, exist_ok=True)
     auth_conn = init_auth_db(resolved_auth_db_path)
