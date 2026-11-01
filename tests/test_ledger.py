@@ -452,6 +452,68 @@ class TestLedgerCore:
         assert len(hist) >= 1
         assert hist[0]["batch_id"] == summary.batch_id
 
+    def test_drive_files_excluded_from_plan_before_confirm(self, test_setup):
+        """Google Drive files are read-only and must be excluded in plan() under skipped_entries."""
+        conn = test_setup["conn"]
+        trash_dir = test_setup["trash_dir"]
+
+        conn.execute("INSERT INTO clusters (id, representative_id, stage_detected, member_count) VALUES (99, NULL, 0, 2)")
+        now = time.time()
+        conn.execute(
+            """
+            INSERT INTO images (
+                id, cluster_id, file_path, file_size, width, height, format, md5,
+                is_keeper, is_recommended_keeper, delete_safe, review_flag,
+                is_low_confidence, quality_status, ssim, ssim_color, sharpness_ratio,
+                pixel_ratio, bytes_ratio, modified_time
+            ) VALUES
+              (901, 99, 'drive://root/oxford_keeper.jpg', 50000, 800, 600, 'JPEG', 'md5_1', 1, 1, 0, 0, 0, 'reference', 1.0, 1.0, 1.0, 1.0, 1.0, ?),
+              (902, 99, 'drive://root/oxford_copy.jpg', 48000, 800, 600, 'JPEG', 'md5_1', 0, 0, 1, 0, 0, 'aligned', 1.0, 1.0, 1.0, 1.0, 1.0, ?)
+            """,
+            (now, now),
+        )
+        conn.execute("UPDATE clusters SET representative_id = 901 WHERE id = 99")
+        conn.commit()
+
+        summary = plan(conn, member_ids=[902], mode="conservative", trash_dir=trash_dir)
+        # Should NOT plan any files into deletion journal
+        assert summary.file_count == 0
+        assert summary.bytes_freed == 0
+        # Should be recorded in skipped_entries with read-only explanation
+        drive_skips = [s for s in summary.skipped_entries if s["image_id"] == 902]
+        assert len(drive_skips) == 1
+        assert "read-only cloud source" in drive_skips[0]["reason"]
+
+    def test_drive_files_refused_with_drive_reason_in_execute(self, test_setup):
+        """If a drive:// entry exists in a deletion batch, execute() and dry_run() refuse with Drive reason."""
+        conn = test_setup["conn"]
+        trash_dir = test_setup["trash_dir"]
+        batch_id = "batch_test_drive_refusal"
+        conn.execute(
+            """
+            INSERT INTO ledger_batches (batch_id, file_count, bytes_freed, status, mode, trash_dir)
+            VALUES (?, 1, 1000, 'planned', 'conservative', ?)
+            """,
+            (batch_id, str(trash_dir)),
+        )
+        conn.execute(
+            """
+            INSERT INTO deletion_journal (batch_id, original_path, trash_path, md5, size, cluster_id, keeper_id, status, is_manual, image_id)
+            VALUES (?, 'drive://root/sample.jpg', 'trash/sample.jpg', 'dummy_md5', 1000, 1, 1, 'planned', 0, 2)
+            """,
+            (batch_id,),
+        )
+        conn.commit()
+
+        d_res = dry_run(conn, batch_id)
+        assert d_res.refused_count == 1
+        assert "read-only cloud source" in d_res.refusals[0]["reason"]
+
+        exec_res = execute(conn, batch_id, confirm=True)
+        assert exec_res.refused_count == 1
+        assert exec_res.moved_count == 0
+        assert "read-only cloud source" in exec_res.refusals[0]["reason"]
+
 
 class TestLedgerCLI:
     def test_cli_lifecycle_plan_apply_undo_history(self, test_setup, monkeypatch, capsys):

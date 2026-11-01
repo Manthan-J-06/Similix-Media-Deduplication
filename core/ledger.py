@@ -384,6 +384,15 @@ def plan(
                 })
                 continue
 
+            if str(m.get("file_path", "")).startswith("drive://"):
+                skipped_entries.append({
+                    "image_id": mid,
+                    "cluster_id": cid,
+                    "file_path": m.get("file_path", ""),
+                    "reason": "read-only cloud source (Google Drive)",
+                })
+                continue
+
             is_manual = mid in manual_set
 
             if is_manual:
@@ -559,6 +568,14 @@ def dry_run(conn: sqlite3.Connection, batch_id: str) -> DryRunResult:
                 })
                 continue
 
+            if str(e["original_path"]).startswith("drive://"):
+                refusals.append({
+                    "entry_id": e["id"],
+                    "path": e["original_path"],
+                    "reason": "read-only cloud source (Google Drive)",
+                })
+                continue
+
             orig_p = Path(e["original_path"])
             # 1. Existence check
             if not orig_p.exists():
@@ -712,6 +729,15 @@ def execute(
 
             if img and img["status"] == "trashed":
                 msg = "already trashed"
+                conn.execute(
+                    "UPDATE deletion_journal SET status = 'refused', reason = ? WHERE id = ?",
+                    (msg, e["id"]),
+                )
+                refusals.append({"entry_id": e["id"], "path": e["original_path"], "reason": msg})
+                continue
+
+            if str(e["original_path"]).startswith("drive://"):
+                msg = "read-only cloud source (Google Drive)"
                 conn.execute(
                     "UPDATE deletion_journal SET status = 'refused', reason = ? WHERE id = ?",
                     (msg, e["id"]),

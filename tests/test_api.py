@@ -190,6 +190,7 @@ def api_test_env(tmp_path: Path):
         auth_db_path=auth_db,
         users_dir=users_dir,
     )
+    app.state.data_root = tmp_path
     if 1 in app.state.custom_user_overrides:
         app.state.custom_user_overrides[1]["root"] = tmp_path
 
@@ -1955,6 +1956,8 @@ class TestPipelineResumable:
 
     def test_drive_web_oauth_flow(self, api_test_env, tmp_path, monkeypatch):
         """Test Drive web OAuth flow, PKCE, admin message, user-isolated tokens, disconnect."""
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.setattr("sources.google_drive.DEFAULT_TOKEN_PATH", str(tmp_path / "drive_token.json"))
         client = api_test_env["client"]
         app = api_test_env["app"]
 

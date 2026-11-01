@@ -915,8 +915,9 @@ class TestDriveThumbnailConcurrencyAndCaching:
 class TestDriveAdminConfig:
     """Tests for Drive admin configuration — find_drive_client_secret, redirect URI, and callback."""
 
-    def test_find_drive_client_secret_returns_searched_paths(self, tmp_path: Path):
+    def test_find_drive_client_secret_returns_searched_paths(self, tmp_path: Path, monkeypatch):
         """find_drive_client_secret must return a 3-tuple with searched paths list."""
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
         from api.server import find_drive_client_secret
 
         # No secret file exists anywhere in tmp_path
@@ -1036,8 +1037,10 @@ class TestDriveAdminConfig:
             )
             assert resp.status_code == 400
 
-    def test_drive_status_shows_searched_paths_when_not_configured(self, tmp_path: Path):
+    def test_drive_status_shows_searched_paths_when_not_configured(self, tmp_path: Path, monkeypatch):
         """GET /drive/status must include searched paths in the message when not configured."""
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.setattr("sources.google_drive.DEFAULT_TOKEN_PATH", str(tmp_path / "drive_token.json"))
         from fastapi.testclient import TestClient
         from api.server import create_app
         from core.config import load_config
