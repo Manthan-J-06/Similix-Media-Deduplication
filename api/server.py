@@ -2388,6 +2388,49 @@ def create_app(
             user_tok_path.unlink(missing_ok=True)
         return {"connected": False}
 
+    @app.post("/drive/configure")
+    async def configure_drive(
+        file: UploadFile = File(...),
+        request: Request = None,
+        user: UserContext = Depends(get_current_user),
+    ) -> dict[str, Any]:
+        """Upload and configure Google OAuth client_secret.json directly from the UI."""
+        cfg = getattr(request.app.state, "config", {}) or {}
+        hosted_mode = bool(cfg.get("hosted_mode", False) or cfg.get("general", {}).get("hosted_mode", False))
+        if "HOSTED_MODE" in os.environ:
+            hosted_mode = os.environ.get("HOSTED_MODE", "").lower() in ("true", "1", "yes")
+        if hosted_mode and os.environ.get("ARGUS_ENABLE_DRIVE") != "1":
+            raise HTTPException(status_code=403, detail="Google Drive integration is disabled in hosted mode.")
+
+        try:
+            content = await file.read(1024 * 1024)
+            data = json.loads(content.decode("utf-8"))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON file: {exc}")
+
+        info = data.get("web") or data.get("installed") or {}
+        if not info.get("client_id") or not info.get("client_secret"):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid Google OAuth secret file: missing client_id or client_secret.",
+            )
+
+        data_root = getattr(request.app.state, "data_root", None)
+        target_dir = data_root if data_root else Path(os.environ.get("ARGUS_DATA_DIR", "~/.argus")).expanduser()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        dest_file = target_dir / "client_secret.json"
+
+        dest_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        try:
+            dest_file.chmod(0o600)
+        except OSError:
+            pass
+
+        return {
+            "configured": True,
+            "message": "Google Drive integration configured successfully.",
+        }
+
     @app.post("/sources/drive")
     def add_drive_source(
         req: DriveSourceRequest,

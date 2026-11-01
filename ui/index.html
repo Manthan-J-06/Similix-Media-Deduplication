@@ -1259,6 +1259,19 @@
               <p style="font-size:0.82rem; color:var(--text-muted); margin-bottom:10px;">Connect Google Drive with read-only access to scan folders for duplicates.</p>
               <button type="button" class="btn btn-primary" id="btn-connect-drive">Connect Google Drive</button>
             </div>
+            <div id="drive-configure-box" style="display:none; margin-top:12px; padding:10px 12px; background:rgba(255,255,255,0.02); border:1px dashed var(--border); border-radius:6px;">
+              <div style="font-size:0.83rem; font-weight:600; margin-bottom:4px;">Upload Credentials from Browser</div>
+              <div style="font-size:0.78rem; color:var(--text-muted); margin-bottom:8px;">
+                Upload your <code>client_secret.json</code> file downloaded from Google Cloud Console:
+              </div>
+              <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                <input type="file" id="drive-secret-file-input" accept=".json,application/json" style="display:none;">
+                <button type="button" class="btn" id="btn-choose-drive-secret" style="font-size:0.82rem; padding:4px 10px;">📁 Choose client_secret.json</button>
+                <span id="drive-secret-filename" style="font-size:0.8rem; color:var(--text-muted);">No file chosen</span>
+                <button type="button" class="btn btn-primary" id="btn-save-drive-secret" style="font-size:0.82rem; padding:4px 12px; display:none;">Upload & Activate</button>
+              </div>
+              <div id="drive-configure-status" style="display:none; font-size:0.78rem; margin-top:6px;"></div>
+            </div>
             <div id="drive-connected-view" style="display:none; align-items:center; justify-content:space-between; gap:10px;">
               <span style="font-size:0.85rem; color:var(--success); font-weight:500;" id="drive-connected-user">Connected as ...</span>
               <button type="button" class="btn" id="btn-disconnect-drive" style="padding:4px 10px; font-size:0.8rem;">Disconnect</button>
@@ -2850,11 +2863,13 @@
       const connectView = document.getElementById("drive-connect-view");
       const connectedView = document.getElementById("drive-connected-view");
       const connectedUser = document.getElementById("drive-connected-user");
+      const configureBox = document.getElementById("drive-configure-box");
       const btnConnect = document.getElementById("btn-connect-drive");
       const btnScan = document.getElementById("btn-scan-drive");
 
       if (!msgEl || !connectView || !connectedView) return;
       msgEl.style.display = "none";
+      if (configureBox) configureBox.style.display = "none";
 
       try {
         const res = await fetch("/drive/status");
@@ -2863,6 +2878,7 @@
         if (!data.enabled) {
           connectView.style.display = "block";
           connectedView.style.display = "none";
+          if (configureBox) configureBox.style.display = "none";
           if (btnConnect) btnConnect.disabled = true;
           if (btnScan) btnScan.disabled = true;
           msgEl.style.display = "block";
@@ -2876,6 +2892,7 @@
         if (!data.configured) {
           connectView.style.display = "block";
           connectedView.style.display = "none";
+          if (configureBox) configureBox.style.display = "block";
           if (btnConnect) btnConnect.disabled = true;
           if (btnScan) btnScan.disabled = true;
           msgEl.style.display = "block";
@@ -2886,6 +2903,7 @@
           return;
         }
 
+        if (configureBox) configureBox.style.display = "none";
         if (btnConnect) btnConnect.disabled = false;
         if (data.connected) {
           connectView.style.display = "none";
@@ -2966,6 +2984,75 @@
       history.replaceState(null, "", window.location.pathname + window.location.search);
       showInlineNotice("Google Drive connected successfully!", "success");
       updateDriveAuthStatus();
+    }
+
+    // Google Drive credentials upload from frontend
+    const btnChooseSecret = document.getElementById("btn-choose-drive-secret");
+    const secretFileInput = document.getElementById("drive-secret-file-input");
+    const secretFilename = document.getElementById("drive-secret-filename");
+    const btnSaveSecret = document.getElementById("btn-save-drive-secret");
+    const secretStatus = document.getElementById("drive-configure-status");
+
+    if (btnChooseSecret && secretFileInput) {
+      btnChooseSecret.addEventListener("click", () => secretFileInput.click());
+      secretFileInput.addEventListener("change", () => {
+        const file = secretFileInput.files[0];
+        if (file) {
+          if (secretFilename) secretFilename.textContent = file.name;
+          if (btnSaveSecret) btnSaveSecret.style.display = "inline-block";
+          if (secretStatus) secretStatus.style.display = "none";
+        } else {
+          if (secretFilename) secretFilename.textContent = "No file chosen";
+          if (btnSaveSecret) btnSaveSecret.style.display = "none";
+        }
+      });
+    }
+
+    if (btnSaveSecret && secretFileInput) {
+      btnSaveSecret.addEventListener("click", async () => {
+        const file = secretFileInput.files[0];
+        if (!file) return;
+
+        btnSaveSecret.disabled = true;
+        btnSaveSecret.textContent = "Uploading...";
+        if (secretStatus) secretStatus.style.display = "none";
+
+        try {
+          const csrf = await getCsrfToken();
+          const formData = new FormData();
+          formData.append("file", file);
+
+          const res = await fetch("/drive/configure", {
+            method: "POST",
+            headers: {
+              "X-CSRF-Token": csrf,
+            },
+            body: formData,
+          });
+
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            throw new Error(data.detail || "Failed to configure Google Drive credentials");
+          }
+
+          if (secretStatus) {
+            secretStatus.style.display = "block";
+            secretStatus.style.color = "var(--success)";
+            secretStatus.textContent = "✓ Credentials activated! You can now connect Google Drive.";
+          }
+          showInlineNotice("Google Drive client_secret.json configured!", "success");
+          await updateDriveAuthStatus();
+        } catch (err) {
+          if (secretStatus) {
+            secretStatus.style.display = "block";
+            secretStatus.style.color = "var(--danger)";
+            secretStatus.textContent = err.message || "Upload failed";
+          }
+        } finally {
+          btnSaveSecret.disabled = false;
+          btnSaveSecret.textContent = "Upload & Activate";
+        }
+      });
     }
 
     // Tab 2: Google Drive Scan

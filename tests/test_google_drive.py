@@ -1021,3 +1021,66 @@ class TestDriveAdminConfig:
             # The message should mention the searched paths
             msg = data.get("message", "")
             assert "Searched" in msg or "not configured" in msg
+
+    def test_configure_drive_via_frontend_upload(self, tmp_path: Path):
+        """POST /drive/configure uploads client_secret.json and enables Drive integration."""
+        from fastapi.testclient import TestClient
+        from api.server import create_app
+        from core.config import load_config
+
+        cfg = load_config()
+        data_dir = tmp_path / "argus_data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+
+        with patch.dict(os.environ, {"ARGUS_DATA_DIR": str(data_dir), "SECRET_KEY": "testsecretkey12345678901234567890"}):
+            app = create_app(config=cfg)
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            reg = client.post("/auth/register", json={"email": "conf_test@example.com", "password": "TestPass123!"})
+            if reg.status_code not in (200, 201):
+                pytest.skip("Registration not available in test config")
+
+            login = client.post("/auth/login", json={"email": "conf_test@example.com", "password": "TestPass123!"})
+            if login.status_code != 200:
+                pytest.skip("Login not available in test config")
+
+            login_data = login.json()
+            token = login_data.get("token")
+            csrf = login_data.get("csrf_token")
+            if token:
+                client.cookies.set("argus_session", token)
+            if csrf:
+                client.headers["X-CSRF-Token"] = csrf
+
+            # Upload invalid file (missing client_id)
+            bad_json = json.dumps({"foo": "bar"}).encode("utf-8")
+            bad_resp = client.post(
+                "/drive/configure",
+                files={"file": ("bad_secret.json", io.BytesIO(bad_json), "application/json")},
+            )
+            assert bad_resp.status_code == 400
+
+            # Upload valid client_secret.json
+            valid_secret = json.dumps({
+                "web": {
+                    "client_id": "uploaded_web_client_id",
+                    "client_secret": "uploaded_web_client_secret",
+                    "redirect_uris": ["http://localhost:8000/drive/callback"],
+                }
+            }).encode("utf-8")
+
+            good_resp = client.post(
+                "/drive/configure",
+                files={"file": ("client_secret.json", io.BytesIO(valid_secret), "application/json")},
+            )
+            assert good_resp.status_code == 200
+            assert good_resp.json()["configured"] is True
+
+            # Verify saved file exists on disk
+            saved_secret = data_dir / "client_secret.json"
+            assert saved_secret.is_file()
+
+            # Verify /drive/status now reports configured = True
+            st_resp = client.get("/drive/status")
+            assert st_resp.status_code == 200
+            assert st_resp.json()["configured"] is True
