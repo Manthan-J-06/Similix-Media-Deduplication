@@ -2173,8 +2173,6 @@ def create_app(
         data_root = getattr(request.app.state, "data_root", None)
         sec_path, _, searched_paths = find_drive_client_secret(cfg, data_root)
         if not sec_path:
-            searched_str = ", ".join(str(p) for p in searched_paths)
-            suggest = str(searched_paths[0]) if searched_paths else "the data directory"
             return {
                 "enabled": True,
                 "configured": False,
@@ -2182,9 +2180,8 @@ def create_app(
                 "email": None,
                 "account_email": None,
                 "message": (
-                    f"Google Drive integration is not configured. An administrator must provide client_secret.json in the data directory. "
-                    f"client_secret.json not found. Searched: {searched_str}. "
-                    f"Place it in {suggest}."
+                    "Google Drive integration is not configured. "
+                    "An administrator must provide client_secret.json in the data directory."
                 ),
             }
 
@@ -2229,14 +2226,11 @@ def create_app(
         data_root = getattr(request.app.state, "data_root", None)
         sec_path, sec_info, searched_paths = find_drive_client_secret(cfg, data_root)
         if not sec_path or not sec_info:
-            searched_str = ", ".join(str(p) for p in searched_paths)
-            suggest = str(searched_paths[0]) if searched_paths else "the data directory"
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    f"Google Drive integration is not configured. An administrator must provide client_secret.json in the data directory. "
-                    f"client_secret.json not found. Searched: {searched_str}. "
-                    f"Place it in {suggest}."
+                    "Google Drive integration is not configured. "
+                    "An administrator must provide client_secret.json in the data directory."
                 ),
             )
 
