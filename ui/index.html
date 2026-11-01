@@ -2051,16 +2051,20 @@
     async function buildAndShowPlanModal() {
       if (!currentClusterData) return;
 
-      // Determine excluded IDs: in this cluster, any non-keeper member NOT in selectedImageIds is excluded
+      // Determine excluded IDs and manual selection IDs
       const excludedIds = [];
+      const manualIds = [];
       currentClusterData.members.forEach(m => {
         if (!m.is_recommended_keeper && !selectedImageIds.has(m.id)) {
           excludedIds.push(m.id);
+        } else if (selectedImageIds.has(m.id)) {
+          manualIds.push(m.id);
         }
       });
 
       const payload = {
         mode: currentMode,
+        manual_member_ids: manualIds,
         approved_swap_cluster_ids: Array.from(approvedSwapClusterIds),
         excluded_ids: excludedIds,
       };

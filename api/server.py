@@ -122,6 +122,7 @@ class PlanRequest(BaseModel):
     mode: str = "conservative"
     approved_swap_cluster_ids: list[int] = Field(default_factory=list)
     excluded_ids: list[int] = Field(default_factory=list)
+    manual_member_ids: list[int] = Field(default_factory=list)
     model_config = ConfigDict(extra="ignore")
 
 
@@ -1877,6 +1878,20 @@ def create_app(
                     detail=f"Image ID(s) not currently a member of a cluster: {invalid_ids}",
                 )
 
+        if req.manual_member_ids:
+            placeholders = ",".join("?" for _ in req.manual_member_ids)
+            rows = conn.execute(
+                f"SELECT id FROM images WHERE id IN ({placeholders}) AND cluster_id IS NOT NULL",
+                req.manual_member_ids,
+            ).fetchall()
+            found_ids = {r[0] for r in rows}
+            invalid_ids = [mid for mid in req.manual_member_ids if mid not in found_ids]
+            if invalid_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Image ID(s) not currently a member of a cluster: {invalid_ids}",
+                )
+
         if req.approved_swap_cluster_ids:
             c_placeholders = ",".join("?" for _ in req.approved_swap_cluster_ids)
             c_rows = conn.execute(
@@ -1895,6 +1910,7 @@ def create_app(
             summary = plan(
                 conn=conn,
                 mode=req.mode,
+                manual_member_ids=req.manual_member_ids,
                 approved_swap_cluster_ids=req.approved_swap_cluster_ids,
                 excluded_ids=req.excluded_ids,
                 config=request.app.state.config,

@@ -438,6 +438,17 @@ class TestAPIServer:
         assert 2 not in planned_ids
         assert 5 in planned_ids
 
+    def test_plan_accepts_manual_member_ids(self, api_test_env):
+        """POST /plan honors manual_member_ids for explicit user deletions."""
+        client = api_test_env["client"]
+        res = client.post("/plan", json={"mode": "conservative", "manual_member_ids": [2]})
+        assert res.status_code == 200
+        data = res.json()
+        planned_ids = [e["image_id"] for e in data["entries"]]
+        assert 2 in planned_ids
+        entry_2 = next(e for e in data["entries"] if e["image_id"] == 2)
+        assert "Manual user selection" in entry_2["reason"] or entry_2.get("is_manual")
+
     def test_apply_without_confirm_fails_and_does_nothing(self, api_test_env):
         """POST /apply requires confirm=True; otherwise returns 400 and modifies nothing."""
         client = api_test_env["client"]
