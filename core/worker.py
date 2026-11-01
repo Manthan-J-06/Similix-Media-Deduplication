@@ -329,9 +329,9 @@ def run_pipeline(
 
         if source_type == "drive":
             from sources.google_drive import GoogleDriveSource
-            user_tok = db_path.parent / "drive_token.json"
+            user_tok = resolved_db.parent / "drive_token.json"
             tok_path = user_tok if user_tok.exists() else None
-            cache_p = db_path.parent / "drive_cache"
+            cache_p = resolved_db.parent / "drive_cache"
             source0 = GoogleDriveSource(
                 folder_id=drive_folder_id,
                 conn=conn,
