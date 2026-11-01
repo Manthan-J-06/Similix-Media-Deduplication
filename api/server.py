@@ -2247,9 +2247,10 @@ def create_app(
         code_challenge = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
         state = secrets.token_urlsafe(32)
 
-        base = os.environ.get("BASE_URL")
-        if not base:
-            base = str(request.base_url).rstrip("/")
+        base = os.environ.get("BASE_URL", "").rstrip("/")
+        req_base = str(request.base_url).rstrip("/")
+        if not base or ("localhost" in base and "127.0.0.1" in req_base) or ("127.0.0.1" in base and "localhost" in req_base):
+            base = req_base
         redirect_uri = f"{base}/drive/callback"
 
         if not hasattr(request.app.state, "drive_oauth_states"):
@@ -2287,9 +2288,16 @@ def create_app(
     def drive_callback(
         code: str = Query(None),
         state: str = Query(None),
+        error: str = Query(None),
         request: Request = None,
-        user: UserContext = Depends(get_current_user),
     ) -> Response:
+        if error:
+            logger.warning("Google Drive OAuth error returned: %s", error)
+            return RedirectResponse(
+                url=f"/#drive=error&detail={urllib.parse.quote(error)}",
+                status_code=303,
+            )
+
         if not code or not state:
             raise HTTPException(status_code=400, detail="Missing code or state parameter")
 
@@ -2299,8 +2307,19 @@ def create_app(
             raise HTTPException(status_code=400, detail="Invalid or expired OAuth state")
 
         user_id = state_info["user_id"]
-        if user.id != user_id:
-            raise HTTPException(status_code=403, detail="OAuth user mismatch")
+
+        # Validate caller session if cookie is present; prevent user hijacking
+        current_user = None
+        try:
+            current_user = get_current_user(request)
+            if current_user and current_user.id != user_id:
+                raise HTTPException(status_code=403, detail="OAuth user mismatch")
+        except HTTPException as exc:
+            if exc.status_code == 403:
+                raise
+            # Session cookie may have been omitted by browser across cross-origin/redirect navigation
+            current_user = None
+
         code_verifier = state_info["code_verifier"]
         redirect_uri = state_info["redirect_uri"]
 
@@ -2371,7 +2390,23 @@ def create_app(
         except OSError:
             pass
 
-        return RedirectResponse(url="/#drive=connected", status_code=303)
+        resp = RedirectResponse(url="/#drive=connected", status_code=303)
+        if not current_user and hasattr(request.app.state, "auth_conn") and request.app.state.auth_conn:
+            try:
+                raw_token, _ = create_session(request.app.state.auth_conn, user_id)
+                proto = request.headers.get("x-forwarded-proto", "").lower()
+                is_secure = (proto == "https") or (request.url.scheme == "https")
+                resp.set_cookie(
+                    key="argus_session",
+                    value=raw_token,
+                    max_age=7 * 24 * 3600,
+                    httponly=True,
+                    samesite="lax",
+                    secure=is_secure,
+                )
+            except Exception:
+                pass
+        return resp
 
     @app.post("/drive/disconnect")
     def disconnect_drive(
