@@ -88,11 +88,11 @@ class ImageSource(ABC):
             with lock:
                 completed += 1
                 cur = completed
-            if progress_callback is not None:
-                try:
-                    progress_callback(cur, total, fid)
-                except Exception:
-                    pass
+                if progress_callback is not None:
+                    try:
+                        progress_callback(cur, total, fid)
+                    except Exception:
+                        pass
             return fid, img
 
         workers = min(max_workers, max(1, total))

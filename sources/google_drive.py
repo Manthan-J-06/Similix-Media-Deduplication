@@ -25,6 +25,7 @@ import re
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -199,6 +200,9 @@ def get_drive_service(
     return build("drive", "v3", credentials=credentials, cache_discovery=False)
 
 
+_db_lock = threading.RLock()
+
+
 def record_bandwidth(
     conn: sqlite3.Connection | None,
     stage: str,
@@ -210,14 +214,15 @@ def record_bandwidth(
     if conn is None or bytes_count <= 0:
         return
     try:
-        conn.execute(
-            """
-            INSERT INTO drive_bandwidth (stage, file_id, bytes_downloaded, item_type)
-            VALUES (?, ?, ?, ?)
-            """,
-            (stage, file_id, bytes_count, item_type),
-        )
-        conn.commit()
+        with _db_lock:
+            conn.execute(
+                """
+                INSERT INTO drive_bandwidth (stage, file_id, bytes_downloaded, item_type)
+                VALUES (?, ?, ?, ?)
+                """,
+                (stage, file_id, bytes_count, item_type),
+            )
+            conn.commit()
     except Exception as exc:
         logger.debug("Failed to record drive bandwidth: %s", exc)
 
@@ -315,40 +320,44 @@ class GoogleDriveSource(ImageSource):
         self.skipped_files: list[tuple[str, str]] = []
         self._metadata_cache: dict[str, ImageMetadata] = {}
         self._drive_item_cache: dict[str, dict[str, Any]] = {}
+        self._cache_lock = threading.RLock()
+        self._api_lock = threading.RLock()
+        self._db_lock = _db_lock
 
     def _enforce_cache_cap(self, incoming_bytes: int = 0) -> None:
         """
         Enforce max_cache_bytes limit on cache_dir using LRU eviction based on access time (st_atime).
         """
-        if not self.cache_dir.exists():
-            return
+        with self._cache_lock:
+            if not self.cache_dir.exists():
+                return
 
-        entries: list[tuple[float, int, Path]] = []
-        total_size = 0
-        try:
-            for p in self.cache_dir.iterdir():
-                if p.is_file() and not p.name.startswith("."):
-                    stat = p.stat()
-                    entries.append((stat.st_atime, stat.st_size, p))
-                    total_size += stat.st_size
-        except OSError:
-            return
-
-        target_size = self.max_cache_bytes - incoming_bytes
-        if total_size <= target_size:
-            return
-
-        # Sort by access time ascending (oldest accessed first = LRU)
-        entries.sort(key=lambda x: x[0])
-
-        for atime, size, path in entries:
+            entries: list[tuple[float, int, Path]] = []
+            total_size = 0
             try:
-                path.unlink(missing_ok=True)
-                total_size -= size
+                for p in self.cache_dir.iterdir():
+                    if p.is_file() and not p.name.startswith("."):
+                        stat = p.stat()
+                        entries.append((stat.st_atime, stat.st_size, p))
+                        total_size += stat.st_size
             except OSError:
-                pass
+                return
+
+            target_size = self.max_cache_bytes - incoming_bytes
             if total_size <= target_size:
-                break
+                return
+
+            # Sort by access time ascending (oldest accessed first = LRU)
+            entries.sort(key=lambda x: x[0])
+
+            for atime, size, path in entries:
+                try:
+                    path.unlink(missing_ok=True)
+                    total_size -= size
+                except OSError:
+                    pass
+                if total_size <= target_size:
+                    break
 
     @property
     def service(self) -> Any:
@@ -483,23 +492,26 @@ class GoogleDriveSource(ImageSource):
 
     def get_metadata(self, file_id: str) -> ImageMetadata:
         """Return ImageMetadata from cache or directly via Google Drive API."""
-        if file_id in self._metadata_cache:
-            return self._metadata_cache[file_id]
+        with self._cache_lock:
+            if file_id in self._metadata_cache:
+                return self._metadata_cache[file_id]
 
-        drive_id, name = self.parse_file_id(file_id)
-        if drive_id in self._metadata_cache:
-            return self._metadata_cache[drive_id]
+            drive_id, name = self.parse_file_id(file_id)
+            if drive_id in self._metadata_cache:
+                return self._metadata_cache[drive_id]
 
         # Fetch metadata from API
-        req = self.service.files().get(
-            fileId=drive_id,
-            fields="id, name, mimeType, size, md5Checksum, modifiedTime, imageMediaMetadata(width,height), thumbnailLink, parents, trashed",
-            supportsAllDrives=True,
-        )
-        item = retry_with_backoff(lambda: req.execute())
+        with self._api_lock:
+            req = self.service.files().get(
+                fileId=drive_id,
+                fields="id, name, mimeType, size, md5Checksum, modifiedTime, imageMediaMetadata(width,height), thumbnailLink, parents, trashed",
+                supportsAllDrives=True,
+            )
+            item = retry_with_backoff(lambda: req.execute())
         res_bytes = len(json.dumps(item).encode("utf-8"))
         record_bandwidth(self.conn, self.stage, drive_id, res_bytes, "metadata")
-        self._drive_item_cache[drive_id] = item
+        with self._cache_lock:
+            self._drive_item_cache[drive_id] = item
 
         mtime_raw = item.get("modifiedTime")
         mtime_ts = 0.0
@@ -535,23 +547,26 @@ class GoogleDriveSource(ImageSource):
             source="gdrive",
             drive_id=drive_id,
         )
-        self._metadata_cache[virtual_path] = meta
-        self._metadata_cache[drive_id] = meta
+        with self._cache_lock:
+            self._metadata_cache[virtual_path] = meta
+            self._metadata_cache[drive_id] = meta
         return meta
 
     def _fetch_fresh_thumbnail_link(self, drive_id: str) -> str | None:
         """Request fresh thumbnailLink when existing link expired."""
-        req = self.service.files().get(
-            fileId=drive_id,
-            fields="thumbnailLink",
-            supportsAllDrives=True,
-        )
-        item = retry_with_backoff(lambda: req.execute())
+        with self._api_lock:
+            req = self.service.files().get(
+                fileId=drive_id,
+                fields="thumbnailLink",
+                supportsAllDrives=True,
+            )
+            item = retry_with_backoff(lambda: req.execute())
         res_bytes = len(json.dumps(item).encode("utf-8"))
         record_bandwidth(self.conn, self.stage, drive_id, res_bytes, "metadata")
         link = item.get("thumbnailLink")
-        if drive_id in self._drive_item_cache and link:
-            self._drive_item_cache[drive_id]["thumbnailLink"] = link
+        with self._cache_lock:
+            if drive_id in self._drive_item_cache and link:
+                self._drive_item_cache[drive_id]["thumbnailLink"] = link
         return link
 
     def _download_thumbnail_bytes(
@@ -626,12 +641,44 @@ class GoogleDriveSource(ImageSource):
         3 retries with backoff, and report "N of M" after every file.
         Cache by file id + modifiedTime; skip files already processed.
         """
-        import threading
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         total = len(file_ids)
         if total == 0:
             return {}
+
+        # Preload metadata / mtime for the requested files to avoid concurrent DB queries
+        if self.conn is not None:
+            with self._cache_lock:
+                missing_paths = [
+                    fid for fid in file_ids
+                    if fid not in self._metadata_cache and self.parse_file_id(fid)[0] not in self._metadata_cache
+                ]
+            if missing_paths:
+                with self._db_lock:
+                    try:
+                        for i in range(0, len(missing_paths), 500):
+                            chunk = missing_paths[i : i + 500]
+                            placeholders = ",".join("?" for _ in chunk)
+                            cursor = self.conn.execute(
+                                f"SELECT file_path, drive_id, modified_time FROM images WHERE file_path IN ({placeholders})",
+                                chunk,
+                            )
+                            with self._cache_lock:
+                                for r_path, r_did, r_mtime in cursor.fetchall():
+                                    m_ts = float(r_mtime or 0.0)
+                                    meta = ImageMetadata(
+                                        file_id=r_path,
+                                        file_size=0,
+                                        modified_time=m_ts,
+                                        drive_id=r_did,
+                                        source="gdrive",
+                                    )
+                                    self._metadata_cache[r_path] = meta
+                                    if r_did:
+                                        self._metadata_cache[r_did] = meta
+                    except Exception as exc:
+                        logger.debug("Failed to preload metadata: %s", exc)
 
         results: dict[str, Image.Image] = {}
         completed = 0
@@ -647,11 +694,11 @@ class GoogleDriveSource(ImageSource):
             with lock:
                 completed += 1
                 cur = completed
-            if progress_callback is not None:
-                try:
-                    progress_callback(cur, total, fid)
-                except Exception:
-                    pass
+                if progress_callback is not None:
+                    try:
+                        progress_callback(cur, total, fid)
+                    except Exception:
+                        pass
             return fid, img
 
         workers = min(max(1, max_workers), max(1, total))
@@ -676,35 +723,48 @@ class GoogleDriveSource(ImageSource):
 
         # Determine mtime
         mtime = 0
-        if drive_id in self._metadata_cache:
-            mtime = int(self._metadata_cache[drive_id].modified_time)
+        with self._cache_lock:
+            meta = self._metadata_cache.get(drive_id) or self._metadata_cache.get(file_id)
+        if meta and meta.modified_time:
+            mtime = int(meta.modified_time)
         elif self.conn is not None:
-            row = self.conn.execute(
-                "SELECT modified_time FROM images WHERE drive_id = ? OR file_path = ? LIMIT 1",
-                (drive_id, file_id),
-            ).fetchone()
-            if row and row[0]:
-                mtime = int(row[0])
+            with self._db_lock:
+                try:
+                    row = self.conn.execute(
+                        "SELECT modified_time FROM images WHERE drive_id = ? OR file_path = ? LIMIT 1",
+                        (drive_id, file_id),
+                    ).fetchone()
+                    if row and row[0]:
+                        mtime = int(row[0])
+                except Exception as exc:
+                    logger.debug("Failed to fetch mtime for %s: %s", file_id, exc)
 
         cache_path = self.cache_dir / f"{drive_id}_{mtime}.jpg"
 
         # Check local cache
-        if cache_path.exists() and cache_path.stat().st_size > 0:
+        if cache_path.exists():
             try:
-                # Update atime to now for LRU tracking
-                now = time.time()
-                os.utime(cache_path, (now, now))
-                with Image.open(cache_path) as img:
-                    thumb = img.convert("RGB")
-                    thumb.thumbnail(size, Image.Resampling.LANCZOS)
-                    return thumb
+                if cache_path.stat().st_size > 0:
+                    with Image.open(cache_path) as img:
+                        thumb = img.convert("RGB")
+                        thumb.thumbnail(size, Image.Resampling.LANCZOS)
+                        try:
+                            now = time.time()
+                            os.utime(cache_path, (now, now))
+                        except OSError:
+                            pass
+                        return thumb
             except Exception:
-                cache_path.unlink(missing_ok=True)
+                try:
+                    cache_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
         # Retrieve thumbnailLink
         link = None
-        if drive_id in self._drive_item_cache:
-            link = self._drive_item_cache[drive_id].get("thumbnailLink")
+        with self._cache_lock:
+            if drive_id in self._drive_item_cache:
+                link = self._drive_item_cache[drive_id].get("thumbnailLink")
 
         raw_bytes = None
         if link:
@@ -730,6 +790,14 @@ class GoogleDriveSource(ImageSource):
             if raw_bytes is None:
                 raise OSError(f"Failed to download fresh thumbnail for file {drive_id}")
 
+        # Decode and verify image bytes before caching
+        try:
+            with Image.open(io.BytesIO(raw_bytes)) as img:
+                thumb = img.convert("RGB")
+                thumb.thumbnail(size, Image.Resampling.LANCZOS)
+        except Exception as exc:
+            raise OSError(f"Failed to decode thumbnail bytes for {drive_id}: {exc}") from exc
+
         # Record bandwidth
         record_bandwidth(self.conn, self.stage, drive_id, len(raw_bytes), "thumbnail")
 
@@ -737,20 +805,24 @@ class GoogleDriveSource(ImageSource):
         self._enforce_cache_cap(incoming_bytes=len(raw_bytes))
 
         # Save to cache atomically
-        tmp_cache = self.cache_dir / f".tmp_{drive_id}_{os.getpid()}_{time.time_ns()}.jpg"
+        tmp_cache = self.cache_dir / f".tmp_{drive_id}_{os.getpid()}_{threading.get_ident()}_{time.time_ns()}.jpg"
         try:
             tmp_cache.write_bytes(raw_bytes)
             os.replace(tmp_cache, cache_path)
-            now = time.time()
-            os.utime(cache_path, (now, now))
-        except Exception:
+            try:
+                now = time.time()
+                os.utime(cache_path, (now, now))
+            except OSError:
+                pass
+        except Exception as exc:
+            logger.debug("Failed saving cache for %s: %s", drive_id, exc)
             if tmp_cache.exists():
-                tmp_cache.unlink(missing_ok=True)
+                try:
+                    tmp_cache.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
-        with Image.open(io.BytesIO(raw_bytes)) as img:
-            thumb = img.convert("RGB")
-            thumb.thumbnail(size, Image.Resampling.LANCZOS)
-            return thumb
+        return thumb
 
     def get_bytes(self, file_id: str) -> bytes:
         """
@@ -762,10 +834,11 @@ class GoogleDriveSource(ImageSource):
 
         # Security check: must be a member of a cluster
         if self.conn is not None:
-            row = self.conn.execute(
-                "SELECT cluster_id FROM images WHERE (drive_id = ? OR file_path = ?) LIMIT 1",
-                (drive_id, file_id),
-            ).fetchone()
+            with self._db_lock:
+                row = self.conn.execute(
+                    "SELECT cluster_id FROM images WHERE (drive_id = ? OR file_path = ?) LIMIT 1",
+                    (drive_id, file_id),
+                ).fetchone()
             if not row or row[0] is None:
                 raise PermissionError(
                     f"Security Invariant: Cannot download full file for unclustered image: {file_id}"
@@ -776,7 +849,8 @@ class GoogleDriveSource(ImageSource):
             )
 
         # Check metadata size cap before downloading
-        meta = self._metadata_cache.get(drive_id) or self._metadata_cache.get(file_id)
+        with self._cache_lock:
+            meta = self._metadata_cache.get(drive_id) or self._metadata_cache.get(file_id)
         if meta and meta.file_size > self.max_file_download_size:
             raise ValueError(
                 f"File {file_id} size ({meta.file_size} bytes) exceeds download cap ({self.max_file_download_size} bytes)"
@@ -784,7 +858,6 @@ class GoogleDriveSource(ImageSource):
 
         from googleapiclient.http import MediaIoBaseDownload
 
-        req = self.service.files().get_media(fileId=drive_id, supportsAllDrives=True)
         tmp_fd, tmp_path_str = tempfile.mkstemp(
             prefix=f"argus_stream_{drive_id}_",
             dir=str(self.temp_dir) if self.temp_dir else None,
@@ -793,15 +866,17 @@ class GoogleDriveSource(ImageSource):
         tmp_path = Path(tmp_path_str)
 
         try:
-            with open(tmp_path, "wb") as fh:
-                downloader = MediaIoBaseDownload(fh, req, chunksize=1024 * 1024)
-                done = False
-                while not done:
-                    status, done = retry_with_backoff(lambda: downloader.next_chunk())
-                    if status and status.resumable_progress > self.max_file_download_size:
-                        raise ValueError(
-                            f"Streaming download exceeded size cap ({self.max_file_download_size} bytes)"
-                        )
+            with self._api_lock:
+                req = self.service.files().get_media(fileId=drive_id, supportsAllDrives=True)
+                with open(tmp_path, "wb") as fh:
+                    downloader = MediaIoBaseDownload(fh, req, chunksize=1024 * 1024)
+                    done = False
+                    while not done:
+                        status, done = retry_with_backoff(lambda: downloader.next_chunk())
+                        if status and status.resumable_progress > self.max_file_download_size:
+                            raise ValueError(
+                                f"Streaming download exceeded size cap ({self.max_file_download_size} bytes)"
+                            )
 
             data = tmp_path.read_bytes()
         finally:

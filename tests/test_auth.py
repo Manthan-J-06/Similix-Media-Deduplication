@@ -132,6 +132,7 @@ class TestAuthenticationAndSessions:
             "/auth/login",
             "/auth/register",
             "/auth/csrf",
+            "/drive/callback",
             "/docs",
             "/docs/oauth2-redirect",
             "/openapi.json",

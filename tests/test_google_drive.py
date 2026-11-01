@@ -865,6 +865,51 @@ class TestDriveThumbnailConcurrencyAndCaching:
         assert mock_urlopen.call_count == 3
         assert mock_sleep.call_count == 2
 
+    def test_fetch_thumbnails_concurrent_sqlite_safety(self, tmp_path: Path):
+        """Concurrent thumbnail fetching across 8 workers safely records bandwidth and queries DB without corruption."""
+        from db.connection import init_db
+
+        conn = init_db(tmp_path / "test_concurrency.db")
+        sample_jpeg = _create_sample_jpeg_bytes()
+        mock_service = MagicMock()
+
+        # Insert 32 image rows
+        file_ids = [f"drive://file_{i}/photo_{i}.jpg" for i in range(32)]
+        for i, fid in enumerate(file_ids):
+            conn.execute(
+                """
+                INSERT INTO images (file_path, file_size, modified_time, drive_id, source, status)
+                VALUES (?, ?, ?, ?, 'gdrive', 'discovered')
+                """,
+                (fid, 1024 * 50, 1700000000.0 + i, f"file_{i}"),
+            )
+        conn.commit()
+
+        source = GoogleDriveSource(
+            service=mock_service,
+            cache_dir=tmp_path / "cache",
+            conn=conn,
+            stage="stage1",
+        )
+        for i in range(32):
+            source._drive_item_cache[f"file_{i}"] = {
+                "thumbnailLink": f"https://lh3.googleusercontent.com/link_{i}=s220"
+            }
+
+        resp_mock = MagicMock()
+        resp_mock.status = 200
+        resp_mock.read.return_value = sample_jpeg
+        resp_mock.__enter__.return_value = resp_mock
+
+        with patch("urllib.request.urlopen", return_value=resp_mock):
+            thumbs = source.fetch_thumbnails(file_ids, max_workers=8)
+
+        assert len(thumbs) == 32
+        # Check bandwidth table has 32 entries recorded concurrently
+        count = conn.execute("SELECT COUNT(*) FROM drive_bandwidth WHERE stage = 'stage1'").fetchone()[0]
+        assert count == 32
+        conn.close()
+
 
 
 class TestDriveAdminConfig:

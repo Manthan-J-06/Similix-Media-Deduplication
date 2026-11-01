@@ -359,13 +359,8 @@ def run_pipeline(
             s0_res = run_stage0(source0, conn, cfg, progress_callback=on_drive_scan)
             for p, r in s0_res.skipped_reasons:
                 all_warnings.append(f"{Path(p).name}: {r}")
-            source_active = GoogleDriveSource(
-                folder_id=drive_folder_id,
-                conn=conn,
-                stage="stage1",
-                token_path=tok_path,
-                cache_dir=cache_p,
-            )
+            source_active = source0
+            source_active.stage = "stage1"
         else:
             from sources.local_folder import LocalFolderSource
             scan_dir = Path(folder or cfg.get("sources", {}).get("library_dir", "~/.argus/library")).expanduser().resolve()
@@ -510,6 +505,8 @@ def run_pipeline(
                 message=f"Embedding ({cur} of {tot} files)",
             )
 
+        if hasattr(source_active, "stage"):
+            source_active.stage = "stage2"
         if pending_embed > 0:
             run_embeddings(source_active, conn, cfg, progress_callback=on_embed_progress)
         else:
@@ -579,6 +576,8 @@ def run_pipeline(
                 message=f"Geometric verification ({cur} of {tot} pairs)",
             )
 
+        if hasattr(source_active, "stage"):
+            source_active.stage = "stage3"
         if _stage_needs_verify(conn):
             run_stage3_verification(conn, cfg, source=source_active, progress_callback=on_verify_progress)
         else:
@@ -620,6 +619,8 @@ def run_pipeline(
                 message=f"Evaluating quality (cluster {cur} of {tot}, id #{cid})",
             )
 
+        if hasattr(source_active, "stage"):
+            source_active.stage = "stage4"
         if _stage_needs_quality(conn):
             q_res = run_quality_pipeline(conn, cfg, source=source_active, progress_callback=on_quality_progress)
             if hasattr(q_res, "slowest_clusters") and q_res.slowest_clusters:
