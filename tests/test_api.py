@@ -1954,6 +1954,59 @@ class TestPipelineResumable:
         res_empty = client.post("/download/selected", json={"image_ids": []})
         assert res_empty.status_code in (400, 422)
 
+    def test_download_google_drive_cluster_and_selected(self, api_test_env, monkeypatch):
+        """Test streaming zip downloads for clusters and selected files originating from Google Drive."""
+        import zipfile
+        client = api_test_env["client"]
+        db_file = api_test_env["db_file"]
+
+        # Insert a cluster containing drive:// files
+        conn = sqlite3.connect(db_file)
+        conn.execute("INSERT INTO clusters (id, representative_id, stage_detected, member_count) VALUES (50, NULL, 0, 2)")
+        now = time.time()
+        conn.execute(
+            """
+            INSERT INTO images (
+                id, cluster_id, file_path, file_size, width, height, format, md5,
+                is_keeper, is_recommended_keeper, delete_safe, review_flag,
+                is_low_confidence, quality_status, ssim, ssim_color, sharpness_ratio,
+                pixel_ratio, bytes_ratio, modified_time
+            ) VALUES
+              (501, 50, 'drive://mock_drive_id_1/cloud_photo1.jpg', 1234, 400, 400, 'JPEG', 'md5_501', 1, 1, 0, 0, 0, 'reference', 1.0, 1.0, 1.0, 1.0, 1.0, ?),
+              (502, 50, 'drive://mock_drive_id_2/cloud_photo2.jpg', 1234, 400, 400, 'JPEG', 'md5_502', 0, 0, 1, 0, 0, 'aligned', 1.0, 1.0, 1.0, 1.0, 1.0, ?)
+            """,
+            (now, now),
+        )
+        conn.execute("UPDATE clusters SET representative_id = 501 WHERE id = 50")
+        conn.commit()
+        conn.close()
+
+        # Mock GoogleDriveSource.get_bytes to return fake JPEG bytes
+        mock_bytes = b"\xff\xd8\xff\xe0\x00\x10JFIF" + b"\x00" * 50
+        from sources.google_drive import GoogleDriveSource
+        monkeypatch.setattr(GoogleDriveSource, "get_bytes", lambda self, uri: mock_bytes)
+        monkeypatch.setattr("api.server._get_user_gdrive_source", lambda req, u, c: GoogleDriveSource(conn=c, config={}, token_path="/tmp/fake_tok.json"))
+
+        # Download cluster 50
+        res_cl = client.get("/download/cluster/50")
+        assert res_cl.status_code == 200
+        assert res_cl.headers["content-type"] == "application/zip"
+        with zipfile.ZipFile(io.BytesIO(res_cl.content)) as zf:
+            names = zf.namelist()
+            assert len(names) == 2
+            assert any("cloud_photo1.jpg" in n for n in names)
+            assert any("cloud_photo2.jpg" in n for n in names)
+            assert zf.read(names[0]) == mock_bytes
+
+        # Download selected image 502
+        res_sel = client.post("/download/selected", json={"image_ids": [502]})
+        assert res_sel.status_code == 200
+        assert res_sel.headers["content-type"] == "application/zip"
+        with zipfile.ZipFile(io.BytesIO(res_sel.content)) as zf:
+            names = zf.namelist()
+            assert len(names) == 1
+            assert any("cloud_photo2.jpg" in n for n in names)
+
     def test_drive_web_oauth_flow(self, api_test_env, tmp_path, monkeypatch):
         """Test Drive web OAuth flow, PKCE, admin message, user-isolated tokens, disconnect."""
         monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))

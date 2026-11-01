@@ -3325,16 +3325,70 @@
     // Cluster & Keepers Download handlers
     const btnDlCluster = document.getElementById("btn-download-cluster");
     if (btnDlCluster) {
-      btnDlCluster.addEventListener("click", () => {
+      btnDlCluster.addEventListener("click", async () => {
         if (!activeClusterId) return;
-        window.location.href = `/download/cluster/${activeClusterId}`;
+        const origText = btnDlCluster.textContent;
+        try {
+          btnDlCluster.disabled = true;
+          btnDlCluster.textContent = "⏳ Downloading...";
+          const res = await fetch(`/download/cluster/${activeClusterId}`);
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            showInlineNotice(err.detail || "Download failed", "error");
+            btnDlCluster.disabled = false;
+            btnDlCluster.textContent = origText;
+            return;
+          }
+          const blob = await res.blob();
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = `cluster_${activeClusterId}.zip`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+          btnDlCluster.disabled = false;
+          btnDlCluster.textContent = origText;
+        } catch (err) {
+          showInlineNotice(err.message || "Download failed", "error");
+          btnDlCluster.disabled = false;
+          btnDlCluster.textContent = origText;
+        }
       });
     }
 
     const btnDlKeepers = document.getElementById("btn-download-all-keepers");
     if (btnDlKeepers) {
-      btnDlKeepers.addEventListener("click", () => {
-        window.location.href = `/download/keepers?mode=${encodeURIComponent(currentMode)}`;
+      btnDlKeepers.addEventListener("click", async () => {
+        const origText = btnDlKeepers.textContent;
+        try {
+          btnDlKeepers.disabled = true;
+          btnDlKeepers.textContent = "⏳ Downloading...";
+          const res = await fetch(`/download/keepers?mode=${encodeURIComponent(currentMode)}`);
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            showInlineNotice(err.detail || "Download failed", "error");
+            btnDlKeepers.disabled = false;
+            btnDlKeepers.textContent = origText;
+            return;
+          }
+          const blob = await res.blob();
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = "recommended_keepers.zip";
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+          btnDlKeepers.disabled = false;
+          btnDlKeepers.textContent = origText;
+        } catch (err) {
+          showInlineNotice(err.message || "Download failed", "error");
+          btnDlKeepers.disabled = false;
+          btnDlKeepers.textContent = origText;
+        }
       });
     }
 
@@ -3342,7 +3396,10 @@
     if (btnDlSelected) {
       btnDlSelected.addEventListener("click", async () => {
         if (selectedImageIds.size === 0) return;
+        const origText = btnDlSelected.textContent;
         try {
+          btnDlSelected.disabled = true;
+          btnDlSelected.textContent = "⏳ Downloading...";
           const csrf = await getCsrfToken();
           const res = await fetch("/download/selected", {
             method: "POST",
@@ -3355,6 +3412,8 @@
           if (!res.ok) {
             const err = await res.json().catch(() => ({}));
             showInlineNotice(err.detail || "Download failed", "error");
+            btnDlSelected.disabled = false;
+            btnDlSelected.textContent = origText;
             return;
           }
           const blob = await res.blob();
@@ -3366,8 +3425,12 @@
           a.click();
           document.body.removeChild(a);
           URL.revokeObjectURL(url);
+          btnDlSelected.disabled = false;
+          btnDlSelected.textContent = origText;
         } catch (err) {
           showInlineNotice(err.message || "Download failed", "error");
+          btnDlSelected.disabled = false;
+          btnDlSelected.textContent = origText;
         }
       });
     }

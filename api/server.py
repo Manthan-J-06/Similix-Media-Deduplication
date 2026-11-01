@@ -620,6 +620,146 @@ def get_db(request: Request, user: UserContext = Depends(get_current_user)):
         conn.close()
 
 
+def _get_user_gdrive_source(request: Request, user: UserContext, conn: sqlite3.Connection):
+    """Instantiate GoogleDriveSource for the authenticated user if credentials exist."""
+    try:
+        from sources.google_drive import GoogleDriveSource, DEFAULT_TOKEN_PATH
+        cfg = getattr(request.app.state, "config", {}) or {}
+        configured_drive_cache = cfg.get("sources", {}).get("google_drive", {}).get("cache_dir")
+        drive_cache_dir = Path(configured_drive_cache).expanduser() if configured_drive_cache else user.drive_cache_dir
+        user_tok_path = user.root / "drive_token.json"
+        global_tok_path = Path(cfg.get("sources", {}).get("google_drive", {}).get("token_path", DEFAULT_TOKEN_PATH)).expanduser()
+        tok_file = user_tok_path if user_tok_path.exists() else (global_tok_path if global_tok_path.exists() else None)
+        if tok_file and tok_file.exists():
+            return GoogleDriveSource(
+                conn=conn,
+                cache_dir=drive_cache_dir,
+                token_path=tok_file,
+                config=cfg,
+                stage="cluster_verification",
+            )
+    except Exception as exc:
+        logger.warning("Could not instantiate GoogleDriveSource: %s", exc)
+    return None
+
+
+def _collect_download_file(
+    file_path_str: str,
+    arcname_default: str,
+    user: UserContext,
+    request: Request,
+    gdrive_source: Any = None,
+) -> tuple[Path | bytes, str] | None:
+    """Resolve a local path or drive:// URI to (Path | bytes, arcname)."""
+    if file_path_str.startswith("drive://"):
+        from sources.google_drive import parse_drive_uri
+        drive_id, filename = parse_drive_uri(file_path_str)
+        arcname = filename or arcname_default or f"{drive_id}.jpg"
+        if gdrive_source is not None:
+            try:
+                b = gdrive_source.get_bytes(file_path_str)
+                if b:
+                    return (b, arcname)
+            except Exception as exc:
+                logger.warning("Could not fetch full Google Drive file %s: %s", file_path_str, exc)
+        cfg = getattr(request.app.state, "config", {}) or {}
+        configured_drive_cache = cfg.get("sources", {}).get("google_drive", {}).get("cache_dir")
+        drive_cache_dir = Path(configured_drive_cache).expanduser() if configured_drive_cache else user.drive_cache_dir
+        if drive_cache_dir.is_dir():
+            matches = sorted(drive_cache_dir.glob(f"{drive_id}_*.jpg"))
+            if not matches:
+                matches = sorted(drive_cache_dir.glob(f"{drive_id}.jpg"))
+            if not matches:
+                matches = sorted(drive_cache_dir.glob(f"{drive_id}*"))
+            if matches and matches[0].is_file():
+                return (matches[0], arcname)
+        return None
+
+    fp = Path(file_path_str)
+    if fp.is_file() and not fp.is_symlink():
+        try:
+            validate_confined_user_path(fp, user.library_dir)
+            return (fp, arcname_default or fp.name)
+        except Exception:
+            try:
+                validate_confined_user_path(fp, user.root)
+                return (fp, arcname_default or fp.name)
+            except Exception:
+                pass
+    return None
+
+
+def stream_zip_archive(files_to_zip: list[tuple[Path | bytes, str]], zip_filename: str):
+    """Create and stream a zip archive from a list of (Path | bytes, arcname) tuples."""
+    if not files_to_zip:
+        raise HTTPException(status_code=404, detail="No downloadable files found")
+
+    max_download_size = 2 * 1024 * 1024 * 1024  # 2 GB cap
+    total_size = 0
+    for item, _ in files_to_zip:
+        if isinstance(item, (bytes, bytearray)):
+            total_size += len(item)
+        elif isinstance(item, Path) and item.is_file() and not item.is_symlink():
+            try:
+                total_size += item.stat().st_size
+            except OSError:
+                pass
+
+    if total_size > max_download_size:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Total download size ({total_size // (1024*1024)} MB) exceeds 2GB cap",
+        )
+
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    temp_path = Path(temp_file.name)
+    temp_file.close()
+
+    try:
+        with zipfile.ZipFile(temp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            seen_arcnames: set[str] = set()
+            for item, arcname in files_to_zip:
+                final_arcname = arcname
+                count = 1
+                while final_arcname in seen_arcnames:
+                    p = Path(arcname)
+                    final_arcname = f"{p.stem}_{count}{p.suffix}"
+                    count += 1
+                seen_arcnames.add(final_arcname)
+                if isinstance(item, (bytes, bytearray)):
+                    zf.writestr(final_arcname, item)
+                elif isinstance(item, Path) and item.is_file() and not item.is_symlink():
+                    zf.write(item, arcname=final_arcname)
+    except Exception as exc:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except Exception:
+                pass
+        raise HTTPException(status_code=500, detail=f"Failed to create zip archive: {exc}")
+
+    def iter_file():
+        try:
+            with open(temp_path, "rb") as f:
+                while chunk := f.read(65536):
+                    yield chunk
+        finally:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except Exception:
+                    pass
+
+    return StreamingResponse(
+        iter_file(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{zip_filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 def create_app(
     db_path: str | Path | None = None,
     trash_dir: str | Path | None = None,
@@ -997,73 +1137,6 @@ def create_app(
     # Downloads & Library
     # ==========================
 
-    def stream_zip_archive(files_to_zip: list[tuple[Path, str]], zip_filename: str):
-        """Create and stream a zip archive from a list of (Path, arcname) tuples."""
-        if not files_to_zip:
-            raise HTTPException(status_code=404, detail="No downloadable files found")
-
-        max_download_size = 2 * 1024 * 1024 * 1024  # 2 GB cap
-        total_size = 0
-        for fp, _ in files_to_zip:
-            if fp.is_file() and not fp.is_symlink():
-                try:
-                    total_size += fp.stat().st_size
-                except OSError:
-                    pass
-
-        if total_size > max_download_size:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Total download size ({total_size // (1024*1024)} MB) exceeds 2GB cap",
-            )
-
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
-        temp_path = Path(temp_file.name)
-        temp_file.close()
-
-        try:
-            with zipfile.ZipFile(temp_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                seen_arcnames: set[str] = set()
-                for fp, arcname in files_to_zip:
-                    if not fp.is_file() or fp.is_symlink():
-                        continue
-                    final_arcname = arcname
-                    count = 1
-                    while final_arcname in seen_arcnames:
-                        p = Path(arcname)
-                        final_arcname = f"{p.stem}_{count}{p.suffix}"
-                        count += 1
-                    seen_arcnames.add(final_arcname)
-                    zf.write(fp, arcname=final_arcname)
-        except Exception as exc:
-            if temp_path.exists():
-                try:
-                    temp_path.unlink()
-                except Exception:
-                    pass
-            raise HTTPException(status_code=500, detail=f"Failed to create zip archive: {exc}")
-
-        def iter_file():
-            try:
-                with open(temp_path, "rb") as f:
-                    while chunk := f.read(65536):
-                        yield chunk
-            finally:
-                if temp_path.exists():
-                    try:
-                        temp_path.unlink()
-                    except Exception:
-                        pass
-
-        return StreamingResponse(
-            iter_file(),
-            media_type="application/zip",
-            headers={
-                "Content-Disposition": f'attachment; filename="{zip_filename}"',
-                "Cache-Control": "no-store",
-            },
-        )
-
     @app.get("/download/cluster/{cluster_id}")
     def download_cluster(
         cluster_id: int,
@@ -1071,29 +1144,23 @@ def create_app(
         user: UserContext = Depends(get_current_user),
         conn: sqlite3.Connection = Depends(get_db),
     ):
-        """Stream a zip archive of all live files in a cluster (user library only)."""
+        """Stream a zip archive of all live files in a cluster (local or Google Drive)."""
         c_row = conn.execute("SELECT id FROM clusters WHERE id = ?", (cluster_id,)).fetchone()
         if not c_row:
             raise HTTPException(status_code=404, detail=f"Cluster {cluster_id} not found")
 
         rows = conn.execute(
-            "SELECT id, file_path, file_size FROM images WHERE cluster_id = ? AND status != 'deleted'",
+            "SELECT id, file_path, file_size FROM images WHERE cluster_id = ? AND (status IS NULL OR status != 'deleted')",
             (cluster_id,),
         ).fetchall()
 
+        gdrive_source = _get_user_gdrive_source(request, user, conn)
         files_to_zip = []
         for r in rows:
-            fp = Path(r["file_path"])
-            if fp.is_file() and not fp.is_symlink():
-                try:
-                    validate_confined_user_path(fp, user.library_dir)
-                    files_to_zip.append((fp, fp.name))
-                except Exception:
-                    try:
-                        validate_confined_user_path(fp, user.root)
-                        files_to_zip.append((fp, fp.name))
-                    except Exception:
-                        pass
+            fp_str = str(r["file_path"])
+            item = _collect_download_file(fp_str, Path(fp_str).name, user, request, gdrive_source)
+            if item:
+                files_to_zip.append(item)
 
         return stream_zip_archive(files_to_zip, f"cluster_{cluster_id}.zip")
 
@@ -1104,29 +1171,23 @@ def create_app(
         user: UserContext = Depends(get_current_user),
         conn: sqlite3.Connection = Depends(get_db),
     ):
-        """Stream a zip archive of selected image IDs (user library only, client-safe)."""
+        """Stream a zip archive of selected image IDs (local or Google Drive)."""
         if not req.image_ids:
             raise HTTPException(status_code=400, detail="No image IDs provided")
 
         placeholders = ",".join(["?"] * len(req.image_ids))
         rows = conn.execute(
-            f"SELECT id, file_path, file_size FROM images WHERE id IN ({placeholders}) AND status != 'deleted'",
+            f"SELECT id, file_path, file_size FROM images WHERE id IN ({placeholders}) AND (status IS NULL OR status != 'deleted')",
             req.image_ids,
         ).fetchall()
 
+        gdrive_source = _get_user_gdrive_source(request, user, conn)
         files_to_zip = []
         for r in rows:
-            fp = Path(r["file_path"])
-            if fp.is_file() and not fp.is_symlink():
-                try:
-                    validate_confined_user_path(fp, user.library_dir)
-                    files_to_zip.append((fp, fp.name))
-                except Exception:
-                    try:
-                        validate_confined_user_path(fp, user.root)
-                        files_to_zip.append((fp, fp.name))
-                    except Exception:
-                        pass
+            fp_str = str(r["file_path"])
+            item = _collect_download_file(fp_str, Path(fp_str).name, user, request, gdrive_source)
+            if item:
+                files_to_zip.append(item)
 
         return stream_zip_archive(files_to_zip, "selected_images.zip")
 
@@ -1137,20 +1198,21 @@ def create_app(
         user: UserContext = Depends(get_current_user),
         conn: sqlite3.Connection = Depends(get_db),
     ):
-        """Stream a zip archive of recommended keepers from all duplicate clusters."""
+        """Stream a zip archive of recommended keepers from all duplicate clusters (local or Google Drive)."""
         clusters = conn.execute("SELECT id, reference_uncertain FROM clusters").fetchall()
+        gdrive_source = _get_user_gdrive_source(request, user, conn)
 
         keeper_files = []
         for c in clusters:
             cid = c["id"]
             ref_unc = c["reference_uncertain"] if "reference_uncertain" in c.keys() else 0
             members = conn.execute(
-                "SELECT * FROM images WHERE cluster_id = ? AND status != 'deleted'",
+                "SELECT * FROM images WHERE cluster_id = ? AND (status IS NULL OR status != 'deleted')",
                 (cid,),
             ).fetchall()
             live_members = [
                 m for m in members
-                if os.path.exists(m["file_path"]) and not os.path.islink(m["file_path"])
+                if str(m["file_path"]).startswith("drive://") or (os.path.exists(m["file_path"]) and not os.path.islink(m["file_path"]))
             ]
             if len(live_members) < 2:
                 continue
@@ -1166,17 +1228,11 @@ def create_app(
             if k_id:
                 k_row = next((m for m in live_members if m["id"] == k_id), None)
                 if k_row:
-                    fp = Path(k_row["file_path"])
-                    if fp.is_file() and not fp.is_symlink():
-                        try:
-                            validate_confined_user_path(fp, user.library_dir)
-                            keeper_files.append((fp, f"cluster_{cid}_{fp.name}"))
-                        except Exception:
-                            try:
-                                validate_confined_user_path(fp, user.root)
-                                keeper_files.append((fp, f"cluster_{cid}_{fp.name}"))
-                            except Exception:
-                                pass
+                    fp_str = str(k_row["file_path"])
+                    default_name = f"cluster_{cid}_{Path(fp_str).name}"
+                    item = _collect_download_file(fp_str, default_name, user, request, gdrive_source)
+                    if item:
+                        keeper_files.append((item[0], f"cluster_{cid}_{item[1]}"))
 
         return stream_zip_archive(keeper_files, "recommended_keepers.zip")
 
