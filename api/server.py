@@ -2600,7 +2600,7 @@ def create_app(
             raise HTTPException(status_code=400, detail="HTTPS only: HTTP and other schemes are rejected")
 
         dataset_cfg = cfg.get("sources", {}).get("dataset", {})
-        allowed_hosts = [h.lower().strip() for h in dataset_cfg.get("allowed_hosts", ["huggingface.co"])]
+        allowed_hosts = [h.lower().strip() for h in dataset_cfg.get("allowed_hosts", ["huggingface.co", "hf.co", "github.com", "raw.githubusercontent.com"])]
         host = (parsed.netloc.split(":")[0]).lower()
         if not any(host == ah or host.endswith("." + ah) for ah in allowed_hosts):
             raise HTTPException(status_code=400, detail=f"Host '{host}' outside allow-list ({allowed_hosts}) rejected")

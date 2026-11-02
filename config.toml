@@ -497,7 +497,7 @@ total_cap_mb = 1000
 allowed_extensions = ["jpg", "jpeg", "png", "webp", "heic"]
 
 [sources.dataset]
-allowed_hosts = ["huggingface.co"]
+allowed_hosts = ["huggingface.co", "hf.co", "github.com", "raw.githubusercontent.com"]
 size_cap_mb = 500
 file_count_cap = 1000
 
