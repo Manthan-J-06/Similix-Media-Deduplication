@@ -36,10 +36,10 @@ import time
 from typing import Any
 import uuid
 
-from core.config import load_config
+from core.config import load_config, resolve_data_dir
 from db.connection import get_connection, init_db
 
-logger = logging.getLogger("argus.worker")
+logger = logging.getLogger("similix.worker")
 
 
 class WorkerState:
@@ -275,7 +275,7 @@ def run_pipeline(
     continued by re-invoking run_pipeline with the same arguments.
     """
     if job_file is None:
-        job_file = Path.home() / ".argus" / "jobs" / f"{job_id}.json"
+        job_file = resolve_data_dir() / "jobs" / f"{job_id}.json"
 
     resolved_db = Path(db_path).resolve()
     logger.info("Worker targeting per-user database: %s", resolved_db)
@@ -363,7 +363,7 @@ def run_pipeline(
             source_active.stage = "stage1"
         else:
             from sources.local_folder import LocalFolderSource
-            scan_dir = Path(folder or cfg.get("sources", {}).get("library_dir", "~/.argus/library")).expanduser().resolve()
+            scan_dir = Path(folder or cfg.get("sources", {}).get("library_dir", resolve_data_dir() / "library")).expanduser().resolve()
             source_active = LocalFolderSource(scan_dir)
             files = list(source_active.list_files())
             total_files = len(files)
@@ -688,7 +688,7 @@ def run_pipeline(
         # Timing Summary Report
         total_pipeline_time = round(time.time() - job_start_time, 3)
         print("\n" + "=" * 54)
-        print("  Argus Deduplication Pipeline Stage Timings")
+        print("  SIMILIX Deduplication Pipeline Stage Timings")
         print("=" * 54)
         for stg, dur in stage_timings.items():
             print(f"  - {stg.capitalize():<24} : {dur:>8.3f}s")
@@ -804,7 +804,7 @@ def run_pipeline(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Argus pipeline background worker")
+    parser = argparse.ArgumentParser(description="SIMILIX pipeline background worker")
     parser.add_argument("--job-id", required=True, help="Unique job ID")
     parser.add_argument("--db", required=True, help="Database path")
     parser.add_argument("--config", default=None, help="Config path")

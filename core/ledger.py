@@ -43,7 +43,7 @@ import time
 from typing import Any
 import uuid
 
-from core.config import load_config
+from core.config import load_config, get_env, resolve_data_dir
 from core.keeper import choose_keeper
 
 # True when running inside a pytest session — used to permit synthetic file paths in unit tests.
@@ -201,20 +201,23 @@ def normalize_refusal_reason(reason: str | None) -> str:
 
 
 def _resolve_trash_dir(config: dict | None = None, trash_dir: str | Path | None = None) -> Path:
-    """Resolve base trash directory from argument, environment, config, or ~/.argus/trash."""
+    """Resolve base trash directory from argument, environment, config, or default trash."""
     if trash_dir is not None:
         return Path(trash_dir).expanduser().resolve()
-    env_trash = os.environ.get("ARGUS_TRASH_DIR")
+    env_trash = get_env("TRASH_DIR")
     if env_trash:
         return Path(env_trash).expanduser().resolve()
-    data_dir = os.environ.get("ARGUS_DATA_DIR")
+    data_dir = get_env("DATA_DIR")
     if data_dir:
         return (Path(data_dir).expanduser() / "trash").resolve()
     if config:
         cfg_trash = config.get("ledger", {}).get("trash_dir")
         if cfg_trash:
-            return Path(cfg_trash).expanduser().resolve()
-    return (Path.home() / ".argus" / "trash").resolve()
+            expanded = Path(cfg_trash).expanduser()
+            if expanded in (Path.home() / ".similix" / "trash", Path.home() / ".argus" / "trash"):
+                return (resolve_data_dir() / "trash").resolve()
+            return expanded.resolve()
+    return (resolve_data_dir() / "trash").resolve()
 
 
 def _get_relative_trash_path(batch_trash_dir: Path, original_path: str | Path) -> Path:

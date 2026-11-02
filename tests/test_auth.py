@@ -122,7 +122,7 @@ class TestAuthenticationAndSessions:
         resp_root_auth = client.get("/")
         assert resp_root_auth.status_code == 200
         assert "text/html" in resp_root_auth.headers.get("content-type", "")
-        assert "Argus" in resp_root_auth.text
+        assert "SIMILIX" in resp_root_auth.text
 
         # 4. Route scanner over all app routes
         unauth_client = TestClient(app)
@@ -271,7 +271,7 @@ class TestAuthenticationAndSessions:
         client = TestClient(auth_test_app["app"])
         res = client.get("/healthz")
         assert res.status_code == 200
-        assert res.json() == {"status": "ok", "service": "argus"}
+        assert res.json() == {"status": "ok", "service": "similix"}
 
     def test_app_restart_persists_accounts_and_sessions(self, tmp_path: Path):
         """Accounts and sessions persist across app restarts when using ARGUS_DATA_DIR / auth_db."""
@@ -302,12 +302,19 @@ class TestAuthenticationAndSessions:
         app2 = create_app(auth_db_path=auth_db, users_dir=users_dir)
         client2 = TestClient(app2)
 
-        # A) Existing session token can still access /auth/me
-        client2.cookies.set("argus_session", token1)
+        # A) Existing session token can still access /auth/me (via similix_session or argus_session)
+        client2.cookies.set("similix_session", token1)
         me_resp2 = client2.get("/auth/me")
         assert me_resp2.status_code == 200
         assert me_resp2.json()["id"] == user_id
         assert me_resp2.json()["email"] == email
+
+        # Also test legacy argus_session cookie
+        client2.cookies.clear()
+        client2.cookies.set("argus_session", token1)
+        me_resp2_argus = client2.get("/auth/me")
+        assert me_resp2_argus.status_code == 200
+        assert me_resp2_argus.json()["id"] == user_id
 
         # B) Logging in with the existing account on the restarted app succeeds
         client3 = TestClient(app2)

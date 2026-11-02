@@ -68,7 +68,9 @@ class TestCLIPEmbedder:
     def test_device_selection(self):
         device = get_device()
         assert isinstance(device, torch.device)
-        if os.environ.get("ARGUS_DEVICE"):
+        if os.environ.get("SIMILIX_DEVICE"):
+            assert device.type == os.environ["SIMILIX_DEVICE"]
+        elif os.environ.get("ARGUS_DEVICE"):
             assert device.type == os.environ["ARGUS_DEVICE"]
         elif os.environ.get("CI"):
             assert device.type == "cpu"

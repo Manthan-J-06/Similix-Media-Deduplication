@@ -35,17 +35,19 @@ from typing import Any, Callable, Iterator
 
 from PIL import Image
 
+from core.config import get_env, resolve_data_dir
 from sources.base import ImageMetadata, ImageSource
 from sources.local_folder import DEFAULT_EXTENSIONS
 
-logger = logging.getLogger("argus.gdrive")
+logger = logging.getLogger("similix.gdrive")
 
 DRIVE_READONLY_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
 SCOPES = [DRIVE_READONLY_SCOPE]
 
-DEFAULT_CLIENT_SECRET_PATH = Path(os.environ.get("ARGUS_DATA_DIR", "~/.argus")).expanduser() / "client_secret.json"
-DEFAULT_TOKEN_PATH = Path(os.environ.get("ARGUS_DATA_DIR", "~/.argus")).expanduser() / "drive_token.json"
-DEFAULT_CACHE_DIR = Path(os.environ.get("ARGUS_DATA_DIR", "~/.argus")).expanduser() / "drive_cache"
+_def_dir = resolve_data_dir()
+DEFAULT_CLIENT_SECRET_PATH = _def_dir / "client_secret.json"
+DEFAULT_TOKEN_PATH = _def_dir / "drive_token.json"
+DEFAULT_CACHE_DIR = _def_dir / "drive_cache"
 DEFAULT_MAX_CACHE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 
 DRIVE_LIST_FIELDS = (
@@ -162,7 +164,7 @@ def get_drive_credentials(
         if not prompt_if_missing:
             raise FileNotFoundError(
                 f"Valid Google Drive credentials not found at {tok_path}. "
-                f"Run `argus drive-auth` to authorize."
+                f"Run `similix drive-auth` to authorize."
             )
 
         if not sec_path.exists():
@@ -580,7 +582,7 @@ class GoogleDriveSource(ImageSource):
         max_retries: int = 3,
     ) -> bytes | None:
         """Download thumbnail bytes from URL with per-request 20s timeout and 3 retries with backoff."""
-        headers = {"User-Agent": "Argus/1.0"}
+        headers = {"User-Agent": "SIMILIX/1.0"}
         try:
             creds = self.credentials
             if creds and getattr(creds, "token", None):
@@ -863,7 +865,7 @@ class GoogleDriveSource(ImageSource):
         from googleapiclient.http import MediaIoBaseDownload
 
         tmp_fd, tmp_path_str = tempfile.mkstemp(
-            prefix=f"argus_stream_{drive_id}_",
+            prefix=f"similix_stream_{drive_id}_",
             dir=str(self.temp_dir) if self.temp_dir else None,
         )
         os.close(tmp_fd)

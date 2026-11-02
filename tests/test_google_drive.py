@@ -496,6 +496,7 @@ class TestBandwidthAccountingSummary:
         }
 
         source = GoogleDriveSource(
+            folder_id="test_folder",
             service=mock_service,
             cache_dir=tmp_path / "cache",
             conn=db,

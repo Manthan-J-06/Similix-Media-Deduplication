@@ -85,7 +85,7 @@ def generate_contact_sheet_html(
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Argus — Category Contact Sheet</title>
+<title>SIMILIX — Category Contact Sheet</title>
 <style>
   :root {
     --bg-primary: #121418;
@@ -226,7 +226,7 @@ def generate_contact_sheet_html(
 </head>
 <body>
 <header>
-  <h1>Argus — Category Contact Sheet</h1>
+  <h1>SIMILIX — Category Contact Sheet</h1>
   <div class=\"subtitle\">Visual verification of predicted categories and confidence scores</div>
   <div class=\"nav-pills\">
 """)

@@ -9,10 +9,66 @@ import json
 from pathlib import Path
 import pytest
 
-from core.config import load_config, DEFAULT_CONFIG_PATH
+from core.config import load_config, DEFAULT_CONFIG_PATH, get_env, resolve_data_dir
 
 
 TUNED_JSON_PATH = Path("bench/tuned.json")
+
+
+def test_get_env_precedence(monkeypatch):
+    """Verify get_env prioritizes SIMILIX_* over ARGUS_* and falls back correctly."""
+    monkeypatch.delenv("SIMILIX_TEST_VAR", raising=False)
+    monkeypatch.delenv("ARGUS_TEST_VAR", raising=False)
+    monkeypatch.delenv("TEST_VAR", raising=False)
+
+    assert get_env("TEST_VAR", "default_val") == "default_val"
+
+    monkeypatch.setenv("ARGUS_TEST_VAR", "from_argus")
+    assert get_env("TEST_VAR") == "from_argus"
+    assert get_env("SIMILIX_TEST_VAR") == "from_argus"
+    assert get_env("ARGUS_TEST_VAR") == "from_argus"
+
+    monkeypatch.setenv("SIMILIX_TEST_VAR", "from_similix")
+    assert get_env("TEST_VAR") == "from_similix"
+    assert get_env("SIMILIX_TEST_VAR") == "from_similix"
+    assert get_env("ARGUS_TEST_VAR") == "from_similix"
+
+
+def test_resolve_data_dir_explicit(tmp_path):
+    target = tmp_path / "custom_data"
+    res = resolve_data_dir(target)
+    assert res == target.resolve()
+    assert res.is_dir()
+
+
+def test_resolve_data_dir_env(tmp_path, monkeypatch):
+    target = tmp_path / "env_data"
+    monkeypatch.setenv("SIMILIX_DATA_DIR", str(target))
+    res = resolve_data_dir()
+    assert res == target.resolve()
+    assert res.is_dir()
+
+    monkeypatch.delenv("SIMILIX_DATA_DIR")
+    monkeypatch.setenv("ARGUS_DATA_DIR", str(target))
+    res2 = resolve_data_dir()
+    assert res2 == target.resolve()
+
+
+def test_resolve_data_dir_migration(tmp_path, monkeypatch):
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    monkeypatch.delenv("SIMILIX_DATA_DIR", raising=False)
+    monkeypatch.delenv("ARGUS_DATA_DIR", raising=False)
+    monkeypatch.delenv("DATA_DIR", raising=False)
+
+    legacy_argus = fake_home / ".argus"
+    legacy_argus.mkdir()
+    (legacy_argus / "similix.db").write_text("dummy")
+
+    resolved = resolve_data_dir()
+    assert resolved == (fake_home / ".similix").resolve()
+    assert (resolved / "similix.db").read_text() == "dummy"
 
 
 def test_config_matches_tuned_thresholds():

@@ -354,8 +354,8 @@ def get_user_dirs(
 ) -> dict[str, Path]:
     """
     Resolve and initialize per-user isolated directory tree:
-    ~/.argus/users/<user_id>/
-      ├── argus.db
+    ~/.similix/users/<user_id>/
+      ├── similix.db (or legacy argus.db)
       ├── library/
       ├── trash/
       ├── thumbs/
@@ -364,9 +364,33 @@ def get_user_dirs(
     """
     user_root = (base_users_dir / str(user_id)).expanduser().resolve()
 
+    def _resolve_user_db(target_root: Path, override: str | None = None) -> Path:
+        if override:
+            return Path(override).expanduser().resolve()
+        similix_db = target_root / "similix.db"
+        argus_db = target_root / "argus.db"
+        if argus_db.exists() and not similix_db.exists():
+            return argus_db.resolve()
+        if argus_db.exists() and similix_db.exists():
+            try:
+                with sqlite3.connect(argus_db) as a_conn:
+                    a_cnt = a_conn.execute("SELECT COUNT(*) FROM images").fetchone()[0]
+                if a_cnt > 0:
+                    with sqlite3.connect(similix_db) as s_conn:
+                        s_cnt = s_conn.execute("SELECT COUNT(*) FROM images").fetchone()[0]
+                    if s_cnt == 0:
+                        return argus_db.resolve()
+            except Exception:
+                pass
+        if similix_db.exists():
+            return similix_db.resolve()
+        if argus_db.exists():
+            return argus_db.resolve()
+        return similix_db.resolve()
+
     if user_id == 1 and custom_overrides:
         root = Path(custom_overrides.get("root") or user_root).expanduser().resolve()
-        db_path = Path(custom_overrides.get("db_path") or (user_root / "argus.db")).expanduser().resolve()
+        db_path = _resolve_user_db(user_root, custom_overrides.get("db_path"))
         library_dir = Path(custom_overrides.get("library_dir") or (user_root / "library")).expanduser().resolve()
         trash_dir = Path(custom_overrides.get("trash_dir") or (user_root / "trash")).expanduser().resolve()
         thumb_cache_dir = Path(custom_overrides.get("thumb_cache_dir") or (user_root / "thumbs")).expanduser().resolve()
@@ -374,7 +398,7 @@ def get_user_dirs(
         drive_cache_dir = Path(custom_overrides.get("drive_cache_dir") or (user_root / "drive_cache")).expanduser().resolve()
     else:
         root = user_root
-        db_path = user_root / "argus.db"
+        db_path = _resolve_user_db(user_root)
         library_dir = user_root / "library"
         trash_dir = user_root / "trash"
         thumb_cache_dir = user_root / "thumbs"

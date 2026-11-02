@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "argus"
+name = "similix"
 version = "0.1.0"
 description = "Local-first image deduplication system"
 readme = "README.md"
@@ -29,6 +29,7 @@ dependencies = [
 ]
 
 [project.scripts]
+similix = "core.cli:main"
 argus = "core.cli:main"
 
 [project.optional-dependencies]

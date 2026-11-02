@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Argus — Central Configuration
+# SIMILIX — Central Configuration
 # Every tuneable threshold and weight lives here. No magic numbers in code.
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -9,7 +9,7 @@ thumbnail_size = 256
 # How many images to process per batch (resumable).
 batch_size = 500
 # SQLite database path (relative to repo root).
-db_path = "argus.db"
+db_path = "similix.db"
 # Directory where thumbnail cache is stored.
 thumbnail_cache_dir = "thumbnails/"
 
@@ -444,7 +444,7 @@ map = [
 # ── Deletion ledger & trash (core/ledger.py) ──────────────────────────────────
 [ledger]
 # Default trash folder. Batches are stored in trash_dir/<batch_id>/.
-trash_dir = "~/.argus/trash"
+trash_dir = "~/.similix/trash"
 # Number of days before a trashed batch can be permanently purged.
 purge_min_age_days = 30
 
@@ -489,7 +489,7 @@ rotate_angles = [90, 180, 270]
 
 # ── Library & Source ingestion (api/server.py) ──────────────────────────────
 [sources]
-library_dir = "~/.argus/library"
+library_dir = "~/.similix/library"
 
 [sources.upload]
 per_file_cap_mb = 50

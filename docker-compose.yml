@@ -1,10 +1,10 @@
 services:
-  argus:
+  similix:
     build:
       context: .
       dockerfile: Dockerfile
-    image: argus:latest
-    container_name: argus-app
+    image: similix:latest
+    container_name: similix-app
     restart: unless-stopped
     read_only: true
     tmpfs:
@@ -17,17 +17,22 @@ services:
       - ALLOW_REGISTRATION=${ALLOW_REGISTRATION:-true}
       - HOSTED_MODE=${HOSTED_MODE:-false}
       - BASE_URL=${BASE_URL:-http://localhost:8000}
+      - SIMILIX_DATA_DIR=/data
       - ARGUS_DATA_DIR=/data
+      - SIMILIX_TRASH_DIR=/data/trash
       - ARGUS_TRASH_DIR=/data/trash
+      - SIMILIX_LIBRARY_DIR=/data/library
       - ARGUS_LIBRARY_DIR=/data/library
+      - SIMILIX_USERS_DIR=/data/users
       - ARGUS_USERS_DIR=/data/users
+      - SIMILIX_ACCOUNTS_DB=/data/auth.db
       - ARGUS_ACCOUNTS_DB=/data/auth.db
       - TMPDIR=/tmp
     volumes:
       # Persistent storage volume for per-user directories, DBs, and library files
-      - argus_data:/data
+      - similix_data:/data
       # To enable Google Drive integration, copy client_secret.json into the data volume:
-      #   docker cp /path/to/client_secret.json argus-app:/data/client_secret.json
+      #   docker cp /path/to/client_secret.json similix-app:/data/client_secret.json
       # Or add a read-only bind mount (only if the file exists on the host):
       # - /path/to/client_secret.json:/data/client_secret.json:ro
     healthcheck:
@@ -38,5 +43,5 @@ services:
       start_period: 10s
 
 volumes:
-  argus_data:
+  similix_data:
     driver: local

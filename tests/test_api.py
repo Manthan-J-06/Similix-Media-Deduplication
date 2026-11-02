@@ -2034,7 +2034,13 @@ class TestPipelineResumable:
         assert res_hosted.json()["enabled"] is False
         assert "disabled in hosted mode" in res_hosted.json()["message"].lower()
 
-        # Allow Drive with ARGUS_ENABLE_DRIVE=1
+        # Allow Drive with ARGUS_ENABLE_DRIVE=1 or SIMILIX_ENABLE_DRIVE=1
+        monkeypatch.setenv("SIMILIX_ENABLE_DRIVE", "1")
+        res_hosted_allowed = client.get("/drive/status")
+        assert res_hosted_allowed.status_code == 200
+        assert res_hosted_allowed.json()["enabled"] is True
+        monkeypatch.delenv("SIMILIX_ENABLE_DRIVE", raising=False)
+
         monkeypatch.setenv("ARGUS_ENABLE_DRIVE", "1")
         res_hosted_allowed = client.get("/drive/status")
         assert res_hosted_allowed.status_code == 200

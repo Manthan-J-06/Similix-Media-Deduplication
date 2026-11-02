@@ -454,7 +454,7 @@ class TestCategoryEvaluationAndCLI:
         generated = generate_contact_sheet_html(conn, out_html, per_category=12)
         assert generated.exists()
         content = generated.read_text(encoding="utf-8")
-        assert "Argus — Category Contact Sheet" in content
+        assert "SIMILIX — Category Contact Sheet" in content
         assert "landscape (1)" in content
         assert "data:image/jpeg;base64," in content
         assert "sample.jpg" in content

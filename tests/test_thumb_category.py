@@ -38,6 +38,11 @@ def _make_app(tmp_path: Path) -> tuple:
     return app, users_dir, auth_db
 
 
+def _user_db(user_dir: Path) -> Path:
+    similix_db = user_dir / "similix.db"
+    return similix_db if similix_db.exists() else (user_dir / "argus.db")
+
+
 def _register_login(client: TestClient, email: str, password: str = "ArgusPass1234!") -> str:
     client.post("/auth/register", json={"email": email, "password": password})
     res = client.post("/auth/login", json={"email": email, "password": password})
@@ -67,7 +72,7 @@ class TestThumbnailIsolation:
         _make_jpg(img_a, color=(200, 0, 0))
         md5_a = compute_file_md5(img_a)
 
-        conn_a = init_db(user_a_dir / "argus.db")
+        conn_a = init_db(_user_db(user_a_dir))
         conn_a.execute(
             "INSERT INTO images (id, file_path, file_size, modified_time, md5) VALUES (1, ?, ?, ?, ?)",
             (str(img_a), img_a.stat().st_size, img_a.stat().st_mtime, md5_a),
@@ -91,7 +96,7 @@ class TestThumbnailIsolation:
         _make_jpg(img_b, color=(0, 0, 200))
         md5_b = compute_file_md5(img_b)
 
-        conn_b = init_db(user_b_dir / "argus.db")
+        conn_b = init_db(_user_db(user_b_dir))
         conn_b.execute(
             "INSERT INTO images (id, file_path, file_size, modified_time, md5) VALUES (1, ?, ?, ?, ?)",
             (str(img_b), img_b.stat().st_size, img_b.stat().st_mtime, md5_b),
@@ -124,7 +129,7 @@ class TestThumbnailIsolation:
         _make_jpg(img_red, color=(255, 0, 0))
         md5_red = compute_file_md5(img_red)
 
-        conn = init_db(user_dir / "argus.db")
+        conn = init_db(_user_db(user_dir))
         conn.execute(
             "INSERT INTO images (id, file_path, file_size, modified_time, md5) VALUES (1, ?, ?, ?, ?)",
             (str(img_red), img_red.stat().st_size, img_red.stat().st_mtime, md5_red),
@@ -158,7 +163,7 @@ class TestThumbnailIsolation:
         _make_jpg(img_blue, color=(0, 0, 255))
         md5_blue = compute_file_md5(img_blue)
 
-        conn2 = init_db(new_user_dir / "argus.db")
+        conn2 = init_db(_user_db(new_user_dir))
         conn2.execute(
             "INSERT INTO images (id, file_path, file_size, modified_time, md5) VALUES (1, ?, ?, ?, ?)",
             (str(img_blue), img_blue.stat().st_size, img_blue.stat().st_mtime, md5_blue),
@@ -188,7 +193,7 @@ class TestThumbnailIsolation:
         _make_jpg(img1, color=(10, 200, 10))
         md5_1 = compute_file_md5(img1)
 
-        conn = init_db(user_dir / "argus.db")
+        conn = init_db(_user_db(user_dir))
         conn.execute(
             "INSERT INTO images (id, file_path, file_size, modified_time, md5) VALUES (1, ?, ?, ?, ?)",
             (str(img1), img1.stat().st_size, img1.stat().st_mtime, md5_1),

@@ -1,4 +1,4 @@
-# Argus — Production Deployment Guide
+# SIMILIX — Production Deployment Guide
 
 This guide covers deployment instructions for three target environments:
 1. **Local Docker / Docker Compose**
@@ -9,7 +9,7 @@ This guide covers deployment instructions for three target environments:
 
 ## 1. Local Docker Deployment (docker-compose)
 
-Argus is containerized using `python:3.11-slim`, runs as a non-root user (`argus`, UID 1000), uses CPU-only PyTorch to minimize image footprint, and pre-downloads open_clip model weights during the build so container startup is fast and offline-capable.
+SIMILIX is containerized using `python:3.11-slim`, runs as a non-root user (`similix`, UID 1000, with `argus` compatibility alias), uses CPU-only PyTorch to minimize image footprint, and pre-downloads open_clip model weights during the build so container startup is fast and offline-capable.
 
 ### Prerequisites
 - Docker Engine 24.0+ and Docker Compose v2+ installed.
@@ -23,9 +23,10 @@ Argus is containerized using `python:3.11-slim`, runs as a non-root user (`argus
    ALLOW_REGISTRATION=true
    HOSTED_MODE=false
    BASE_URL=http://localhost:8000
+   SIMILIX_DATA_DIR=/data
    ```
    > [!NOTE]
-   > Never bake secrets or private credentials into the Dockerfile or commit `.env` into git.
+   > Never bake secrets or private credentials into the Dockerfile or commit `.env` into git. Both `SIMILIX_*` and `ARGUS_*` environment variables are supported.
 
 2. **Build and Run with Docker Compose**
    ```bash
@@ -35,16 +36,16 @@ Argus is containerized using `python:3.11-slim`, runs as a non-root user (`argus
 3. **Verify Service Health & Startup Self-Check**
    ```bash
    curl http://localhost:8000/healthz
-   # Response: {"status":"ok","service":"argus"}
+   # Response: {"status":"ok","service":"similix"}
    ```
 
-   Argus logs a startup self-check banner upon boot:
+   SIMILIX logs a startup self-check banner upon boot:
    ```text
    ==================================================
-     ARGUS Startup Self-Check
+     SIMILIX Startup Self-Check
    ==================================================
      Data Directory : /data
-     DB Path        : /data/argus.db
+     DB Path        : /data/similix.db
      Secret Key Set : yes
    ==================================================
    ```
@@ -58,21 +59,21 @@ Argus is containerized using `python:3.11-slim`, runs as a non-root user (`argus
    ```
    > [!CAUTION]
    > **Never use `docker compose down -v`**.
-   > The `-v` flag deletes Docker volumes, which permanently destroys the `argus_data` volume containing `auth.db`, per-user databases, uploaded libraries, thumbnails, and ledger journals. To preserve user accounts and data across container restarts and image updates, always stop containers using `docker compose down` (without `-v`).
+   > The `-v` flag deletes Docker volumes, which permanently destroys the `similix_data` volume containing `auth.db`, per-user databases, uploaded libraries, thumbnails, and ledger journals. To preserve user accounts and data across container restarts and image updates, always stop containers using `docker compose down` (without `-v`).
 
 ### What Persists vs What Doesn't (Docker)
 
 | Data Category | Persistence | Storage Location / Explanation |
 |---|---|---|
-| **User Data & DBs** | ✅ **Persists** | Stored in Docker named volume `argus_data` mounted at `/data`. Retains `auth.db`, per-user `argus.db`, `library/`, `trash/`, `thumbnails/`, and `jobs/`. |
-| **Model Weights** | ✅ **Persists** | Pre-cached in image layer at `/home/argus/.cache/huggingface` during image build. |
+| **User Data & DBs** | ✅ **Persists** | Stored in Docker named volume `similix_data` mounted at `/data`. Retains `auth.db`, per-user `similix.db`, `library/`, `trash/`, `thumbnails/`, and `jobs/`. |
+| **Model Weights** | ✅ **Persists** | Pre-cached in image layer at `/home/similix/.cache/huggingface` during image build. |
 | **Container Root Filesystem** | ❌ **Ephemeral** | Any temporary logs, package installations, or scratch files outside `/data` will be reset if the container is recreated (`docker compose down && docker compose up`). |
 
 ---
 
 ## 2. Cloudflare Tunnel from this Mac
 
-A Cloudflare Tunnel (`cloudflared`) exposes the Argus web service securely to the internet with TLS termination without opening router ports or configuring static public IP addresses.
+A Cloudflare Tunnel (`cloudflared`) exposes the SIMILIX web service securely to the internet with TLS termination without opening router ports or configuring static public IP addresses.
 
 ### Prerequisites
 - A domain name registered or active on Cloudflare DNS.
@@ -93,7 +94,7 @@ A Cloudflare Tunnel (`cloudflared`) exposes the Argus web service securely to th
 
 3. **Create a Dedicated Tunnel**
    ```bash
-   cloudflared tunnel create argus
+   cloudflared tunnel create similix
    ```
    Note the Tunnel UUID and credentials file path printed in the output (`~/.cloudflared/<TUNNEL_ID>.json`).
 
@@ -104,39 +105,39 @@ A Cloudflare Tunnel (`cloudflared`) exposes the Argus web service securely to th
    credentials-file: /Users/<your-username>/.cloudflared/<TUNNEL_ID>.json
 
    ingress:
-     - hostname: argus.yourdomain.com
+     - hostname: similix.yourdomain.com
        service: http://127.0.0.1:8000
      - service: http_status:404
    ```
 
 5. **Route DNS Traffic to the Tunnel**
    ```bash
-   cloudflared tunnel route dns argus argus.yourdomain.com
+   cloudflared tunnel route dns similix similix.yourdomain.com
    ```
 
-6. **Start Argus and the Tunnel**
-   In terminal 1, start the Argus server (or run it via Docker Compose):
+6. **Start SIMILIX and the Tunnel**
+   In terminal 1, start the SIMILIX server (or run it via Docker Compose):
    ```bash
    # Run via Docker:
-   BASE_URL=https://argus.yourdomain.com docker compose up -d
+   BASE_URL=https://similix.yourdomain.com docker compose up -d
 
    # Or run directly via CLI:
-   BASE_URL=https://argus.yourdomain.com argus serve --host 127.0.0.1 --port 8000
+   BASE_URL=https://similix.yourdomain.com similix serve --host 127.0.0.1 --port 8000
    ```
 
    In terminal 2, launch the tunnel:
    ```bash
-   cloudflared tunnel run argus
+   cloudflared tunnel run similix
    ```
 
 7. **Verify Public Access**
-   Navigate to `https://argus.yourdomain.com` in your browser. Cloudflare automatically provides HTTPS with zero firewall changes.
+   Navigate to `https://similix.yourdomain.com` in your browser. Cloudflare automatically provides HTTPS with zero firewall changes.
 
 ### What Persists vs What Doesn't (Cloudflare Tunnel)
 
 | Data Category | Persistence | Storage Location / Explanation |
 |---|---|---|
-| **User Libraries & Ledgers** | ✅ **Persists** | Stored on the local host Mac filesystem under `~/.argus/` or inside the Docker named volume. |
+| **User Libraries & Ledgers** | ✅ **Persists** | Stored on the local host Mac filesystem under `~/.similix/` (or legacy `~/.argus/`) or inside the Docker named volume. |
 | **Tunnel Connection State** | ❌ **Stateless** | Cloudflare tunnels are stateless multiplexed connections. If the Mac sleeps or connection drops, the tunnel automatically reconnects upon waking. |
 
 ---
@@ -156,7 +157,7 @@ Hugging Face Spaces allows hosting containerized web applications directly on ma
    In your Hugging Face Space repository, include YAML frontmatter at the top of `README.md`:
    ```yaml
    ---
-   title: Argus Deduplication
+   title: SIMILIX Deduplication
    emoji: 🔍
    colorFrom: blue
    colorTo: indigo
@@ -172,11 +173,11 @@ Hugging Face Spaces allows hosting containerized web applications directly on ma
    - `HOSTED_MODE`: `true` (Disables local directory scanning and dataset URL fetching)
    - `ALLOW_REGISTRATION`: `true` (or `false` for invite-only)
    - `SECRET_KEY`: `<minimum 32 character random string>` (Required in hosted mode)
-   - `ARGUS_DATA_DIR`: `/data` (Single root for all user databases, libraries, jobs, and thumbnails)
+   - `SIMILIX_DATA_DIR`: `/data` (Single root for all user databases, libraries, jobs, and thumbnails; `ARGUS_DATA_DIR` also supported)
 
 4. **Push Repository to Hugging Face**
    ```bash
-   git remote add space https://huggingface.co/spaces/<your-username>/argus
+   git remote add space https://huggingface.co/spaces/<your-username>/similix
    git push space main
    ```
 
@@ -188,13 +189,13 @@ Hugging Face Spaces allows hosting containerized web applications directly on ma
 | Tier | Path | Persistence | Explanation |
 |---|---|---|---|
 | **Free Tier** | `/data` or `/app` | ❌ **Ephemeral** | The container filesystem is ephemeral. Whenever the Space restarts, updates, or goes to sleep after inactivity, **all uploaded images, users, and SQLite databases will be wiped clean**. |
-| **Persistent Storage Tier** | `/data` | ✅ **Persists** | When **Persistent Storage** (Small, Medium, or Large) is purchased and enabled in Space settings, `/data` is backed by network-attached storage. Setting `ARGUS_DATA_DIR=/data` guarantees that all users, credentials, image libraries, ledgers, and deduplication states **persist permanently across restarts and rebuilds**. |
+| **Persistent Storage Tier** | `/data` | ✅ **Persists** | When **Persistent Storage** (Small, Medium, or Large) is purchased and enabled in Space settings, `/data` is backed by network-attached storage. Setting `SIMILIX_DATA_DIR=/data` guarantees that all users, credentials, image libraries, ledgers, and deduplication states **persist permanently across restarts and rebuilds**. |
 
 ---
 
 ## 4. Oracle Cloud / VPS Ubuntu Server
 
-This section covers self-hosting Argus on any Ubuntu 22.04+ VPS (Oracle Cloud Free Tier, DigitalOcean, Linode, Hetzner, etc.) with Docker, an HTTPS reverse proxy via Caddy, and systemd for automatic restarts.
+This section covers self-hosting SIMILIX on any Ubuntu 22.04+ VPS (Oracle Cloud Free Tier, DigitalOcean, Linode, Hetzner, etc.) with Docker, an HTTPS reverse proxy via Caddy, and systemd for automatic restarts.
 
 ### Prerequisites
 
@@ -230,16 +231,16 @@ newgrp docker
 ### Step 2: Clone the Repository and Configure
 
 ```bash
-git clone https://github.com/your-org/argus.git /opt/argus
-cd /opt/argus
+git clone https://github.com/your-org/similix.git /opt/similix
+cd /opt/similix
 
 # Create .env with your secrets
 cat > .env <<'EOF'
 SECRET_KEY=<at-least-32-random-characters>
 ALLOW_REGISTRATION=true
 HOSTED_MODE=false
-BASE_URL=https://argus.yourdomain.com
-ARGUS_DATA_DIR=/data
+BASE_URL=https://similix.yourdomain.com
+SIMILIX_DATA_DIR=/data
 EOF
 ```
 
@@ -249,9 +250,9 @@ EOF
 ### Step 3: Build and Start with Docker Compose
 
 ```bash
-cd /opt/argus
+cd /opt/similix
 docker compose up --build -d
-docker compose ps        # verify argus-app is Up
+docker compose ps        # verify similix-app is Up
 docker compose logs -f   # watch startup logs
 ```
 
@@ -269,7 +270,7 @@ sudo apt-get update && sudo apt-get install -y caddy
 Create `/etc/caddy/Caddyfile`:
 
 ```caddyfile
-argus.yourdomain.com {
+similix.yourdomain.com {
     reverse_proxy localhost:8000
 }
 ```
@@ -293,22 +294,22 @@ sudo ufw status
 ```
 
 > [!IMPORTANT]
-> Do **not** expose port 8000 publicly — all traffic must go through Caddy (port 443). Argus binds only on `localhost:8000`.
+> Do **not** expose port 8000 publicly — all traffic must go through Caddy (port 443). SIMILIX binds only on `localhost:8000`.
 
 ### Step 6: Systemd Service for Auto-Start on Boot
 
-Create `/etc/systemd/system/argus.service`:
+Create `/etc/systemd/system/similix.service`:
 
 ```ini
 [Unit]
-Description=Argus Deduplication Service
+Description=SIMILIX Deduplication Service
 After=docker.service network-online.target
 Requires=docker.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-WorkingDirectory=/opt/argus
+WorkingDirectory=/opt/similix
 ExecStart=/usr/bin/docker compose up -d --remove-orphans
 ExecStop=/usr/bin/docker compose down
 TimeoutStartSec=120
@@ -319,13 +320,13 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable argus
-sudo systemctl start argus
+sudo systemctl enable similix
+sudo systemctl start similix
 ```
 
 ### Step 7: Automated Backup of Data Volume
 
-Add a daily cron job to back up the `argus_data` Docker volume:
+Add a daily cron job to back up the `similix_data` Docker volume:
 
 ```bash
 sudo crontab -e
@@ -334,11 +335,11 @@ sudo crontab -e
 Add the following line:
 
 ```cron
-0 3 * * * docker run --rm -v argus_argus_data:/data:ro -v /opt/backups/argus:/backup alpine tar czf /backup/argus_data_$(date +\%Y\%m\%d).tar.gz -C /data . && find /opt/backups/argus -name "*.tar.gz" -mtime +30 -delete
+0 3 * * * docker run --rm -v similix_similix_data:/data:ro -v /opt/backups/similix:/backup alpine tar czf /backup/similix_data_$(date +\%Y\%m\%d).tar.gz -C /data . && find /opt/backups/similix -name "*.tar.gz" -mtime +30 -delete
 ```
 
 ```bash
-sudo mkdir -p /opt/backups/argus
+sudo mkdir -p /opt/backups/similix
 ```
 
 > [!NOTE]
@@ -346,13 +347,13 @@ sudo mkdir -p /opt/backups/argus
 
 ### Step 8: Google Drive Integration (Optional)
 
-To enable Google Drive sign-in, copy your `client_secret.json` into the Argus data volume:
+To enable Google Drive sign-in, copy your `client_secret.json` into the SIMILIX data volume:
 
 ```bash
-docker cp /path/to/client_secret.json argus-app:/data/client_secret.json
+docker cp /path/to/client_secret.json similix-app:/data/client_secret.json
 ```
 
-Or mount it read-only via `docker-compose.yml` (add under `volumes:` in the `argus` service):
+Or mount it read-only via `docker-compose.yml` (add under `volumes:` in the `similix` service):
 
 ```yaml
 # Uncomment and set path if client_secret.json exists on the host:
@@ -363,7 +364,7 @@ Or mount it read-only via `docker-compose.yml` (add under `volumes:` in the `arg
 
 | Data Category | Persistence | Storage Location / Explanation |
 |---|---|---|
-| **User Data & DBs** | ✅ **Persists** | Stored in Docker named volume `argus_data` at `/data` on the host. Survives container restarts, image rebuilds, and OS reboots (as long as the volume is not manually deleted). |
+| **User Data & DBs** | ✅ **Persists** | Stored in Docker named volume `similix_data` at `/data` on the host. Survives container restarts, image rebuilds, and OS reboots (as long as the volume is not manually deleted). |
 | **TLS Certificates** | ✅ **Persists** | Managed by Caddy and stored in `/var/lib/caddy/`. Auto-renewed before expiry. |
-| **Daily Backups** | ✅ **Persists** | Written to `/opt/backups/argus/` on the host. Retained for 30 days. |
+| **Daily Backups** | ✅ **Persists** | Written to `/opt/backups/similix/` on the host. Retained for 30 days. |
 | **Container Layers** | ❌ **Ephemeral** | Rebuilt with `docker compose up --build`. Does not affect user data in the named volume. |

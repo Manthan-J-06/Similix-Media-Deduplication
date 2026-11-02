@@ -1,4 +1,4 @@
-# ARGUS — Local-First Intelligent Image Deduplication
+# SIMILIX — Local-First Intelligent Image Deduplication
 
 <p align="center">
   <strong>High-precision image deduplication, clustering, semantic categorization, and safe library cleanup.</strong>
@@ -8,7 +8,7 @@
   <a href="#what-it-does">What It Does</a> •
   <a href="#architecture">Architecture & Visuals</a> •
   <a href="#installation">Installation</a> •
-  <a href="#running-argus">Running Argus</a> •
+  <a href="#running-similix">Running SIMILIX</a> •
   <a href="#docker-deployment">Docker</a> •
   <a href="#limits-and-quotas">Limits</a> •
   <a href="#privacy-note">Privacy Note</a>
@@ -18,7 +18,7 @@
 
 ## What It Does
 
-Argus is an open-source, local-first image deduplication and library management platform. It identifies exact byte-for-byte duplicates as well as near-duplicate images resulting from crops, aspect ratio changes, color adjustments, watermark additions, and recompressions, without sending your pictures to any third-party cloud.
+SIMILIX is an open-source, local-first image deduplication and library management platform. It identifies exact byte-for-byte duplicates as well as near-duplicate images resulting from crops, aspect ratio changes, color adjustments, watermark additions, and recompressions, without sending your pictures to any third-party cloud.
 
 ### Key Capabilities
 
@@ -79,7 +79,7 @@ flowchart TD
 #### Duplicates View
 ```
 +---------------------------------------------------------------------------------------+
-|  [ARGUS Logo] ARGUS          [All photos] [Duplicates]           user@example.com [v] |
+|  [SIMILIX Logo] SIMILIX      [All photos] [Duplicates]           user@example.com [v] |
 +------------------------+--------------------------------------------------------------+
 | MODES:                 | Cluster #4  •  Beach (94%)  •  Sunset (88%)                  |
 | [Cons.] (Bal.) [Aggr.] | Potential savings: 14.8 MB (68%)                             |
@@ -96,7 +96,7 @@ flowchart TD
 #### All Photos (Library) View
 ```
 +---------------------------------------------------------------------------------------+
-|  [ARGUS Logo] ARGUS          (All photos) [Duplicates]           user@example.com [v] |
+|  [SIMILIX Logo] SIMILIX      (All photos) [Duplicates]           user@example.com [v] |
 +---------------------------------------------------------------------------------------+
 | Search: [Search photos...     ]  Category: [Food and drink (18) v]  [Download Keepers]|
 +---------------------------------------------------------------------------------------+
@@ -124,8 +124,8 @@ flowchart TD
 ### 1. Clone & Set Up Virtual Environment
 
 ```bash
-git clone https://github.com/manthanj/argus.git
-cd argus
+git clone https://github.com/manthanj/similix.git
+cd similix
 
 python3.11 -m venv .venv
 source .venv/bin/activate
@@ -149,23 +149,23 @@ python -c "import open_clip; open_clip.create_model_and_transforms('ViT-B-32', p
 
 ---
 
-## Running Argus
+## Running SIMILIX
 
 ### Launching the Web Server
 
-Run the Argus API and Web UI server:
+Run the SIMILIX API and Web UI server (you can use `similix` or the backward-compatible `argus` alias):
 
 ```bash
-argus serve --host 127.0.0.1 --port 8000
+similix serve --host 127.0.0.1 --port 8000
 ```
 
-Upon boot, Argus performs an automatic startup self-check:
+Upon boot, SIMILIX performs an automatic startup self-check:
 ```text
 ==================================================
-  ARGUS Startup Self-Check
+  SIMILIX Startup Self-Check
 ==================================================
-  Data Directory : /Users/user/.argus
-  DB Path        : /Users/user/.argus/argus.db
+  Data Directory : /Users/user/.similix
+  DB Path        : /Users/user/.similix/similix.db
   Secret Key Set : yes
 ==================================================
 ```
@@ -174,26 +174,26 @@ Open `http://127.0.0.1:8000` in your web browser. First-time users can register 
 
 ### CLI Usage
 
-Argus provides CLI commands for headless terminal operations:
+SIMILIX provides CLI commands for headless terminal operations (both `similix` and `argus` commands are supported):
 
 ```bash
-# 1. Scan a local folder into an Argus database
-argus scan ~/Pictures/Vacation --db vacation.db
+# 1. Scan a local folder into a SIMILIX database
+similix scan ~/Pictures/Vacation --db vacation.db
 
 # 2. Cluster duplicates across conservative, balanced, or aggressive modes
-argus cluster --db vacation.db --mode balanced
+similix cluster --db vacation.db --mode balanced
 
 # 3. Review duplicate clusters in terminal
-argus review --db vacation.db
+similix review --db vacation.db
 
 # 4. Preview safe deletions without touching files
-argus apply --db vacation.db --dry-run
+similix apply --db vacation.db --dry-run
 
 # 5. Move safe copies to trash
-argus apply --db vacation.db
+similix apply --db vacation.db
 
 # 6. Undo the last deletion batch
-argus undo --db vacation.db
+similix undo --db vacation.db
 ```
 
 ### Google Drive Authentication
@@ -201,7 +201,7 @@ argus undo --db vacation.db
 To enable Google Drive folder ingestion:
 
 ```bash
-argus drive-auth --client-secret /path/to/client_secret.json
+similix drive-auth --client-secret /path/to/client_secret.json
 ```
 
 Follow the terminal instructions to authorize read access. Tokens are cached locally in your persistent data root.
@@ -210,7 +210,7 @@ Follow the terminal instructions to authorize read access. Tokens are cached loc
 
 ## Docker Deployment
 
-Argus includes a multi-stage `Dockerfile` and `docker-compose.yml` for containerized deployments:
+SIMILIX includes a multi-stage `Dockerfile` and `docker-compose.yml` for containerized deployments:
 
 ```bash
 # Build and run in detached mode
@@ -225,7 +225,7 @@ docker compose down
 
 > [!CAUTION]
 > **Never run `docker compose down -v`**.
-> The `-v` flag destroys Docker named volumes, which will permanently delete your `argus_data` volume containing your user database, uploaded libraries, and ledger journals.
+> The `-v` flag destroys Docker named volumes, which will permanently delete your `similix_data` volume containing your user database, uploaded libraries, and ledger journals.
 
 See [DEPLOY.md](DEPLOY.md) for full deployment instructions covering Docker, Cloudflare Tunnels, and Hugging Face Spaces.
 
@@ -247,8 +247,8 @@ See [DEPLOY.md](DEPLOY.md) for full deployment instructions covering Docker, Clo
 ## Privacy Note
 
 - **100% Local-First**: All vision transformers, perceptual hash algorithms, SIFT/SSIM calculations, and database operations execute locally on your hardware.
-- **Zero Telemetry**: Argus contains no tracking pixels, telemetry probes, third-party analytics, or remote cloud pings.
-- **Air-Gapped & Offline Capable**: Once model weights are cached, Argus can run completely severed from the internet.
+- **Zero Telemetry**: SIMILIX contains no tracking pixels, telemetry probes, third-party analytics, or remote cloud pings.
+- **Air-Gapped & Offline Capable**: Once model weights are cached, SIMILIX can run completely severed from the internet.
 - **Reversible Safety**: Deletions move files to system trash and log cryptographic records to the SQLite ledger, enabling instant undo at any time.
 
 ---

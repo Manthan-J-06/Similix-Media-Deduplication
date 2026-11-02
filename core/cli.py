@@ -1,8 +1,9 @@
 """
-core/cli.py — Command-line interface for Argus.
+core/cli.py — Command-line interface for SIMILIX (with argus alias).
 
 Usage:
     python -m core.cli scan <folder>
+    similix scan <folder>
     argus scan <folder>
 """
 
@@ -46,11 +47,11 @@ def cmd_scan(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     cfg = load_config(args.config)
-    db_path = args.db or cfg.get("general", {}).get("db_path", "argus.db")
+    db_path = args.db or cfg.get("general", {}).get("db_path", "similix.db" if not Path("argus.db").exists() else "argus.db")
     conn = init_db(db_path)
 
     print(f"==================================================")
-    print(f"  ARGUS Image Deduplication Pipeline")
+    print(f"  SIMILIX Image Deduplication Pipeline")
     print(f"==================================================")
     print(f"Target folder : {folder}")
     print(f"Database      : {db_path}")
@@ -144,7 +145,7 @@ def cmd_embed(args: argparse.Namespace) -> None:
     rotations = stage2_cfg.get("enable_rotation_embeddings", False)
 
     print("==================================================")
-    print("  ARGUS Stage 2 CLIP Embedding Pipeline")
+    print("  SIMILIX Stage 2 CLIP Embedding Pipeline")
     print("==================================================")
     print(f"Target        : {target_display}")
     print(f"Database      : {db_path}")
@@ -186,7 +187,7 @@ def cmd_cluster(args: argparse.Namespace) -> None:
     index_path = args.index or stage2_cfg.get("faiss_index_path", str(Path(db_path).with_suffix(".faiss")))
 
     print("==================================================")
-    print("  ARGUS Stage 2 Duplicate Clustering")
+    print("  SIMILIX Stage 2 Duplicate Clustering")
     print("==================================================")
     print(f"Database         : {db_path}")
     print(f"FAISS Index      : {index_path}")
@@ -235,7 +236,7 @@ def cmd_verify(args: argparse.Namespace) -> None:
     min_rat = stage3_cfg.get("min_inlier_ratio", 0.65)
 
     print("==================================================")
-    print("  ARGUS Stage 3 Geometric Verification")
+    print("  SIMILIX Stage 3 Geometric Verification")
     print("==================================================")
     print(f"Database         : {db_path}")
     print(f"Algorithm        : {algo.upper()}")
@@ -286,7 +287,7 @@ def cmd_quality(args: argparse.Namespace) -> None:
     min_rat = q_cfg.get("min_align_inlier_ratio", 0.50)
 
     print("==================================================")
-    print("  ARGUS Quality Scoring & Geometric Alignment")
+    print("  SIMILIX Quality Scoring & Geometric Alignment")
     print("==================================================")
     print(f"Database         : {db_path}")
     print(f"Proxy Size       : {proxy_sz}px")
@@ -329,7 +330,7 @@ def cmd_keeper(args: argparse.Namespace) -> None:
     mode = args.mode or cfg.get("keeper", {}).get("default_mode", "balanced")
 
     print("==================================================")
-    print("  ARGUS Stage 4 Keeper Selection & Deletion Plan")
+    print("  SIMILIX Stage 4 Keeper Selection & Deletion Plan")
     print("==================================================")
     print(f"Database         : {db_path}")
     print(f"Keeper Mode      : {mode.upper()}")
@@ -360,7 +361,7 @@ def cmd_plan(args: argparse.Namespace) -> None:
     mode = args.mode or cfg.get("keeper", {}).get("default_mode", "balanced")
 
     print("==================================================")
-    print("  ARGUS Deletion Planning (core/ledger)")
+    print("  SIMILIX Deletion Planning (core/ledger)")
     print("==================================================")
     print(f"Database         : {db_path}")
     print(f"Mode             : {mode.upper()}")
@@ -378,7 +379,7 @@ def cmd_plan(args: argparse.Namespace) -> None:
     print("--------------------------------------------------")
     if summary.file_count > 0:
         print(f"To execute this batch and move files to trash, run:")
-        print(f"  argus apply {summary.batch_id} --confirm")
+        print(f"  similix apply {summary.batch_id} --confirm")
     else:
         print("No files eligible for deletion in this mode.")
 
@@ -395,7 +396,7 @@ def cmd_apply(args: argparse.Namespace) -> None:
             d_res = dry_run(conn, args.batch_id)
         except ValueError as e:
             if f"Batch '{args.batch_id}' not found" in str(e):
-                print(f"Batch '{args.batch_id}' not found; run `argus history`", file=sys.stderr)
+                print(f"Batch '{args.batch_id}' not found; run `similix history`", file=sys.stderr)
                 sys.exit(1)
             raise
         print(f"Batch ID       : {d_res.batch_id}")
@@ -408,11 +409,11 @@ def cmd_apply(args: argparse.Namespace) -> None:
 
     if not args.confirm:
         print("Error: The 'apply' command moves files to trash and requires the --confirm flag.", file=sys.stderr)
-        print(f"Run: argus apply {args.batch_id} --confirm", file=sys.stderr)
+        print(f"Run: similix apply {args.batch_id} --confirm", file=sys.stderr)
         sys.exit(1)
 
     print("==================================================")
-    print("  ARGUS Applying Deletion Batch (core/ledger)")
+    print("  SIMILIX Applying Deletion Batch (core/ledger)")
     print("==================================================")
     print(f"Batch ID         : {args.batch_id}")
     print(f"Database         : {db_path}")
@@ -423,7 +424,7 @@ def cmd_apply(args: argparse.Namespace) -> None:
         res = execute(conn, batch_id=args.batch_id, confirm=True)
     except ValueError as e:
         if f"Batch '{args.batch_id}' not found" in str(e):
-            print(f"Batch '{args.batch_id}' not found; run `argus history`", file=sys.stderr)
+            print(f"Batch '{args.batch_id}' not found; run `similix history`", file=sys.stderr)
             sys.exit(1)
         raise
 
@@ -445,7 +446,7 @@ def cmd_apply(args: argparse.Namespace) -> None:
         for f in res.failures:
             print(f"  - {f['path']}: {f['error']}")
     if res.moved_count > 0:
-        print(f"\nTo rollback this batch, run:\n  argus undo {args.batch_id}")
+        print(f"\nTo rollback this batch, run:\n  similix undo {args.batch_id}")
 
 
 def cmd_undo(args: argparse.Namespace) -> None:
@@ -454,7 +455,7 @@ def cmd_undo(args: argparse.Namespace) -> None:
     conn = init_db(db_path)
 
     print("==================================================")
-    print("  ARGUS Undo / Restore Trashed Files")
+    print("  SIMILIX Undo / Restore Trashed Files")
     print("==================================================")
     print(f"Database         : {db_path}")
 
@@ -481,7 +482,7 @@ def cmd_undo(args: argparse.Namespace) -> None:
         res = undo(conn, batch_id=args.batch_id)
     except ValueError as e:
         if f"Batch '{args.batch_id}' not found" in str(e):
-            print(f"Batch '{args.batch_id}' not found; run `argus history`", file=sys.stderr)
+            print(f"Batch '{args.batch_id}' not found; run `similix history`", file=sys.stderr)
             sys.exit(1)
         raise
 
@@ -503,7 +504,7 @@ def cmd_purge(args: argparse.Namespace) -> None:
 
     if not args.confirm:
         print("Error: The 'purge' command permanently removes files from trash and requires the --confirm flag.", file=sys.stderr)
-        print(f"Run: argus purge {args.batch_id} --confirm", file=sys.stderr)
+        print(f"Run: similix purge {args.batch_id} --confirm", file=sys.stderr)
         sys.exit(1)
 
     from core.ledger import purge
@@ -511,13 +512,13 @@ def cmd_purge(args: argparse.Namespace) -> None:
         res = purge(conn, batch_id=args.batch_id, confirm=True, max_age_days=min_age)
     except ValueError as e:
         if f"Batch '{args.batch_id}' not found" in str(e):
-            print(f"Batch '{args.batch_id}' not found; run `argus history`", file=sys.stderr)
+            print(f"Batch '{args.batch_id}' not found; run `similix history`", file=sys.stderr)
             sys.exit(1)
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
     print("==================================================")
-    print("  ARGUS Purge Trashed Files")
+    print("  SIMILIX Purge Trashed Files")
     print("==================================================")
     print(f"Batch ID         : {res.batch_id}")
     print(f"Purged files     : {res.purged_count}")
@@ -534,7 +535,7 @@ def cmd_history(args: argparse.Namespace) -> None:
     batches = get_history(conn, limit=args.limit)
 
     print("====================================================================================================")
-    print(f"  ARGUS Deletion Ledger History ({len(batches)} batches)")
+    print(f"  SIMILIX Deletion Ledger History ({len(batches)} batches)")
     print("====================================================================================================")
     header = f"{'Batch ID':<36} | {'Created At':<20} | {'Mode':<12} | {'Status':<10} | {'Files':<6} | {'Freed (MB)'}"
     print(header)
@@ -568,7 +569,7 @@ def cmd_categorize(args: argparse.Namespace) -> None:
     from core.categories import run_categorization
 
     print("==================================================")
-    print("  ARGUS Zero-Shot Semantic Categorization")
+    print("  SIMILIX Zero-Shot Semantic Categorization")
     print("==================================================")
     print(f"Database : {db_path}")
     print(f"Mode     : {'Force re-categorize' if args.force else 'Resumable (skip labeled)'}")
@@ -605,7 +606,7 @@ def cmd_search(args: argparse.Namespace) -> None:
     results = search_images_by_text(args.query, conn, cfg, limit=args.limit)
 
     print("====================================================================================================")
-    print(f"  ARGUS Semantic Text Search: \"{args.query}\" ({len(results)} results)")
+    print(f"  SIMILIX Semantic Text Search: \"{args.query}\" ({len(results)} results)")
     print("====================================================================================================")
     header = f"{'Rank':<4} | {'Score':<7} | {'Category':<14} | {'Prob':<6} | {'Resolution':<11} | {'File Path'}"
     print(header)
@@ -639,7 +640,7 @@ def cmd_list(args: argparse.Namespace) -> None:
 
     print("====================================================================================================")
     cat_title = f" [Category: {args.category}]" if args.category else ""
-    print(f"  ARGUS Image List{cat_title} ({len(rows)} images displayed, limit {args.limit})")
+    print(f"  SIMILIX Image List{cat_title} ({len(rows)} images displayed, limit {args.limit})")
     print("====================================================================================================")
     header = f"{'ID':<6} | {'Category':<14} | {'Prob':<6} | {'Resolution':<11} | {'Size (KB)':<10} | {'File Path'}"
     print(header)
@@ -693,7 +694,7 @@ def cmd_show(args: argparse.Namespace) -> None:
         return
 
     print("=" * 115)
-    print(f"  ARGUS Duplicate Clusters Summary: {db_path} ({len(clusters)} clusters) [Mode: {mode.upper()}]")
+    print(f"  SIMILIX Duplicate Clusters Summary: {db_path} ({len(clusters)} clusters) [Mode: {mode.upper()}]")
     print("=" * 115)
 
     total_swap_proposals = 0
@@ -804,14 +805,14 @@ def cmd_serve(args: argparse.Namespace) -> None:
     secret_is_set = "yes" if bool(os.environ.get("SECRET_KEY") or cfg.get("auth", {}).get("secret_key")) else "no"
     print(
         f"\n==================================================\n"
-        f"  ARGUS Startup Self-Check\n"
+        f"  SIMILIX Startup Self-Check\n"
         f"==================================================\n"
         f"  Data Directory : {app.state.data_root}\n"
         f"  DB Path        : {app.state.db_path}\n"
         f"  Secret Key Set : {secret_is_set}\n"
         f"=================================================="
     )
-    print(f"Starting Argus API server on http://{host}:{port} (data root: {app.state.data_root}, auth db: {app.state.auth_db_path}, users: {app.state.users_dir})")
+    print(f"Starting SIMILIX API server on http://{host}:{port} (data root: {app.state.data_root}, auth db: {app.state.auth_db_path}, users: {app.state.users_dir})")
     uvicorn.run(app, host=host, port=port)
 
 
@@ -826,7 +827,7 @@ def cmd_drive_auth(args: argparse.Namespace) -> None:
     token_path = args.token or DEFAULT_TOKEN_PATH
 
     print("==================================================")
-    print("  ARGUS Google Drive Authorization (READ-ONLY)")
+    print("  SIMILIX Google Drive Authorization (READ-ONLY)")
     print("==================================================")
     print(f"Client Secret : {client_secret}")
     print(f"Token Path    : {token_path}")
@@ -860,7 +861,7 @@ def cmd_scan_drive(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     print("==================================================")
-    print("  ARGUS Google Drive Deduplication Pipeline")
+    print("  SIMILIX Google Drive Deduplication Pipeline")
     print("==================================================")
     target_str = "Whole Drive (--all)" if all_drive else f"Folder ID: {folder_id}"
     print(f"Target        : {target_str}")
@@ -921,7 +922,7 @@ def cmd_confirm_drive(args: argparse.Namespace) -> None:
     mode = getattr(args, "mode", "balanced")
 
     print("==================================================")
-    print("  ARGUS Google Drive Full-Resolution Confirmation")
+    print("  SIMILIX Google Drive Full-Resolution Confirmation")
     print("==================================================")
     print(f"Database      : {db_path}")
     print(f"Mode          : {mode}")
@@ -945,9 +946,12 @@ def cmd_confirm_drive(args: argparse.Namespace) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
+    prog_name = "similix"
+    if sys.argv and Path(sys.argv[0]).stem == "argus":
+        prog_name = "argus"
     parser = argparse.ArgumentParser(
-        prog="argus",
-        description="Argus: Local-first Image Deduplication System",
+        prog=prog_name,
+        description="SIMILIX: Local-first Image Deduplication System",
     )
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
 
@@ -1043,7 +1047,7 @@ def main(argv: list[str] | None = None) -> None:
     show_parser.add_argument("--db", default=None, help="Path to SQLite database file")
     show_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
 
-    serve_parser = subparsers.add_parser("serve", help="Start the Argus FastAPI server on 127.0.0.1:8000")
+    serve_parser = subparsers.add_parser("serve", help="Start the SIMILIX FastAPI server on 127.0.0.1:8000")
     serve_parser.add_argument("folder", nargs="?", default=None, help="Path to image folder or database (optional)")
     serve_parser.add_argument("--db", default=None, help="Path to SQLite database file")
     serve_parser.add_argument("--host", default=None, help="Host to bind (default: 127.0.0.1 or $HOST)")

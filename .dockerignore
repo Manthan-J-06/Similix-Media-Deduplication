@@ -32,6 +32,8 @@ htmlcov/
 *.db-journal
 *.db-wal
 *.db-shm
+.similix/
+~/.similix/
 .argus/
 ~/.argus/
 data/
@@ -42,6 +44,7 @@ thumbnails/
 jobs/
 drive_cache/
 bench/results/
+similix_data/
 argus_data/
 
 # Secrets & credentials

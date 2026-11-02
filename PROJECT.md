@@ -1,4 +1,4 @@
-# Argus — Local-First Image Deduplication System
+# SIMILIX — Local-First Image Deduplication System
 
 > **Status:** See [Current Status](#current-status) section below.
 

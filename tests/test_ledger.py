@@ -576,25 +576,25 @@ class TestLedgerCLI:
             main(["apply", fake_id, "--confirm", "--db", str(db_file)])
         assert exc.value.code != 0
         err = capsys.readouterr().err
-        assert f"Batch '{fake_id}' not found; run `argus history`" in err
+        assert f"Batch '{fake_id}' not found; run `similix history`" in err
 
         # 2. apply --dry-run
         with pytest.raises(SystemExit) as exc:
             main(["apply", fake_id, "--dry-run", "--db", str(db_file)])
         assert exc.value.code != 0
         err = capsys.readouterr().err
-        assert f"Batch '{fake_id}' not found; run `argus history`" in err
+        assert f"Batch '{fake_id}' not found; run `similix history`" in err
 
         # 3. undo
         with pytest.raises(SystemExit) as exc:
             main(["undo", fake_id, "--db", str(db_file)])
         assert exc.value.code != 0
         err = capsys.readouterr().err
-        assert f"Batch '{fake_id}' not found; run `argus history`" in err
+        assert f"Batch '{fake_id}' not found; run `similix history`" in err
 
         # 4. purge
         with pytest.raises(SystemExit) as exc:
             main(["purge", fake_id, "--confirm", "--db", str(db_file)])
         assert exc.value.code != 0
         err = capsys.readouterr().err
-        assert f"Batch '{fake_id}' not found; run `argus history`" in err
+        assert f"Batch '{fake_id}' not found; run `similix history`" in err

@@ -1,5 +1,5 @@
 """
-api/server.py — FastAPI REST API for Argus.
+api/server.py — FastAPI REST API for SIMILIX.
 
 Binds to 127.0.0.1 only. No CORS for external origins.
 All file moves/deletions are strictly routed through core/ledger.
@@ -54,7 +54,7 @@ from core.auth import (
     validate_confined_user_path,
 )
 from core.categories import search_images_by_text
-from core.config import load_config
+from core.config import load_config, get_env, resolve_data_dir
 from core.keeper import choose_keeper
 from core.ledger import (
     ensure_ledger_tables,
@@ -66,7 +66,7 @@ from core.ledger import (
 )
 from db.connection import get_connection, init_db
 
-logger = logging.getLogger("argus.api")
+logger = logging.getLogger("similix.api")
 
 # In-process synchronization locks for concurrent thumbnail generation
 _thumb_locks: dict[tuple[int, int], threading.Lock] = {}
@@ -224,9 +224,10 @@ def find_drive_client_secret(config: dict | None = None, data_dir: Path | None =
         candidates.append(Path(cfg_path).expanduser())
     if data_dir:
         candidates.append(data_dir / "client_secret.json")
-    env_data_dir = os.environ.get("ARGUS_DATA_DIR")
+    env_data_dir = get_env("DATA_DIR")
     if env_data_dir:
         candidates.append(Path(env_data_dir).expanduser() / "client_secret.json")
+    candidates.append(Path.home() / ".similix" / "client_secret.json")
     candidates.append(Path.home() / ".argus" / "client_secret.json")
     candidates.append(Path("client_secret.json").resolve())
 
@@ -548,7 +549,7 @@ def launch_pipeline_job(
 
 def get_current_user(request: Request) -> UserContext:
     """Validate session cookie or Bearer token, enforce CSRF on POST, and resolve user dirs."""
-    token = request.cookies.get("argus_session")
+    token = request.cookies.get("similix_session") or request.cookies.get("argus_session")
     if not token:
         auth_h = request.headers.get("Authorization", "")
         if auth_h.startswith("Bearer "):
@@ -771,68 +772,70 @@ def create_app(
     auth_db_path: str | Path | None = None,
     users_dir: str | Path | None = None,
 ) -> FastAPI:
-    """Create and configure the Argus FastAPI application with per-user isolation."""
+    """Create and configure the SIMILIX FastAPI application with per-user isolation."""
     if config is None:
         try:
             config = load_config(config_path) if config_path else load_config()
         except Exception:
             config = {}
 
-    raw_data_dir = os.environ.get("ARGUS_DATA_DIR") or config.get("general", {}).get("data_dir")
-    if raw_data_dir:
-        data_root = Path(raw_data_dir).expanduser().resolve()
-        data_root.mkdir(parents=True, exist_ok=True)
-    else:
-        cand = Path.home() / ".argus"
-        try:
-            cand.mkdir(parents=True, exist_ok=True)
-            test_f = cand / ".perm_check"
-            test_f.touch()
-            test_f.unlink()
-            data_root = cand.resolve()
-        except (OSError, PermissionError):
-            data_root = Path.cwd() / ".argus"
-            data_root.mkdir(parents=True, exist_ok=True)
+    raw_data_dir = get_env("DATA_DIR") or config.get("general", {}).get("data_dir")
+    data_root = resolve_data_dir(raw_data_dir)
 
     explicit_db_path = db_path is not None
     if not explicit_db_path:
-        db_path = os.environ.get("ARGUS_DB_PATH") or (data_root / "argus.db" if raw_data_dir else (config.get("database", {}).get("path") or (data_root / "argus.db")))
+        db_env = get_env("DB_PATH")
+        if db_env:
+            db_path = db_env
+        else:
+            cand_db = data_root / "similix.db"
+            if not cand_db.exists() and (data_root / "argus.db").exists():
+                db_path = data_root / "argus.db"
+            else:
+                db_path = cand_db if raw_data_dir else (config.get("database", {}).get("path") or cand_db)
     resolved_db_path = Path(db_path).expanduser().resolve()
 
-    if trash_dir is None:
-        trash_dir = os.environ.get("ARGUS_TRASH_DIR") or (data_root / "trash" if raw_data_dir else (config.get("ledger", {}).get("trash_dir") or (data_root / "trash")))
-    resolved_trash_dir = Path(trash_dir).expanduser().resolve()
-    resolved_trash_dir.mkdir(parents=True, exist_ok=True)
+    def _safe_resolve_dir(raw_arg: str | Path | None, env_key: str, cfg_val: str | None, subfolder: str) -> Path:
+        if raw_arg is not None:
+            cand = Path(raw_arg).expanduser().resolve()
+        else:
+            env_val = get_env(env_key)
+            if env_val:
+                cand = Path(env_val).expanduser().resolve()
+            elif raw_data_dir or not cfg_val:
+                cand = (data_root / subfolder).resolve()
+            else:
+                expanded = Path(cfg_val).expanduser()
+                if expanded in (Path.home() / ".similix" / subfolder, Path.home() / ".argus" / subfolder):
+                    cand = (data_root / subfolder).resolve()
+                else:
+                    cand = expanded.resolve()
+        try:
+            cand.mkdir(parents=True, exist_ok=True)
+            return cand
+        except (OSError, PermissionError):
+            fallback = (data_root / subfolder).resolve()
+            fallback.mkdir(parents=True, exist_ok=True)
+            return fallback
 
-    if thumb_cache_dir is None:
-        thumb_cache_dir = os.environ.get("ARGUS_THUMB_CACHE_DIR") or (data_root / "thumbnails")
-    resolved_thumb_cache_dir = Path(thumb_cache_dir).expanduser().resolve()
-    resolved_thumb_cache_dir.mkdir(parents=True, exist_ok=True)
-
-    if library_dir is None:
-        library_dir = os.environ.get("ARGUS_LIBRARY_DIR") or (data_root / "library" if raw_data_dir else (config.get("sources", {}).get("library_dir") or (data_root / "library")))
-    resolved_library_dir = Path(library_dir).expanduser().resolve()
-    resolved_library_dir.mkdir(parents=True, exist_ok=True)
-
-    if jobs_dir is None:
-        jobs_dir = os.environ.get("ARGUS_JOBS_DIR") or (data_root / "jobs" if raw_data_dir else (config.get("general", {}).get("jobs_dir") or (data_root / "jobs")))
-    resolved_jobs_dir = Path(jobs_dir).expanduser().resolve()
-    resolved_jobs_dir.mkdir(parents=True, exist_ok=True)
-
-    # Per-user storage directories root
-    if users_dir is None:
-        users_dir = os.environ.get("ARGUS_USERS_DIR") or (data_root / "users" if raw_data_dir else (config.get("general", {}).get("users_dir") or (data_root / "users")))
-    resolved_users_dir = Path(users_dir).expanduser().resolve()
-    resolved_users_dir.mkdir(parents=True, exist_ok=True)
+    resolved_trash_dir = _safe_resolve_dir(trash_dir, "TRASH_DIR", config.get("ledger", {}).get("trash_dir"), "trash")
+    resolved_thumb_cache_dir = _safe_resolve_dir(thumb_cache_dir, "THUMB_CACHE_DIR", None, "thumbnails")
+    resolved_library_dir = _safe_resolve_dir(library_dir, "LIBRARY_DIR", config.get("sources", {}).get("library_dir"), "library")
+    resolved_jobs_dir = _safe_resolve_dir(jobs_dir, "JOBS_DIR", config.get("general", {}).get("jobs_dir"), "jobs")
+    resolved_users_dir = _safe_resolve_dir(users_dir, "USERS_DIR", config.get("general", {}).get("users_dir"), "users")
 
     # Auth DB initialization
     if auth_db_path is None:
-        auth_db_path = os.environ.get("ARGUS_ACCOUNTS_DB") or os.environ.get("ARGUS_AUTH_DB") or (data_root / "auth.db" if raw_data_dir else (config.get("auth", {}).get("db_path") or (data_root / "auth.db")))
+        auth_db_path = get_env("ACCOUNTS_DB") or get_env("AUTH_DB") or (data_root / "auth.db" if raw_data_dir else (config.get("auth", {}).get("db_path") or (data_root / "auth.db")))
     resolved_auth_db_path = Path(auth_db_path).expanduser().resolve()
-    resolved_auth_db_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        resolved_auth_db_path.parent.mkdir(parents=True, exist_ok=True)
+    except (OSError, PermissionError):
+        resolved_auth_db_path = (data_root / "auth.db").resolve()
+        resolved_auth_db_path.parent.mkdir(parents=True, exist_ok=True)
     auth_conn = init_auth_db(resolved_auth_db_path)
 
-    logger.info("Argus fixed data root: %s", data_root)
+    logger.info("SIMILIX fixed data root: %s", data_root)
     logger.info("Auth DB: %s, Users dir: %s", resolved_auth_db_path, resolved_users_dir)
 
     # Initialize default single-user / test DB
@@ -860,7 +863,7 @@ def create_app(
         secret_is_set = "yes" if bool(os.environ.get("SECRET_KEY") or config.get("auth", {}).get("secret_key")) else "no"
         sys.stdout.write(
             f"\n==================================================\n"
-            f"  ARGUS Startup Self-Check\n"
+            f"  SIMILIX Startup Self-Check\n"
             f"==================================================\n"
             f"  Data Directory : {data_root}\n"
             f"  DB Path        : {resolved_db_path}\n"
@@ -871,7 +874,7 @@ def create_app(
         yield
 
     app = FastAPI(
-        title="Argus API",
+        title="SIMILIX API",
         version="0.1.0",
         docs_url=None,
         redoc_url=None,
@@ -968,7 +971,7 @@ def create_app(
     @app.get("/healthz")
     def health_check():
         """Public health check endpoint for reverse proxies and orchestrators."""
-        return {"status": "ok", "service": "argus"}
+        return {"status": "ok", "service": "similix"}
 
     @app.get("/login")
     def serve_login():
@@ -980,7 +983,7 @@ def create_app(
     @app.get("/auth/csrf")
     def get_csrf(request: Request):
         """Public endpoint returning CSRF token for the active session (if any)."""
-        token = request.cookies.get("argus_session")
+        token = request.cookies.get("similix_session") or request.cookies.get("argus_session")
         csrf_tok = ""
         if token and hasattr(request.app.state, "auth_conn"):
             s = get_session_user(request.app.state.auth_conn, token)
@@ -1020,22 +1023,24 @@ def create_app(
 
         proto = request.headers.get("x-forwarded-proto", "").lower()
         is_secure = (proto == "https") or (request.url.scheme == "https")
-        response.set_cookie(
-            key="argus_session",
-            value=raw_token,
-            max_age=7 * 24 * 3600,
-            httponly=True,
-            samesite="lax",
-            secure=is_secure,
-        )
-        response.set_cookie(
-            key="argus_csrf",
-            value=csrf_tok,
-            max_age=7 * 24 * 3600,
-            httponly=False,
-            samesite="lax",
-            secure=is_secure,
-        )
+        for cookie_name in ("similix_session", "argus_session"):
+            response.set_cookie(
+                key=cookie_name,
+                value=raw_token,
+                max_age=7 * 24 * 3600,
+                httponly=True,
+                samesite="lax",
+                secure=is_secure,
+            )
+        for csrf_name in ("similix_csrf", "argus_csrf"):
+            response.set_cookie(
+                key=csrf_name,
+                value=csrf_tok,
+                max_age=7 * 24 * 3600,
+                httponly=False,
+                samesite="lax",
+                secure=is_secure,
+            )
         return {
             "status": "authenticated",
             "user": user_data,
@@ -1050,15 +1055,15 @@ def create_app(
         user: UserContext = Depends(get_current_user),
     ):
         """Invalidate session in auth.db and clear auth cookies."""
-        token = request.cookies.get("argus_session")
+        token = request.cookies.get("similix_session") or request.cookies.get("argus_session")
         if not token:
             auth_h = request.headers.get("Authorization", "")
             if auth_h.startswith("Bearer "):
                 token = auth_h[7:].strip()
         if token:
             invalidate_session(request.app.state.auth_conn, token)
-        response.delete_cookie("argus_session")
-        response.delete_cookie("argus_csrf")
+        for cname in ("similix_session", "argus_session", "similix_csrf", "argus_csrf"):
+            response.delete_cookie(cname)
         return {"status": "logged_out"}
 
     @app.get("/auth/me")
@@ -1097,8 +1102,8 @@ def create_app(
         )
 
         if response is not None:
-            response.delete_cookie("argus_session")
-            response.delete_cookie("argus_csrf")
+            for cname in ("similix_session", "argus_session", "similix_csrf", "argus_csrf"):
+                response.delete_cookie(cname)
         return res
 
     @app.delete("/auth/me")
@@ -1130,7 +1135,7 @@ def create_app(
         return Response(
             content=buf.getvalue(),
             media_type="application/zip",
-            headers={"Content-Disposition": 'attachment; filename="argus_library.zip"'},
+            headers={"Content-Disposition": 'attachment; filename="similix_library.zip"'},
         )
 
     # ==========================
@@ -2435,7 +2440,7 @@ def create_app(
         if "HOSTED_MODE" in os.environ:
             hosted_mode = os.environ.get("HOSTED_MODE", "").lower() in ("true", "1", "yes")
 
-        if hosted_mode and os.environ.get("ARGUS_ENABLE_DRIVE") != "1":
+        if hosted_mode and (get_env("ENABLE_DRIVE") != "1"):
             return {
                 "enabled": False,
                 "configured": False,
@@ -2495,7 +2500,7 @@ def create_app(
         if "HOSTED_MODE" in os.environ:
             hosted_mode = os.environ.get("HOSTED_MODE", "").lower() in ("true", "1", "yes")
 
-        if hosted_mode and os.environ.get("ARGUS_ENABLE_DRIVE") != "1":
+        if hosted_mode and (get_env("ENABLE_DRIVE") != "1"):
             raise HTTPException(status_code=403, detail="Google Drive integration is disabled in hosted mode.")
 
         data_root = getattr(request.app.state, "data_root", None)
@@ -2671,14 +2676,15 @@ def create_app(
                 raw_token, _ = create_session(request.app.state.auth_conn, user_id)
                 proto = request.headers.get("x-forwarded-proto", "").lower()
                 is_secure = (proto == "https") or (request.url.scheme == "https")
-                resp.set_cookie(
-                    key="argus_session",
-                    value=raw_token,
-                    max_age=7 * 24 * 3600,
-                    httponly=True,
-                    samesite="lax",
-                    secure=is_secure,
-                )
+                for cname in ("similix_session", "argus_session"):
+                    resp.set_cookie(
+                        key=cname,
+                        value=raw_token,
+                        max_age=7 * 24 * 3600,
+                        httponly=True,
+                        samesite="lax",
+                        secure=is_secure,
+                    )
             except Exception:
                 pass
         return resp
@@ -2703,7 +2709,7 @@ def create_app(
         hosted_mode = bool(cfg.get("hosted_mode", False) or cfg.get("general", {}).get("hosted_mode", False))
         if "HOSTED_MODE" in os.environ:
             hosted_mode = os.environ.get("HOSTED_MODE", "").lower() in ("true", "1", "yes")
-        if hosted_mode and os.environ.get("ARGUS_ENABLE_DRIVE") != "1":
+        if hosted_mode and (get_env("ENABLE_DRIVE") != "1"):
             raise HTTPException(status_code=403, detail="Google Drive integration is disabled in hosted mode.")
 
         try:
@@ -2720,7 +2726,7 @@ def create_app(
             )
 
         data_root = getattr(request.app.state, "data_root", None)
-        target_dir = data_root if data_root else Path(os.environ.get("ARGUS_DATA_DIR", "~/.argus")).expanduser()
+        target_dir = data_root if data_root else resolve_data_dir()
         target_dir.mkdir(parents=True, exist_ok=True)
         dest_file = target_dir / "client_secret.json"
 
@@ -2746,7 +2752,7 @@ def create_app(
         hosted_mode = bool(cfg.get("hosted_mode", False) or cfg.get("general", {}).get("hosted_mode", False))
         if "HOSTED_MODE" in os.environ:
             hosted_mode = os.environ.get("HOSTED_MODE", "").lower() in ("true", "1", "yes")
-        if hosted_mode and os.environ.get("ARGUS_ENABLE_DRIVE") != "1":
+        if hosted_mode and (get_env("ENABLE_DRIVE") != "1"):
             raise HTTPException(status_code=403, detail="Google Drive integration is disabled in hosted mode.")
 
         folder_id = extract_drive_folder_id(req.link)
@@ -2828,7 +2834,7 @@ def create_app(
                 return super().redirect_request(req_obj, fp, code, msg, headers, newurl)
 
         opener = urllib.request.build_opener(SafeRedirectHandler())
-        req_head = urllib.request.Request(url, headers={"User-Agent": "Argus/0.1.0"})
+        req_head = urllib.request.Request(url, headers={"User-Agent": "SIMILIX/0.1.0"})
         temp_dir = user.root / "tmp"
         temp_dir.mkdir(parents=True, exist_ok=True)
         tmp_download = tempfile.NamedTemporaryFile(prefix="dataset_stream_", dir=temp_dir, delete=False)

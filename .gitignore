@@ -1,6 +1,10 @@
 # ── Data & outputs (never commit) ────────────────────────────────────────────
 data/
 thumbnails/
+.similix/
+.argus/
+similix_data/
+argus_data/
 *.db
 *.db-shm
 *.db-wal

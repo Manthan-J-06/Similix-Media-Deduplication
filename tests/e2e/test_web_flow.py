@@ -531,13 +531,15 @@ def test_logo_rendering(live_server):
                 eye = page.locator(".brand svg.argus-eye")
                 assert eye.is_visible()
                 assert eye.get_attribute("viewBox") == "0 0 40 40"
-                path_stroke = page.locator(".brand svg.argus-eye path").get_attribute("stroke")
+                path_stroke = page.locator(".brand svg.argus-eye path").first.get_attribute("stroke")
                 assert path_stroke == "#2DD4BF"
+                path_stroke_2 = page.locator(".brand svg.argus-eye path").nth(1).get_attribute("stroke")
+                assert path_stroke_2 == "#818CF8"
 
                 # Check wordmark
-                wordmark = page.locator(".brand .argus-wordmark")
+                wordmark = page.locator(".brand .similix-wordmark, .brand .argus-wordmark")
                 assert wordmark.is_visible()
-                assert wordmark.inner_text().strip() == "ARGUS"
+                assert wordmark.inner_text().strip() == "SIMILIX"
 
                 # Check styles
                 font_weight = wordmark.evaluate("el => window.getComputedStyle(el).fontWeight")

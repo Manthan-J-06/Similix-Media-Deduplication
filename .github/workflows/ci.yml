@@ -1,4 +1,4 @@
-name: Argus CI
+name: SIMILIX CI
 
 on:
   push:
@@ -19,6 +19,7 @@ jobs:
       HF_HOME: ~/.cache/huggingface
       KMP_DUPLICATE_LIB_OK: "TRUE"
       OMP_NUM_THREADS: "1"
+      SIMILIX_DEVICE: "cpu"
       ARGUS_DEVICE: "cpu"
 
     steps:
@@ -73,6 +74,7 @@ jobs:
       HF_HOME: ~/.cache/huggingface
       KMP_DUPLICATE_LIB_OK: "TRUE"
       OMP_NUM_THREADS: "1"
+      SIMILIX_DEVICE: "cpu"
       ARGUS_DEVICE: "cpu"
 
     steps:

@@ -7,14 +7,19 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PORT=8000 \
     HOST=0.0.0.0 \
+    SIMILIX_DATA_DIR=/data \
     ARGUS_DATA_DIR=/data \
+    SIMILIX_TRASH_DIR=/data/trash \
     ARGUS_TRASH_DIR=/data/trash \
+    SIMILIX_LIBRARY_DIR=/data/library \
     ARGUS_LIBRARY_DIR=/data/library \
+    SIMILIX_USERS_DIR=/data/users \
     ARGUS_USERS_DIR=/data/users \
+    SIMILIX_ACCOUNTS_DB=/data/auth.db \
     ARGUS_ACCOUNTS_DB=/data/auth.db \
     TMPDIR=/tmp \
-    HF_HOME=/home/argus/.cache/huggingface \
-    TORCH_HOME=/home/argus/.cache/torch
+    HF_HOME=/home/similix/.cache/huggingface \
+    TORCH_HOME=/home/similix/.cache/torch
 
 # Install lightweight runtime dependencies
 RUN apt-get update && apt-get install --no-install-recommends -y \
@@ -23,9 +28,10 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user and application directory with strict permissions
-RUN useradd -m -u 1000 -s /bin/bash argus && \
-    mkdir -p /data/users /data/trash /data/library /home/argus/.argus /home/argus/.cache/huggingface /home/argus/.cache/torch /app && \
-    chown -R argus:argus /data /home/argus /app
+RUN useradd -m -u 1000 -s /bin/bash similix && \
+    mkdir -p /data/users /data/trash /data/library /home/similix/.similix /home/similix/.argus /home/similix/.cache/huggingface /home/similix/.cache/torch /app && \
+    ln -s /home/similix /home/argus && \
+    chown -R similix:similix /data /home/similix /app
 
 WORKDIR /app
 
@@ -42,10 +48,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy source files and install package in editable mode
 COPY . .
 RUN pip install --no-cache-dir -e . && \
-    chown -R argus:argus /app
+    chown -R similix:similix /app
 
 # Pre-download open_clip model weights & tokenizer at build time for instant, offline startup
-USER argus
+USER similix
 RUN python3 -c "import open_clip; open_clip.create_model_and_transforms('ViT-B-32', pretrained='laion2b_s34b_b79k'); open_clip.get_tokenizer('ViT-B-32')"
 
 # Expose web port (default 8000, compatible with Hugging Face Spaces $PORT 7860)
