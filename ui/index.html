@@ -3631,8 +3631,44 @@
                   return `<span class="chip chip-category" style="font-size:0.68rem;">${escapeHtml(img.category)} (${p1}%)</span>`;
                 })()}
               </div>
+              <div style="display:flex; align-items:center; justify-content:flex-end; margin-top:6px; padding-top:6px; border-top:1px solid var(--border);">
+                <button type="button" class="btn-file-dismiss btn-lib-dismiss" data-id="${img.id}" title="Dismiss photo from Argus without deleting file from disk" style="font-size:0.7rem; padding:2px 8px; width:100%;">Dismiss</button>
+              </div>
             </div>
           `;
+
+          const btnLibDismiss = card.querySelector(".btn-lib-dismiss");
+          if (btnLibDismiss) {
+            btnLibDismiss.addEventListener("click", async (e) => {
+              e.stopPropagation();
+              const confirmed = confirm(`Dismiss "${img.filename}" from Argus?\n\nThe file will remain safely on disk/Drive, but will be hidden from the app.`);
+              if (!confirmed) return;
+              btnLibDismiss.disabled = true;
+              btnLibDismiss.textContent = "Dismissing...";
+              try {
+                const csrf = await getCsrfToken();
+                const res = await fetch(`/images/${img.id}/dismiss`, {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/json",
+                    "X-CSRF-Token": csrf,
+                  },
+                });
+                if (!res.ok) {
+                  const errData = await res.json().catch(() => ({}));
+                  throw new Error(errData.detail || "Failed to dismiss photo");
+                }
+                showInlineNotice(`"${img.filename}" dismissed`, "info");
+                await loadLibrary(libCurrentPage);
+                await refreshAll({ preserveActiveCluster: true });
+              } catch (err) {
+                showInlineNotice(err.message || "Failed to dismiss photo", "error");
+                btnLibDismiss.disabled = false;
+                btnLibDismiss.textContent = "Dismiss";
+              }
+            });
+          }
+
           grid.appendChild(card);
         });
       } catch (err) {

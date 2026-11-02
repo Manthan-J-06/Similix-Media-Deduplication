@@ -2225,10 +2225,19 @@ class TestPipelineResumable:
         assert data1["remaining_members"] == 2
         assert data1["cluster_deleted"] is False
 
-        # Member 3 is now unclustered
+        # Member 3 is now unclustered and status is dismissed
         with sqlite3.connect(db_file) as conn:
-            m3 = conn.execute("SELECT cluster_id FROM images WHERE id = 3").fetchone()
+            m3 = conn.execute("SELECT cluster_id, status FROM images WHERE id = 3").fetchone()
             assert m3[0] is None
+            assert m3[1] == "dismissed"
+
+        # Member 3 must be excluded from library
+        lib_res1 = client.get("/library")
+        assert lib_res1.status_code == 200
+        lib_ids1 = [img["id"] for img in lib_res1.json()["images"]]
+        assert 3 not in lib_ids1
+        assert 1 in lib_ids1
+        assert 2 in lib_ids1
 
         # 2. Dismiss member 2: now only member 1 would remain, so cluster auto-closes (<2 members)
         res_dis2 = client.post("/clusters/1/dismiss/2")
@@ -2237,6 +2246,20 @@ class TestPipelineResumable:
         assert data2["success"] is True
         assert data2["cluster_deleted"] is True
 
+        # Member 2 is dismissed; survivor 1 is unclustered but NOT dismissed
+        with sqlite3.connect(db_file) as conn:
+            m2 = conn.execute("SELECT cluster_id, status FROM images WHERE id = 2").fetchone()
+            assert m2[0] is None
+            assert m2[1] == "dismissed"
+            m1 = conn.execute("SELECT cluster_id, status FROM images WHERE id = 1").fetchone()
+            assert m1[0] is None
+            assert m1[1] != "dismissed"
+
+        lib_res2 = client.get("/library")
+        lib_ids2 = [img["id"] for img in lib_res2.json()["images"]]
+        assert 2 not in lib_ids2
+        assert 1 in lib_ids2  # survivor still visible in library
+
         # Cluster 1 is gone
         res_cl1 = client.get("/clusters/1")
         assert res_cl1.status_code == 404
@@ -2244,10 +2267,55 @@ class TestPipelineResumable:
         # 3. Test dismiss entire cluster on Cluster 2
         res_cl2_before = client.get("/clusters/2")
         assert res_cl2_before.status_code == 200
+        cl2_member_ids = [m["id"] for m in res_cl2_before.json()["members"]]
+        assert len(cl2_member_ids) >= 2
+
         res_dis_all = client.post("/clusters/2/dismiss")
         assert res_dis_all.status_code == 200
         assert res_dis_all.json()["cluster_deleted"] is True
 
         res_cl2_after = client.get("/clusters/2")
         assert res_cl2_after.status_code == 404
+
+        # All members of Cluster 2 must be dismissed and excluded from library
+        lib_res3 = client.get("/library")
+        lib_ids3 = [img["id"] for img in lib_res3.json()["images"]]
+        for mid in cl2_member_ids:
+            assert mid not in lib_ids3
+
+    def test_dismiss_image_directly_and_library_exclusion(self, api_test_env):
+        """Test dismissing any individual image directly via /images/{id}/dismiss."""
+        client = api_test_env["client"]
+        db_file = api_test_env["db_file"]
+
+        # Insert a unique unclustered image
+        with sqlite3.connect(db_file) as conn:
+            conn.execute(
+                "INSERT INTO images (id, file_path, file_size, format, status) "
+                "VALUES (999, '/tmp/unique_photo.jpg', 5000, 'jpeg', 'discovered')"
+            )
+            conn.commit()
+
+        # It should appear in library
+        lib_res = client.get("/library")
+        assert 999 in [img["id"] for img in lib_res.json()["images"]]
+
+        # Dismiss directly via /images/999/dismiss
+        dis_res = client.post("/images/999/dismiss")
+        assert dis_res.status_code == 200
+        assert dis_res.json()["success"] is True
+        assert dis_res.json()["status"] == "dismissed"
+
+        # Check DB status
+        with sqlite3.connect(db_file) as conn:
+            row = conn.execute("SELECT status FROM images WHERE id = 999").fetchone()
+            assert row[0] == "dismissed"
+
+        # It should no longer appear in library
+        lib_res_after = client.get("/library")
+        assert 999 not in [img["id"] for img in lib_res_after.json()["images"]]
+
+        # Dismiss non-existent image returns 404
+        dis_404 = client.post("/images/99999/dismiss")
+        assert dis_404.status_code == 404
 

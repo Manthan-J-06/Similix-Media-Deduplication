@@ -304,12 +304,12 @@ def plan(
 
         live_members = []
         for m in all_members:
-            if m["status"] == "trashed":
+            if m["status"] in ("trashed", "deleted", "dismissed"):
                 skipped_entries.append({
                     "image_id": m["id"],
                     "cluster_id": cid,
                     "file_path": m["file_path"],
-                    "reason": "already trashed",
+                    "reason": f"already {m['status']}",
                 })
                 continue
 
@@ -437,7 +437,7 @@ def plan(
     for entry in planned_entries:
         cid = entry.cluster_id
         total_live_members = conn.execute(
-            "SELECT COUNT(*) FROM images WHERE cluster_id = ? AND (status IS NULL OR status != 'trashed')",
+            "SELECT COUNT(*) FROM images WHERE cluster_id = ? AND (status IS NULL OR status NOT IN ('trashed', 'deleted', 'dismissed'))",
             (cid,),
         ).fetchone()[0]
 
@@ -541,7 +541,7 @@ def dry_run(conn: sqlite3.Connection, batch_id: str) -> DryRunResult:
 
     for cid, c_entries in by_cluster.items():
         surviving = conn.execute(
-            "SELECT COUNT(*) FROM images WHERE cluster_id = ? AND (status IS NULL OR status != 'trashed')",
+            "SELECT COUNT(*) FROM images WHERE cluster_id = ? AND (status IS NULL OR status NOT IN ('trashed', 'deleted', 'dismissed'))",
             (cid,),
         ).fetchone()[0]
 
@@ -560,11 +560,11 @@ def dry_run(conn: sqlite3.Connection, batch_id: str) -> DryRunResult:
                 (e["image_id"],),
             ).fetchone()
 
-            if img and img["status"] == "trashed":
+            if img and img["status"] in ("trashed", "deleted", "dismissed"):
                 refusals.append({
                     "entry_id": e["id"],
                     "path": e["original_path"],
-                    "reason": "already trashed",
+                    "reason": f"already {img['status']}",
                 })
                 continue
 
@@ -707,7 +707,7 @@ def execute(
 
     for cid, c_entries in by_cluster.items():
         surviving = conn.execute(
-            "SELECT COUNT(*) FROM images WHERE cluster_id = ? AND (status IS NULL OR status != 'trashed')",
+            "SELECT COUNT(*) FROM images WHERE cluster_id = ? AND (status IS NULL OR status NOT IN ('trashed', 'deleted', 'dismissed'))",
             (cid,),
         ).fetchone()[0]
 
@@ -727,8 +727,8 @@ def execute(
                 (e["image_id"],),
             ).fetchone()
 
-            if img and img["status"] == "trashed":
-                msg = "already trashed"
+            if img and img["status"] in ("trashed", "deleted", "dismissed"):
+                msg = f"already {img['status']}"
                 conn.execute(
                     "UPDATE deletion_journal SET status = 'refused', reason = ? WHERE id = ?",
                     (msg, e["id"]),

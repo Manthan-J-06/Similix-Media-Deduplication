@@ -1209,7 +1209,7 @@ def create_app(
             cid = c["id"]
             ref_unc = c["reference_uncertain"] if "reference_uncertain" in c.keys() else 0
             members = conn.execute(
-                "SELECT * FROM images WHERE cluster_id = ? AND (status IS NULL OR status NOT IN ('trashed', 'deleted'))",
+                "SELECT * FROM images WHERE cluster_id = ? AND (status IS NULL OR status NOT IN ('trashed', 'deleted', 'dismissed'))",
                 (cid,),
             ).fetchall()
             live_members = [
@@ -1249,7 +1249,7 @@ def create_app(
             """
             SELECT id, file_path FROM images
             WHERE (cluster_id IS NULL OR cluster_id = 0)
-              AND (status IS NULL OR status NOT IN ('trashed', 'deleted'))
+              AND (status IS NULL OR status NOT IN ('trashed', 'deleted', 'dismissed'))
             ORDER BY id
             """
         ).fetchall()
@@ -1277,7 +1277,7 @@ def create_app(
         List all images for the authenticated user (including unique, unclustered images),
         with pagination (default 60/page), search by filename, and category filtering.
         """
-        conditions = ["(status IS NULL OR status NOT IN ('deleted', 'trashed'))"]
+        conditions = ["(status IS NULL OR status NOT IN ('deleted', 'trashed', 'dismissed'))"]
         params: list[Any] = []
 
         if search and search.strip():
@@ -1385,7 +1385,7 @@ def create_app(
             )
 
         total_images = conn.execute(
-            "SELECT COUNT(*) FROM images WHERE status IS NULL OR status != 'trashed'"
+            "SELECT COUNT(*) FROM images WHERE status IS NULL OR status NOT IN ('trashed', 'deleted', 'dismissed')"
         ).fetchone()[0]
         if response is not None:
             response.headers["X-Total-Images"] = str(total_images)
@@ -1407,7 +1407,7 @@ def create_app(
                        category_top1_prob, category_top2, category_top2_prob, match_pct,
                        resolution_pct, confidence, status
                 FROM images
-                WHERE cluster_id = ? AND (status IS NULL OR status != 'trashed')
+                WHERE cluster_id = ? AND (status IS NULL OR status NOT IN ('trashed', 'deleted', 'dismissed'))
                 ORDER BY id
                 """,
                 (cid,),
@@ -1548,7 +1548,7 @@ def create_app(
                    category_top1_prob, category_top2, category_top2_prob, match_pct,
                    resolution_pct, confidence, status
             FROM images
-            WHERE cluster_id = ? AND (status IS NULL OR status != 'trashed')
+            WHERE cluster_id = ? AND (status IS NULL OR status NOT IN ('trashed', 'deleted', 'dismissed'))
             ORDER BY id
             """,
             (cluster_id,),
@@ -1721,7 +1721,7 @@ def create_app(
             UPDATE images
             SET cluster_id = NULL,
                 is_keeper = 0,
-                status = CASE WHEN status = 'trashed' THEN 'trashed' ELSE 'discovered' END,
+                status = 'dismissed',
                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
             WHERE id = ?
             """,
@@ -1731,7 +1731,7 @@ def create_app(
         remaining_members = conn.execute(
             """
             SELECT id, is_keeper FROM images
-            WHERE cluster_id = ? AND (status IS NULL OR status NOT IN ('trashed', 'deleted'))
+            WHERE cluster_id = ? AND (status IS NULL OR status NOT IN ('trashed', 'deleted', 'dismissed'))
             ORDER BY id
             """,
             (cluster_id,),
@@ -1746,7 +1746,6 @@ def create_app(
                     UPDATE images
                     SET cluster_id = NULL,
                         is_keeper = 0,
-                        status = CASE WHEN status = 'trashed' THEN 'trashed' ELSE 'discovered' END,
                         updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
                     WHERE id = ?
                     """,
@@ -1793,7 +1792,7 @@ def create_app(
             UPDATE images
             SET cluster_id = NULL,
                 is_keeper = 0,
-                status = CASE WHEN status = 'trashed' THEN 'trashed' ELSE 'discovered' END,
+                status = 'dismissed',
                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
             WHERE cluster_id = ?
             """,
@@ -1802,6 +1801,76 @@ def create_app(
         conn.execute("DELETE FROM clusters WHERE id = ?", (cluster_id,))
         conn.commit()
         return {"success": True, "cluster_id": cluster_id, "cluster_deleted": True}
+
+    @app.post("/images/{image_id}/dismiss")
+    def dismiss_image(
+        image_id: int,
+        request: Request = None,
+        user: UserContext = Depends(get_current_user),
+        conn: sqlite3.Connection = Depends(get_db),
+    ) -> dict[str, Any]:
+        """Dismiss any image from the app (hiding it from library and clusters) without deleting the physical file."""
+        img = conn.execute(
+            "SELECT id, cluster_id, file_path, status FROM images WHERE id = ?",
+            (image_id,),
+        ).fetchone()
+        if not img:
+            raise HTTPException(status_code=404, detail=f"Image {image_id} not found")
+
+        cid = img["cluster_id"]
+        conn.execute(
+            """
+            UPDATE images
+            SET cluster_id = NULL,
+                is_keeper = 0,
+                status = 'dismissed',
+                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            WHERE id = ?
+            """,
+            (image_id,),
+        )
+
+        cluster_deleted = False
+        remaining_count = 0
+        if cid:
+            remaining_members = conn.execute(
+                """
+                SELECT id FROM images
+                WHERE cluster_id = ? AND (status IS NULL OR status NOT IN ('trashed', 'deleted', 'dismissed'))
+                ORDER BY id
+                """,
+                (cid,),
+            ).fetchall()
+            remaining_count = len(remaining_members)
+            if remaining_count < 2:
+                if remaining_count == 1:
+                    survivor_id = remaining_members[0]["id"]
+                    conn.execute(
+                        "UPDATE images SET cluster_id = NULL, is_keeper = 0, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?",
+                        (survivor_id,),
+                    )
+                conn.execute("DELETE FROM clusters WHERE id = ?", (cid,))
+                cluster_deleted = True
+            else:
+                c_row = conn.execute("SELECT representative_id FROM clusters WHERE id = ?", (cid,)).fetchone()
+                if c_row and c_row["representative_id"] == image_id:
+                    new_rep_id = remaining_members[0]["id"]
+                    conn.execute(
+                        "UPDATE clusters SET member_count = ?, representative_id = ? WHERE id = ?",
+                        (remaining_count, new_rep_id, cid),
+                    )
+                else:
+                    conn.execute("UPDATE clusters SET member_count = ? WHERE id = ?", (remaining_count, cid))
+
+        conn.commit()
+        return {
+            "success": True,
+            "image_id": image_id,
+            "status": "dismissed",
+            "cluster_id": cid,
+            "cluster_deleted": cluster_deleted,
+            "remaining_cluster_members": remaining_count if remaining_count >= 2 else 0,
+        }
 
     @app.get("/thumb/{image_id}")
     def get_thumbnail(
@@ -2003,7 +2072,7 @@ def create_app(
                 """
                 SELECT id, file_path, category_top1
                 FROM images
-                WHERE cluster_id = ? AND (status IS NULL OR status != 'trashed')
+                WHERE cluster_id = ? AND (status IS NULL OR status NOT IN ('trashed', 'deleted', 'dismissed'))
                 """,
                 (cid,),
             ).fetchall()
