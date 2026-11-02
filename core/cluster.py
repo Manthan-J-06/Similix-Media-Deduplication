@@ -282,16 +282,24 @@ def run_stage2_clustering(
         """
     ).fetchall()
 
+    deleted_clusters: set[int] = set()
+
     for i in range(len(active_clusters)):
         c1 = active_clusters[i]
         c1_id = c1["id"]
+        if c1_id in deleted_clusters:
+            continue
         r1_id = c1["representative_id"]
         if r1_id not in img_map or img_map[r1_id].get("cluster_id") != c1_id:
             continue
 
         for j in range(i + 1, len(active_clusters)):
+            if c1_id in deleted_clusters:
+                break
             c2 = active_clusters[j]
             c2_id = c2["id"]
+            if c2_id in deleted_clusters:
+                continue
             r2_id = c2["representative_id"]
             if r2_id not in img_map or img_map[r2_id].get("cluster_id") != c2_id:
                 continue
@@ -306,6 +314,9 @@ def run_stage2_clustering(
             target_cid = c1_id if keeper_id == r1_id else c2_id
             donor_cid = c2_id if target_cid == c1_id else c1_id
             target_rep = keeper_id
+
+            if target_cid in deleted_clusters or donor_cid in deleted_clusters:
+                continue
 
             donor_members = [
                 img_id for img_id, m in img_map.items() if m.get("cluster_id") == donor_cid
@@ -352,7 +363,11 @@ def run_stage2_clustering(
                     (len(donor_members), target_cid),
                 )
                 conn.execute("DELETE FROM clusters WHERE id = ?", (donor_cid,))
+                deleted_clusters.add(donor_cid)
                 res.clusters_merged += 1
+
+                if donor_cid == c1_id:
+                    break
 
     conn.commit()
 

@@ -2418,12 +2418,547 @@ def create_app(
         except Exception as exc:
             logging.getLogger("argus.api").warning("Could not pre-insert uploaded files into DB: %s", exc)
 
-        job_id = launch_pipeline_job(request.app, user=user, source_type="local", folder=dest_dir)
+        job_id = launch_pipeline_job(request.app, user=user, source_type="local", folder=user.library_dir)
         return {
             "job_id": job_id,
             "uploaded_count": len(saved_files),
             "project": clean_project,
             "files": [Path(p).name for p in saved_files],
+        }
+
+    def _pre_insert_images_db(db_path: Path, saved_files: list[str]) -> None:
+        try:
+            with sqlite3.connect(db_path) as conn:
+                for fp in saved_files:
+                    p = Path(fp)
+                    if not p.exists():
+                        continue
+                    sz = p.stat().st_size
+                    mtime = p.stat().st_mtime
+                    w, h, fmt = None, None, None
+                    try:
+                        with Image.open(p) as img:
+                            w, h = img.size
+                            fmt = img.format
+                    except Exception:
+                        pass
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO images (
+                            file_path, file_size, modified_time, width, height, format, status, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, 'discovered', strftime('%Y-%m-%dT%H:%M:%SZ','now'), strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+                        """,
+                        (str(p.resolve()), sz, mtime, w, h, fmt),
+                    )
+                conn.commit()
+        except Exception as exc:
+            logger.warning("Could not pre-insert images into DB: %s", exc)
+
+    def _extract_zip_streamed(
+        zip_path: Path,
+        dest_dir: Path,
+        user: UserContext,
+        config: dict,
+    ) -> list[str]:
+        """
+        Safely extract image files from a ZIP archive in a streamed manner.
+        Enforces:
+          - Max file count limit (up to 10,000 files)
+          - Zip bomb protections (overall uncompressed size <= quota, compression ratio <= 100:1)
+          - Path traversal rejection (no '..', absolute paths, outside user_root)
+          - No symlinks (POSIX S_IFLNK rejected)
+          - Image type validation (allowed extensions + Pillow verification)
+          - 50 MB per-file size cap
+          - User storage quota
+        """
+        sources_cfg = config.get("sources", {})
+        upload_cfg = sources_cfg.get("upload", {})
+        zip_cfg = sources_cfg.get("zip", {})
+        quotas_cfg = config.get("quotas", {})
+
+        max_files = zip_cfg.get("max_files", 10000)
+        max_uncompressed = zip_cfg.get("max_uncompressed_bytes", 2 * 1024 * 1024 * 1024)
+        max_ratio = zip_cfg.get("max_ratio", 100)
+        per_file_cap = upload_cfg.get("per_file_cap_mb", 50) * 1024 * 1024
+        user_storage_cap = quotas_cfg.get("user_storage_cap_mb", 2048) * 1024 * 1024
+        allowed_exts = {e.lower().lstrip(".") for e in upload_cfg.get("allowed_extensions", ["jpg", "jpeg", "png", "webp", "heic", "tiff", "bmp"])}
+
+        current_user_storage = get_user_storage_usage(user.root)
+        if current_user_storage >= user_storage_cap:
+            raise HTTPException(status_code=400, detail="Upload exceeds user storage quota")
+
+        try:
+            zf = zipfile.ZipFile(zip_path, "r")
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid or corrupted ZIP archive: {exc}")
+
+        with zf:
+            infolist = zf.infolist()
+            # Filter candidate image entries
+            image_entries = []
+            for zinfo in infolist:
+                if zinfo.is_dir():
+                    continue
+                fname = zinfo.filename.replace("\\", "/")
+                if fname.startswith("__MACOSX/") or Path(fname).name.startswith("."):
+                    continue
+                ext = Path(fname).suffix.lower().lstrip(".")
+                if ext in allowed_exts:
+                    image_entries.append((zinfo, fname, ext))
+
+            if len(image_entries) > max_files:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"ZIP archive exceeds {max_files} files cap (contains {len(image_entries)} images)",
+                )
+
+            # Pre-scan for zip bombs, symlinks, and path traversal
+            total_uncompressed = 0
+            for zinfo, fname, _ in image_entries:
+                if ".." in fname or fname.startswith("/") or fname.startswith("\\"):
+                    raise HTTPException(status_code=400, detail=f"Path traversal in ZIP rejected: {fname}")
+
+                is_symlink = ((zinfo.external_attr >> 16) & 0o170000) == 0o120000
+                if is_symlink:
+                    raise HTTPException(status_code=400, detail=f"Symlink rejected: {fname} (symlinks inside ZIP archives are forbidden)")
+
+                total_uncompressed += zinfo.file_size
+                if zinfo.file_size > 1024 * 1024 and zinfo.compress_size > 0:
+                    ratio = zinfo.file_size / zinfo.compress_size
+                    if ratio > max_ratio:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Potential ZIP bomb detected in {fname} (compression ratio {ratio:.1f}:1 exceeds {max_ratio}:1 limit)",
+                        )
+
+            if total_uncompressed > max_uncompressed:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"ZIP archive uncompressed size ({total_uncompressed // (1024*1024)} MB) exceeds allowed limit ({max_uncompressed // (1024*1024)} MB)",
+                )
+
+            if current_user_storage + total_uncompressed > user_storage_cap:
+                raise HTTPException(
+                    status_code=400,
+                    detail="ZIP extraction would exceed user storage quota",
+                )
+
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            validate_confined_user_path(dest_dir, user.root)
+
+            extracted_files: list[str] = []
+            for idx, (zinfo, fname, ext) in enumerate(image_entries):
+                basename = Path(fname).name
+                if not basename or basename.startswith("."):
+                    continue
+
+                dest_file = dest_dir / basename
+                if dest_file.exists():
+                    stem = Path(basename).stem
+                    dest_file = dest_dir / f"{stem}_{idx}.{ext}"
+
+                validate_confined_user_path(dest_file, user.root)
+
+                written_bytes = 0
+                with zf.open(zinfo, "r") as src, open(dest_file, "wb") as dst:
+                    while True:
+                        buf = src.read(65536)
+                        if not buf:
+                            break
+                        written_bytes += len(buf)
+                        if written_bytes > per_file_cap:
+                            dst.close()
+                            if dest_file.exists():
+                                dest_file.unlink()
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"File in ZIP exceeds {per_file_cap // (1024*1024)} MB cap: {fname}",
+                            )
+                        dst.write(buf)
+
+                try:
+                    with Image.open(dest_file) as im:
+                        im.verify()
+                except Exception:
+                    if dest_file.exists():
+                        dest_file.unlink()
+                    continue
+
+                extracted_files.append(str(dest_file.resolve()))
+
+            return extracted_files
+
+        # ── Folder Upload Endpoints (Chunked in 25s with resume) ──
+
+    @app.post("/sources/folder/chunk")
+    async def upload_folder_chunk(
+        upload_id: str = Form(...),
+        chunk_index: int = Form(...),
+        total_chunks: int = Form(...),
+        total_files: int = Form(...),
+        project: str = Form("default"),
+        files: list[UploadFile] = File(...),
+        relative_paths: list[str] = Form(None),
+        request: Request = None,
+        user: UserContext = Depends(get_current_user),
+    ) -> dict[str, Any]:
+        """
+        Receive a chunk of files from a folder upload (typically 25 files per chunk).
+        Enforces max batch cap up to 10,000 files, user quota, per-file cap, and path sanitization.
+        Relative paths are used for display only.
+        """
+        sources_cfg = request.app.state.config.get("sources", {})
+        upload_cfg = sources_cfg.get("upload", {})
+        quotas_cfg = request.app.state.config.get("quotas", {})
+
+        max_folder_files = upload_cfg.get("max_folder_files", 10000)
+        if total_files > max_folder_files:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Folder upload exceeds {max_folder_files} files cap (received {total_files})",
+            )
+
+        clean_upload_id = re.sub(r"[^a-zA-Z0-9_\-]", "", upload_id.strip()) or f"fld_{int(time.time())}"
+        clean_project = re.sub(r"[^a-zA-Z0-9_\-]", "_", project.strip()) or "default"
+        dest_dir = user.library_dir / clean_project
+        validate_confined_user_path(dest_dir, user.root)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        user.jobs_dir.mkdir(parents=True, exist_ok=True)
+        state_file = user.jobs_dir / f"folder_upload_{clean_upload_id}.json"
+        state = read_job_state(state_file) if state_file.exists() else {
+            "upload_id": clean_upload_id,
+            "project": clean_project,
+            "total_files": total_files,
+            "total_chunks": total_chunks,
+            "chunks_received": [],
+            "saved_files": [],
+            "relative_paths": {},
+        }
+
+        # Idempotent resume check
+        if chunk_index in state.get("chunks_received", []):
+            return {
+                "status": "already_received",
+                "chunk_index": chunk_index,
+                "total_chunks": total_chunks,
+                "uploaded_count": len(state.get("saved_files", [])),
+                "total_files": total_files,
+            }
+
+        allowed_exts = {e.lower().lstrip(".") for e in upload_cfg.get("allowed_extensions", ["jpg", "jpeg", "png", "webp", "heic", "tiff", "bmp"])}
+        per_file_cap = upload_cfg.get("per_file_cap_mb", 50) * 1024 * 1024
+        user_storage_cap = quotas_cfg.get("user_storage_cap_mb", 2048) * 1024 * 1024
+        current_user_storage = get_user_storage_usage(user.root)
+
+        saved_this_chunk = []
+        for idx, upload in enumerate(files):
+            orig_name = upload.filename or ""
+            # Path traversal rejection
+            if ".." in orig_name or orig_name.startswith(("/", "\\")):
+                raise HTTPException(status_code=400, detail=f"Path traversal rejected: {orig_name}")
+
+            basename = Path(orig_name).name
+            if not basename or basename.startswith("."):
+                continue
+
+            ext = Path(basename).suffix.lower().lstrip(".")
+            if ext not in allowed_exts:
+                raise HTTPException(status_code=400, detail=f"Non-image rejected: {orig_name}")
+
+            dest_path = dest_dir / basename
+            if dest_path.exists():
+                stem = Path(basename).stem
+                dest_path = dest_dir / f"{stem}_{chunk_index}_{idx}.{ext}"
+
+            validate_confined_user_path(dest_path, user.root)
+
+            file_bytes = 0
+            with open(dest_path, "wb") as f_out:
+                while True:
+                    buf = await upload.read(65536)
+                    if not buf:
+                        break
+                    file_bytes += len(buf)
+                    current_user_storage += len(buf)
+                    if file_bytes > per_file_cap:
+                        f_out.close()
+                        if dest_path.exists():
+                            dest_path.unlink()
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"File exceeds {per_file_cap // (1024*1024)} MB cap: {orig_name}",
+                        )
+                    if current_user_storage > user_storage_cap:
+                        f_out.close()
+                        if dest_path.exists():
+                            dest_path.unlink()
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Upload exceeds user storage quota ({user_storage_cap // (1024*1024)} MB)",
+                        )
+                    f_out.write(buf)
+
+            saved_path_str = str(dest_path.resolve())
+            saved_this_chunk.append(saved_path_str)
+            rel_display = relative_paths[idx] if (relative_paths and idx < len(relative_paths)) else orig_name
+            state.setdefault("relative_paths", {})[dest_path.name] = rel_display
+
+        state.setdefault("chunks_received", []).append(chunk_index)
+        state.setdefault("saved_files", []).extend(saved_this_chunk)
+        write_job_state(state_file, state)
+
+        return {
+            "status": "chunk_received",
+            "chunk_index": chunk_index,
+            "total_chunks": total_chunks,
+            "uploaded_count": len(state["saved_files"]),
+            "total_files": total_files,
+        }
+
+    @app.get("/sources/folder/status")
+    def get_folder_upload_status(
+        upload_id: str = Query(...),
+        user: UserContext = Depends(get_current_user),
+    ) -> dict[str, Any]:
+        """Check status of a chunked folder upload for resuming."""
+        clean_upload_id = re.sub(r"[^a-zA-Z0-9_\-]", "", upload_id.strip())
+        state_file = user.jobs_dir / f"folder_upload_{clean_upload_id}.json"
+        if not state_file.exists():
+            return {
+                "exists": False,
+                "upload_id": clean_upload_id,
+                "chunks_received": [],
+                "uploaded_count": 0,
+                "status": "not_found",
+            }
+        state = read_job_state(state_file) or {}
+        return {
+            "exists": True,
+            "upload_id": clean_upload_id,
+            "project": state.get("project", "default"),
+            "total_files": state.get("total_files", 0),
+            "total_chunks": state.get("total_chunks", 0),
+            "chunks_received": state.get("chunks_received", []),
+            "uploaded_count": len(state.get("saved_files", [])),
+            "relative_paths": state.get("relative_paths", {}),
+            "status": "in_progress",
+        }
+
+    @app.post("/sources/folder/complete")
+    async def complete_folder_upload(
+        upload_id: str = Form(...),
+        project: str = Form("default"),
+        request: Request = None,
+        user: UserContext = Depends(get_current_user),
+    ) -> dict[str, Any]:
+        """Finalize chunked folder upload and run the pipeline."""
+        clean_upload_id = re.sub(r"[^a-zA-Z0-9_\-]", "", upload_id.strip())
+        clean_project = re.sub(r"[^a-zA-Z0-9_\-]", "_", project.strip()) or "default"
+        state_file = user.jobs_dir / f"folder_upload_{clean_upload_id}.json"
+        if not state_file.exists():
+            raise HTTPException(status_code=404, detail="Folder upload session not found or already completed")
+
+        state = read_job_state(state_file) or {}
+        saved_files = state.get("saved_files", [])
+
+        _pre_insert_images_db(user.db_path, saved_files)
+        job_id = launch_pipeline_job(request.app, user=user, source_type="local", folder=user.library_dir)
+
+        try:
+            state_file.unlink()
+        except Exception:
+            pass
+
+        return {
+            "job_id": job_id,
+            "uploaded_count": len(saved_files),
+            "project": clean_project,
+            "files": [Path(p).name for p in saved_files],
+        }
+
+    # ── ZIP Upload Endpoints (Chunked and Direct Streamed Extraction) ──
+
+    @app.post("/sources/zip/chunk")
+    async def upload_zip_chunk(
+        upload_id: str = Form(...),
+        chunk_index: int = Form(...),
+        total_chunks: int = Form(...),
+        file: UploadFile = File(...),
+        total_bytes: int = Form(0),
+        project: str = Form("default"),
+        request: Request = None,
+        user: UserContext = Depends(get_current_user),
+    ) -> dict[str, Any]:
+        """Upload a binary chunk of a ZIP archive."""
+        clean_upload_id = re.sub(r"[^a-zA-Z0-9_\-]", "", upload_id.strip()) or f"zip_{int(time.time())}"
+        clean_project = re.sub(r"[^a-zA-Z0-9_\-]", "_", project.strip()) or "default"
+        quotas_cfg = request.app.state.config.get("quotas", {})
+        user_storage_cap = quotas_cfg.get("user_storage_cap_mb", 2048) * 1024 * 1024
+        current_user_storage = get_user_storage_usage(user.root)
+        if current_user_storage >= user_storage_cap:
+            raise HTTPException(status_code=400, detail="Upload exceeds user storage quota")
+
+        tmp_dir = user.root / "tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        zip_part = tmp_dir / f"zip_{clean_upload_id}.part"
+        validate_confined_user_path(zip_part, user.root)
+
+        state_file = user.jobs_dir / f"zip_upload_{clean_upload_id}.json"
+        state = read_job_state(state_file) if state_file.exists() else {
+            "upload_id": clean_upload_id,
+            "project": clean_project,
+            "total_chunks": total_chunks,
+            "total_bytes": total_bytes,
+            "chunks_received": [],
+            "bytes_received": 0,
+        }
+
+        if chunk_index in state.get("chunks_received", []):
+            return {
+                "status": "already_received",
+                "chunk_index": chunk_index,
+                "total_chunks": total_chunks,
+                "bytes_received": zip_part.stat().st_size if zip_part.exists() else 0,
+            }
+
+        mode = "ab" if (zip_part.exists() and chunk_index > 0) else "wb"
+        with open(zip_part, mode) as f_out:
+            while True:
+                buf = await file.read(65536)
+                if not buf:
+                    break
+                current_user_storage += len(buf)
+                if current_user_storage > user_storage_cap:
+                    f_out.close()
+                    if zip_part.exists():
+                        zip_part.unlink()
+                    raise HTTPException(status_code=400, detail="Upload exceeds user storage quota")
+                f_out.write(buf)
+
+        state.setdefault("chunks_received", []).append(chunk_index)
+        state["bytes_received"] = zip_part.stat().st_size
+        write_job_state(state_file, state)
+
+        return {
+            "status": "chunk_received",
+            "chunk_index": chunk_index,
+            "total_chunks": total_chunks,
+            "bytes_received": state["bytes_received"],
+        }
+
+    @app.get("/sources/zip/status")
+    def get_zip_upload_status(
+        upload_id: str = Query(...),
+        user: UserContext = Depends(get_current_user),
+    ) -> dict[str, Any]:
+        """Check status of chunked ZIP upload."""
+        clean_upload_id = re.sub(r"[^a-zA-Z0-9_\-]", "", upload_id.strip())
+        state_file = user.jobs_dir / f"zip_upload_{clean_upload_id}.json"
+        if not state_file.exists():
+            return {"exists": False, "chunks_received": [], "bytes_received": 0, "status": "not_found"}
+        state = read_job_state(state_file) or {}
+        return {
+            "exists": True,
+            "upload_id": clean_upload_id,
+            "total_chunks": state.get("total_chunks", 0),
+            "chunks_received": state.get("chunks_received", []),
+            "bytes_received": state.get("bytes_received", 0),
+            "status": "in_progress",
+        }
+
+    @app.post("/sources/zip/extract")
+    async def extract_zip_upload(
+        upload_id: str = Form(...),
+        project: str = Form("default"),
+        request: Request = None,
+        user: UserContext = Depends(get_current_user),
+    ) -> dict[str, Any]:
+        """Streamed server-side extraction of chunked ZIP upload."""
+        clean_upload_id = re.sub(r"[^a-zA-Z0-9_\-]", "", upload_id.strip())
+        clean_project = re.sub(r"[^a-zA-Z0-9_\-]", "_", project.strip()) or "default"
+        zip_part = user.root / "tmp" / f"zip_{clean_upload_id}.part"
+        if not zip_part.exists():
+            raise HTTPException(status_code=404, detail="Uploaded ZIP archive part not found")
+
+        dest_dir = user.library_dir / clean_project
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        validate_confined_user_path(dest_dir, user.root)
+
+        try:
+            extracted_files = _extract_zip_streamed(zip_part, dest_dir, user, request.app.state.config)
+        finally:
+            if zip_part.exists():
+                try:
+                    zip_part.unlink()
+                except Exception:
+                    pass
+            state_file = user.jobs_dir / f"zip_upload_{clean_upload_id}.json"
+            if state_file.exists():
+                try:
+                    state_file.unlink()
+                except Exception:
+                    pass
+
+        _pre_insert_images_db(user.db_path, extracted_files)
+        job_id = launch_pipeline_job(request.app, user=user, source_type="local", folder=user.library_dir)
+        return {
+            "job_id": job_id,
+            "extracted_count": len(extracted_files),
+            "project": clean_project,
+            "files": [Path(p).name for p in extracted_files],
+        }
+
+    @app.post("/sources/zip")
+    async def upload_zip_direct(
+        file: UploadFile = File(...),
+        project: str = Query("default"),
+        request: Request = None,
+        user: UserContext = Depends(get_current_user),
+    ) -> dict[str, Any]:
+        """Direct single-request ZIP upload and streamed extraction."""
+        clean_project = re.sub(r"[^a-zA-Z0-9_\-]", "_", project.strip()) or "default"
+        tmp_dir = user.root / "tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        temp_zip = tmp_dir / f"direct_{uuid.uuid4().hex}.zip"
+        validate_confined_user_path(temp_zip, user.root)
+
+        quotas_cfg = request.app.state.config.get("quotas", {})
+        user_storage_cap = quotas_cfg.get("user_storage_cap_mb", 2048) * 1024 * 1024
+        current_user_storage = get_user_storage_usage(user.root)
+
+        try:
+            with open(temp_zip, "wb") as f_out:
+                while True:
+                    chunk = await file.read(65536)
+                    if not chunk:
+                        break
+                    current_user_storage += len(chunk)
+                    if current_user_storage > user_storage_cap:
+                        f_out.close()
+                        if temp_zip.exists():
+                            temp_zip.unlink()
+                        raise HTTPException(status_code=400, detail="Upload exceeds user storage quota")
+                    f_out.write(chunk)
+
+            dest_dir = user.library_dir / clean_project
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            validate_confined_user_path(dest_dir, user.root)
+            extracted_files = _extract_zip_streamed(temp_zip, dest_dir, user, request.app.state.config)
+        finally:
+            if temp_zip.exists():
+                try:
+                    temp_zip.unlink()
+                except Exception:
+                    pass
+
+        _pre_insert_images_db(user.db_path, extracted_files)
+        job_id = launch_pipeline_job(request.app, user=user, source_type="local", folder=user.library_dir)
+        return {
+            "job_id": job_id,
+            "extracted_count": len(extracted_files),
+            "project": clean_project,
+            "files": [Path(p).name for p in extracted_files],
         }
 
     # ==========================

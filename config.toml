@@ -494,7 +494,16 @@ library_dir = "~/.similix/library"
 [sources.upload]
 per_file_cap_mb = 50
 total_cap_mb = 1000
-allowed_extensions = ["jpg", "jpeg", "png", "webp", "heic"]
+allowed_extensions = ["jpg", "jpeg", "png", "webp", "heic", "tiff", "bmp"]
+max_batch_files = 100
+max_folder_files = 10000
+max_zip_files = 10000
+chunk_size_files = 25
+
+[sources.zip]
+max_uncompressed_bytes = 2147483648
+max_ratio = 100
+max_files = 10000
 
 [sources.dataset]
 allowed_hosts = ["huggingface.co", "hf.co", "github.com", "raw.githubusercontent.com"]

@@ -1252,11 +1252,13 @@
         <!-- Tabs -->
         <div class="segmented-control" style="width:100%;">
           <button type="button" class="source-tab-btn active" data-tab="tab-upload">Upload Files</button>
+          <button type="button" class="source-tab-btn" data-tab="tab-folder" id="tab-btn-folder">Upload Folder</button>
+          <button type="button" class="source-tab-btn" data-tab="tab-zip" id="tab-btn-zip">Upload ZIP</button>
           <button type="button" class="source-tab-btn" data-tab="tab-drive">Google Drive</button>
           <button type="button" class="source-tab-btn" data-tab="tab-dataset">Dataset URL</button>
         </div>
 
-        <!-- Tab 1: Upload -->
+        <!-- Tab 1: Upload Files -->
         <div id="tab-upload" class="source-tab-pane">
           <div class="drop-zone" id="drop-zone">
             <div style="font-size:28px; margin-bottom:6px;">📤</div>
@@ -1265,8 +1267,61 @@
             <button type="button" class="btn" id="btn-browse-files">Browse Files</button>
             <input type="file" id="file-input" multiple accept=".jpg,.jpeg,.png,.webp,.heic" style="display:none;">
           </div>
+          <div style="display:flex; justify-content:center; gap:12px; margin-top:10px;">
+            <button type="button" class="btn" id="btn-quick-folder" style="font-size:0.8rem; padding:4px 10px;">📁 Upload entire folder instead</button>
+            <button type="button" class="btn" id="btn-quick-zip" style="font-size:0.8rem; padding:4px 10px;">📦 Upload ZIP archive instead</button>
+          </div>
           <div id="upload-file-list" style="margin-top:10px; font-size:0.8rem; color:var(--text-muted); max-height:100px; overflow-y:auto;"></div>
           <button type="button" class="btn btn-primary" id="btn-start-upload" style="margin-top:12px; width:100%; display:none;">Upload & Run Pipeline</button>
+        </div>
+
+        <!-- Tab 2: Upload Folder -->
+        <div id="tab-folder" class="source-tab-pane" style="display:none;">
+          <div class="drop-zone" id="folder-drop-zone">
+            <div style="font-size:28px; margin-bottom:6px;">📁</div>
+            <div style="font-weight:600; font-size:0.95rem; margin-bottom:4px;">Upload Entire Directory</div>
+            <div style="font-size:0.8rem; color:var(--text-muted); margin-bottom:12px;">Batches up to 10,000 files &bull; Transferred in chunks of 25 with resume</div>
+            <button type="button" class="btn btn-primary" id="btn-browse-folder">Choose Folder</button>
+            <input type="file" id="folder-input" webkitdirectory directory multiple accept=".jpg,.jpeg,.png,.webp,.heic,.tiff,.bmp" style="display:none;">
+          </div>
+          <div id="folder-summary" style="margin-top:10px; font-size:0.82rem; color:var(--text); display:none;"></div>
+          <div id="folder-progress-panel" style="margin-top:12px; display:none;">
+            <div style="display:flex; justify-content:space-between; font-size:0.8rem; color:var(--text-muted); margin-bottom:4px;">
+              <span id="folder-progress-status">Uploading files...</span>
+              <span id="folder-progress-percent" style="font-weight:600; color:var(--primary);">0%</span>
+            </div>
+            <div style="height:6px; background:var(--bg-secondary); border-radius:3px; overflow:hidden; border:1px solid var(--border);">
+              <div id="folder-progress-bar" style="width:0%; height:100%; background:var(--primary); transition:width 0.2s ease;"></div>
+            </div>
+            <div id="folder-current-file" style="font-size:0.75rem; color:var(--text-muted); margin-top:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;"></div>
+          </div>
+          <div style="display:flex; gap:8px; margin-top:12px;">
+            <button type="button" class="btn btn-primary" id="btn-start-folder-upload" style="flex:1; display:none;">Upload Folder & Run Pipeline</button>
+            <button type="button" class="btn" id="btn-pause-folder-upload" style="display:none;">Pause</button>
+            <button type="button" class="btn btn-primary" id="btn-resume-folder-upload" style="display:none;">Resume</button>
+          </div>
+        </div>
+
+        <!-- Tab 3: Upload ZIP -->
+        <div id="tab-zip" class="source-tab-pane" style="display:none;">
+          <div class="drop-zone" id="zip-drop-zone">
+            <div style="font-size:28px; margin-bottom:6px;">📦</div>
+            <div style="font-weight:600; font-size:0.95rem; margin-bottom:4px;">Upload ZIP Archive</div>
+            <div style="font-size:0.8rem; color:var(--text-muted); margin-bottom:12px;">Supports up to 10,000 images &bull; Streamed server-side extraction</div>
+            <button type="button" class="btn btn-primary" id="btn-browse-zip">Choose ZIP File</button>
+            <input type="file" id="zip-input" accept=".zip,application/zip" style="display:none;">
+          </div>
+          <div id="zip-summary" style="margin-top:10px; font-size:0.82rem; color:var(--text); display:none;"></div>
+          <div id="zip-progress-panel" style="margin-top:12px; display:none;">
+            <div style="display:flex; justify-content:space-between; font-size:0.8rem; color:var(--text-muted); margin-bottom:4px;">
+              <span id="zip-progress-status">Uploading ZIP archive...</span>
+              <span id="zip-progress-percent" style="font-weight:600; color:var(--primary);">0%</span>
+            </div>
+            <div style="height:6px; background:var(--bg-secondary); border-radius:3px; overflow:hidden; border:1px solid var(--border);">
+              <div id="zip-progress-bar" style="width:0%; height:100%; background:var(--primary); transition:width 0.2s ease;"></div>
+            </div>
+          </div>
+          <button type="button" class="btn btn-primary" id="btn-start-zip-upload" style="margin-top:12px; width:100%; display:none;">Upload & Extract ZIP</button>
         </div>
 
         <!-- Tab 2: Drive -->
@@ -2645,7 +2700,13 @@
 
       banner.style.display = "block";
       fill.style.background = "#2563eb";
-      if (stageFill) stageFill.style.background = "#2dd4bf";
+      fill.style.width = "0%";
+      percentText.textContent = "0%";
+      statusText.textContent = "Initializing pipeline...";
+      if (stageFill) {
+        stageFill.style.background = "#2dd4bf";
+        stageFill.style.width = "0%";
+      }
       setSourceButtonsDisabled(true);
 
       // Elapsed time tracking
@@ -2930,6 +2991,334 @@
         msg.style.color = "var(--danger)";
         msg.style.border = "1px solid var(--danger-border)";
         msg.textContent = err.message || "Upload failed";
+      }
+    });
+
+    // ── Folder Upload (Chunks of 25 with resume) ──
+    const folderInput = document.getElementById("folder-input");
+    const btnBrowseFolder = document.getElementById("btn-browse-folder");
+    const folderDropZone = document.getElementById("folder-drop-zone");
+    const folderSummary = document.getElementById("folder-summary");
+    const folderProgressPanel = document.getElementById("folder-progress-panel");
+    const folderProgressStatus = document.getElementById("folder-progress-status");
+    const folderProgressPercent = document.getElementById("folder-progress-percent");
+    const folderProgressBar = document.getElementById("folder-progress-bar");
+    const folderCurrentFile = document.getElementById("folder-current-file");
+    const btnStartFolderUpload = document.getElementById("btn-start-folder-upload");
+    const btnPauseFolderUpload = document.getElementById("btn-pause-folder-upload");
+    const btnResumeFolderUpload = document.getElementById("btn-resume-folder-upload");
+
+    let selectedFolderFiles = [];
+    let folderChunks = [];
+    let folderUploadId = null;
+    let isFolderUploadPaused = false;
+    const FOLDER_CHUNK_SIZE = 25;
+
+    btnBrowseFolder.addEventListener("click", (e) => {
+      e.stopPropagation();
+      folderInput.click();
+    });
+    folderDropZone.addEventListener("click", () => folderInput.click());
+
+    document.getElementById("btn-quick-folder")?.addEventListener("click", () => {
+      document.querySelector('[data-tab="tab-folder"]')?.click();
+    });
+    document.getElementById("btn-quick-zip")?.addEventListener("click", () => {
+      document.querySelector('[data-tab="tab-zip"]')?.click();
+    });
+
+    folderInput.addEventListener("change", () => {
+      if (folderInput.files && folderInput.files.length > 0) {
+        handleFolderFilesSelected(Array.from(folderInput.files));
+      }
+    });
+
+    function handleFolderFilesSelected(files) {
+      const allowedExts = new Set(["jpg", "jpeg", "png", "webp", "heic", "tiff", "bmp"]);
+      selectedFolderFiles = files.filter(f => {
+        const ext = f.name.split(".").pop().toLowerCase();
+        return allowedExts.has(ext);
+      });
+
+      if (selectedFolderFiles.length === 0) {
+        folderSummary.style.display = "block";
+        folderSummary.style.color = "var(--danger)";
+        folderSummary.textContent = "No supported image files found in selected folder.";
+        btnStartFolderUpload.style.display = "none";
+        return;
+      }
+
+      if (selectedFolderFiles.length > 10000) {
+        folderSummary.style.display = "block";
+        folderSummary.style.color = "var(--danger)";
+        folderSummary.textContent = `Folder contains ${selectedFolderFiles.length} files (maximum is 10,000 files).`;
+        btnStartFolderUpload.style.display = "none";
+        return;
+      }
+
+      folderChunks = [];
+      for (let i = 0; i < selectedFolderFiles.length; i += FOLDER_CHUNK_SIZE) {
+        folderChunks.push(selectedFolderFiles.slice(i, i + FOLDER_CHUNK_SIZE));
+      }
+
+      folderSummary.style.display = "block";
+      folderSummary.style.color = "var(--text)";
+      const folderName = selectedFolderFiles[0].webkitRelativePath
+        ? selectedFolderFiles[0].webkitRelativePath.split("/")[0]
+        : "Selected folder";
+      folderSummary.innerHTML = `<strong>${folderName}/</strong>: ${selectedFolderFiles.length} images ready (${folderChunks.length} chunks of up to 25 files)`;
+      btnStartFolderUpload.style.display = "block";
+      folderProgressPanel.style.display = "none";
+      btnPauseFolderUpload.style.display = "none";
+      btnResumeFolderUpload.style.display = "none";
+    }
+
+    async function runFolderUploadLoop() {
+      if (!folderUploadId) {
+        folderUploadId = "fld_" + Date.now() + "_" + Math.random().toString(36).substr(2, 8);
+        try { localStorage.setItem("similix_folder_upload_id", folderUploadId); } catch (_) {}
+      }
+
+      let completedChunks = new Set();
+      try {
+        const stRes = await fetch(`/sources/folder/status?upload_id=${folderUploadId}`);
+        if (stRes.ok) {
+          const stData = await stRes.json();
+          if (stData.chunks_received && Array.isArray(stData.chunks_received)) {
+            completedChunks = new Set(stData.chunks_received);
+          }
+        }
+      } catch (_) {}
+
+      folderProgressPanel.style.display = "block";
+      btnStartFolderUpload.style.display = "none";
+      btnPauseFolderUpload.style.display = "block";
+      btnResumeFolderUpload.style.display = "none";
+
+      const csrf = await getCsrfToken();
+      let uploadedFilesCount = 0;
+
+      for (let i = 0; i < folderChunks.length; i++) {
+        if (isFolderUploadPaused) {
+          folderProgressStatus.textContent = `Paused at chunk ${i + 1} of ${folderChunks.length}. Click Resume to continue.`;
+          btnPauseFolderUpload.style.display = "none";
+          btnResumeFolderUpload.style.display = "block";
+          return;
+        }
+
+        if (completedChunks.has(i)) {
+          uploadedFilesCount += folderChunks[i].length;
+          const pct = Math.round((uploadedFilesCount / selectedFolderFiles.length) * 100);
+          folderProgressPercent.textContent = `${pct}%`;
+          folderProgressBar.style.width = `${pct}%`;
+          folderProgressStatus.textContent = `Chunk ${i + 1} of ${folderChunks.length} already uploaded (resuming)...`;
+          continue;
+        }
+
+        const chunk = folderChunks[i];
+        const formData = new FormData();
+        formData.append("upload_id", folderUploadId);
+        formData.append("chunk_index", i);
+        formData.append("total_chunks", folderChunks.length);
+        formData.append("total_files", selectedFolderFiles.length);
+        formData.append("project", "folder_upload");
+
+        chunk.forEach(f => {
+          formData.append("files", f, f.name);
+          formData.append("relative_paths", f.webkitRelativePath || f.name);
+        });
+
+        const currentRel = chunk[0].webkitRelativePath || chunk[0].name;
+        folderCurrentFile.textContent = `Uploading: ${currentRel}`;
+        folderProgressStatus.textContent = `Uploading chunk ${i + 1} of ${folderChunks.length} (${uploadedFilesCount}/${selectedFolderFiles.length} files)...`;
+
+        const res = await fetch("/sources/folder/chunk", {
+          method: "POST",
+          headers: { "X-CSRF-Token": csrf },
+          body: formData,
+        });
+
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.detail || `Upload failed on chunk ${i + 1}`);
+        }
+
+        completedChunks.add(i);
+        uploadedFilesCount += chunk.length;
+        const pct = Math.round((uploadedFilesCount / selectedFolderFiles.length) * 100);
+        folderProgressPercent.textContent = `${pct}%`;
+        folderProgressBar.style.width = `${pct}%`;
+      }
+
+      folderProgressStatus.textContent = "Finalizing upload and starting pipeline...";
+      folderCurrentFile.textContent = "Running SIMILIX deduplication pipeline...";
+
+      const compData = new FormData();
+      compData.append("upload_id", folderUploadId);
+      compData.append("project", "folder_upload");
+
+      const compRes = await fetch("/sources/folder/complete", {
+        method: "POST",
+        headers: { "X-CSRF-Token": csrf },
+        body: compData,
+      });
+
+      if (!compRes.ok) {
+        const err = await compRes.json().catch(() => ({}));
+        throw new Error(err.detail || "Finalizing folder upload failed");
+      }
+
+      const compResult = await compRes.json();
+      try { localStorage.removeItem("similix_folder_upload_id"); } catch (_) {}
+      folderUploadId = null;
+      selectedFolderFiles = [];
+      folderChunks = [];
+
+      sourcesModal.style.display = "none";
+      refreshAll({ preserveActiveCluster: true });
+      if (compResult && typeof compResult.job_id === "string" && compResult.job_id.trim()) {
+        pollJobProgress(compResult.job_id);
+      }
+    }
+
+    btnStartFolderUpload.addEventListener("click", async () => {
+      try {
+        isFolderUploadPaused = false;
+        await runFolderUploadLoop();
+      } catch (err) {
+        folderSummary.style.display = "block";
+        folderSummary.style.color = "var(--danger)";
+        folderSummary.textContent = "Error: " + err.message;
+        btnStartFolderUpload.style.display = "block";
+        btnPauseFolderUpload.style.display = "none";
+        btnResumeFolderUpload.style.display = "none";
+      }
+    });
+
+    btnPauseFolderUpload.addEventListener("click", () => {
+      isFolderUploadPaused = true;
+    });
+
+    btnResumeFolderUpload.addEventListener("click", async () => {
+      try {
+        isFolderUploadPaused = false;
+        btnResumeFolderUpload.style.display = "none";
+        btnPauseFolderUpload.style.display = "block";
+        await runFolderUploadLoop();
+      } catch (err) {
+        folderSummary.style.display = "block";
+        folderSummary.style.color = "var(--danger)";
+        folderSummary.textContent = "Resume error: " + err.message;
+      }
+    });
+
+    // ── ZIP Upload Logic (Streamed extraction server-side) ──
+    const zipInput = document.getElementById("zip-input");
+    const btnBrowseZip = document.getElementById("btn-browse-zip");
+    const zipDropZone = document.getElementById("zip-drop-zone");
+    const zipSummary = document.getElementById("zip-summary");
+    const zipProgressPanel = document.getElementById("zip-progress-panel");
+    const zipProgressStatus = document.getElementById("zip-progress-status");
+    const zipProgressPercent = document.getElementById("zip-progress-percent");
+    const zipProgressBar = document.getElementById("zip-progress-bar");
+    const btnStartZipUpload = document.getElementById("btn-start-zip-upload");
+
+    let selectedZipFile = null;
+
+    btnBrowseZip.addEventListener("click", (e) => {
+      e.stopPropagation();
+      zipInput.click();
+    });
+    zipDropZone.addEventListener("click", () => zipInput.click());
+
+    zipInput.addEventListener("change", () => {
+      if (zipInput.files && zipInput.files.length > 0) {
+        selectedZipFile = zipInput.files[0];
+        zipSummary.style.display = "block";
+        zipSummary.style.color = "var(--text)";
+        zipSummary.innerHTML = `<strong>${selectedZipFile.name}</strong> (${formatBytes(selectedZipFile.size)})`;
+        btnStartZipUpload.style.display = "block";
+        zipProgressPanel.style.display = "none";
+      }
+    });
+
+    btnStartZipUpload.addEventListener("click", async () => {
+      if (!selectedZipFile) return;
+      btnStartZipUpload.disabled = true;
+      zipProgressPanel.style.display = "block";
+
+      const ZIP_CHUNK_SIZE = 5 * 1024 * 1024; // 5 MB chunks
+      const totalChunks = Math.max(1, Math.ceil(selectedZipFile.size / ZIP_CHUNK_SIZE));
+      const zipUploadId = "zip_" + Date.now() + "_" + Math.random().toString(36).substr(2, 8);
+      const csrf = await getCsrfToken();
+
+      try {
+        for (let i = 0; i < totalChunks; i++) {
+          const start = i * ZIP_CHUNK_SIZE;
+          const end = Math.min(selectedZipFile.size, start + ZIP_CHUNK_SIZE);
+          const chunkBlob = selectedZipFile.slice(start, end);
+
+          const formData = new FormData();
+          formData.append("upload_id", zipUploadId);
+          formData.append("chunk_index", i);
+          formData.append("total_chunks", totalChunks);
+          formData.append("total_bytes", selectedZipFile.size);
+          formData.append("project", "zip_upload");
+          formData.append("file", chunkBlob, selectedZipFile.name);
+
+          const pct = Math.round(((i + 1) / totalChunks) * 85);
+          zipProgressPercent.textContent = `${pct}%`;
+          zipProgressBar.style.width = `${pct}%`;
+          zipProgressStatus.textContent = `Uploading ZIP chunk ${i + 1} of ${totalChunks} (${formatBytes(end)} / ${formatBytes(selectedZipFile.size)})...`;
+
+          const chunkRes = await fetch("/sources/zip/chunk", {
+            method: "POST",
+            headers: { "X-CSRF-Token": csrf },
+            body: formData,
+          });
+
+          if (!chunkRes.ok) {
+            const err = await chunkRes.json().catch(() => ({}));
+            throw new Error(err.detail || "ZIP chunk upload failed");
+          }
+        }
+
+        zipProgressPercent.textContent = "90%";
+        zipProgressBar.style.width = "90%";
+        zipProgressStatus.textContent = "Extracting ZIP archive server-side in stream...";
+
+        const extFormData = new FormData();
+        extFormData.append("upload_id", zipUploadId);
+        extFormData.append("project", "zip_upload");
+
+        const extRes = await fetch("/sources/zip/extract", {
+          method: "POST",
+          headers: { "X-CSRF-Token": csrf },
+          body: extFormData,
+        });
+
+        if (!extRes.ok) {
+          const err = await extRes.json().catch(() => ({}));
+          throw new Error(err.detail || "ZIP extraction failed");
+        }
+
+        const extResult = await extRes.json();
+        zipProgressPercent.textContent = "100%";
+        zipProgressBar.style.width = "100%";
+        zipProgressStatus.textContent = `Extracted ${extResult.extracted_count} images successfully!`;
+
+        sourcesModal.style.display = "none";
+        selectedZipFile = null;
+        btnStartZipUpload.disabled = false;
+        refreshAll({ preserveActiveCluster: true });
+        if (extResult && typeof extResult.job_id === "string" && extResult.job_id.trim()) {
+          pollJobProgress(extResult.job_id);
+        }
+      } catch (err) {
+        zipSummary.style.display = "block";
+        zipSummary.style.color = "var(--danger)";
+        zipSummary.textContent = "Error: " + err.message;
+        btnStartZipUpload.disabled = false;
       }
     });
 

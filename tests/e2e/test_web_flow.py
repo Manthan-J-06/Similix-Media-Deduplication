@@ -907,3 +907,181 @@ def test_upload_5_unique_images_appear_in_library(live_server, tmp_path):
         context.close()
         browser.close()
 
+
+@pytest.mark.skipif(not is_clip_weights_cached(), reason="CLIP weights not cached; skipping e2e browser test")
+def test_folder_and_zip_ingestion_with_duplicates(live_server, tmp_path):
+    """
+    E2E test verifying:
+    1. Folder upload of 40 images (chunked in batches of 25 with progress bar).
+    2. ZIP upload of 40 images (chunked upload with streamed server-side extraction).
+    3. Pipeline completion with N of M progress.
+    4. Duplicates detected across both folder and ZIP sources (80 images total).
+    """
+    from playwright.sync_api import sync_playwright
+
+    base_url = live_server
+    test_email = f"fldzip_{uuid.uuid4().hex[:8]}@example.com"
+    test_password = "SecurePassword123!"
+
+    from PIL import ImageDraw
+
+    def _create_distinct_image(path, group_id):
+        size = (180, 180)
+        im = Image.new("RGB", size, color=(group_id * 23 % 255, (group_id * 47 + 50) % 255, (group_id * 71 + 100) % 255))
+        draw = ImageDraw.Draw(im)
+        draw.rectangle([20, 20, 160, 160], fill=((group_id * 53) % 255, (group_id * 83) % 255, (group_id * 113) % 255))
+        draw.text((40, 70), f"GRP_{group_id}", fill=(255, 255, 255))
+        draw.line([0, 0, (group_id * 17) % 180, 180], fill=(255, 255, 0), width=4)
+        im.save(str(path), format="JPEG", quality=95)
+
+    # 1. Prepare 40 folder images and 40 zip images
+    fld_dir = tmp_path / "folder_40"
+    fld_dir.mkdir(parents=True, exist_ok=True)
+    fld_sub = fld_dir / "subfolder"
+    fld_sub.mkdir(parents=True, exist_ok=True)
+
+    folder_files = []
+    # 5 shared base images in folder (Groups 0..4)
+    for i in range(5):
+        p = fld_dir / f"shared_base_{i}.jpg"
+        _create_distinct_image(p, group_id=i)
+        folder_files.append(p)
+
+    # 5 duplicate copies inside the folder
+    for i in range(5):
+        p = fld_sub / f"fld_copy_{i}.jpg"
+        shutil.copyfile(folder_files[i], p)
+        folder_files.append(p)
+
+    # 30 distinct unique images in folder (Groups 100..129)
+    for i in range(30):
+        p = fld_dir / f"fld_unique_{i}.jpg"
+        _create_distinct_image(p, group_id=100 + i)
+        folder_files.append(p)
+
+    assert len(folder_files) == 40
+
+    # Prepare ZIP archive with 40 images
+    zip_path = tmp_path / "test_archive_40.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        # 5 copies of the shared base images (cross-folder duplicates!)
+        for i in range(5):
+            zf.write(folder_files[i], arcname=f"zip_archive/cross_dup_{i}.jpg")
+
+        # 5 duplicate pairs inside the zip (5 pairs x 2 = 10 images, Groups 10..14)
+        for i in range(5):
+            p_orig = tmp_path / f"zip_pair_{i}_a.jpg"
+            p_dup = tmp_path / f"zip_pair_{i}_b.jpg"
+            _create_distinct_image(p_orig, group_id=10 + i)
+            shutil.copyfile(p_orig, p_dup)
+            zf.write(p_orig, arcname=f"zip_archive/pairs/pair_{i}_a.jpg")
+            zf.write(p_dup, arcname=f"zip_archive/pairs/pair_{i}_b.jpg")
+
+        # 25 unique images in zip (Groups 200..224)
+        for i in range(25):
+            p = tmp_path / f"zip_unique_{i}.jpg"
+            _create_distinct_image(p, group_id=200 + i)
+            zf.write(p, arcname=f"zip_archive/uniques/uniq_{i}.jpg")
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        assert len(zf.namelist()) == 40
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(viewport={"width": 1280, "height": 900})
+        page = context.new_page()
+
+        # Register & Login
+        page.goto(f"{base_url}/login")
+        page.wait_for_selector("#tab-register", timeout=10000)
+        page.click("#tab-register")
+        page.fill("#email", test_email)
+        page.fill("#password", test_password)
+        page.click("#submit-btn")
+
+        try:
+            page.wait_for_url(f"{base_url}/", timeout=15000)
+        except Exception:
+            if page.is_visible("#tab-login.active"):
+                page.fill("#email", test_email)
+                page.fill("#password", test_password)
+                page.click("#submit-btn")
+                page.wait_for_url(f"{base_url}/", timeout=15000)
+
+        page.wait_for_selector("#user-email-display", timeout=10000)
+        page.wait_for_selector("#btn-open-sources", timeout=10000)
+
+        # ── Step 1: Upload Folder of 40 images (Chunks of 25) ──
+        page.click("#btn-open-sources")
+        page.wait_for_selector("#sources-modal", state="visible", timeout=5000)
+        page.click("#tab-btn-folder")
+        page.wait_for_selector("#folder-drop-zone", state="visible", timeout=5000)
+
+        page.set_input_files("#folder-input", str(fld_dir))
+        page.wait_for_selector("#btn-start-folder-upload", state="visible", timeout=5000)
+        page.click("#btn-start-folder-upload")
+
+        # Wait for folder pipeline to complete
+        page.wait_for_selector("#job-progress-banner", state="visible", timeout=15000)
+        t0 = time.time()
+        completed = False
+        while time.time() - t0 < 120:
+            status = page.evaluate("() => document.getElementById('job-status-text')?.textContent || ''")
+            pct = page.evaluate("() => document.getElementById('job-percent-text')?.textContent || ''")
+            stage = page.evaluate("() => document.getElementById('job-stage-label')?.textContent || ''")
+            print(f"[{time.time()-t0:.1f}s] status='{status}', pct='{pct}', stage='{stage}'")
+            if "Pipeline complete" in status or "Pipeline completed" in status or pct == "100%":
+                completed = True
+                break
+            if "failed" in status.lower() or "error" in status.lower():
+                raise RuntimeError(f"Pipeline failed: {status}")
+            time.sleep(2)
+        assert completed, f"Pipeline did not complete in 120s. Last status: {status}"
+
+        # ── Step 2: Upload ZIP archive of 40 images ──
+        page.click("#btn-open-sources")
+        page.wait_for_selector("#sources-modal", state="visible", timeout=5000)
+        page.click("#tab-btn-zip")
+        page.wait_for_selector("#zip-drop-zone", state="visible", timeout=5000)
+
+        page.set_input_files("#zip-input", str(zip_path))
+        page.wait_for_selector("#btn-start-zip-upload", state="visible", timeout=5000)
+        page.click("#btn-start-zip-upload")
+
+        # Wait for sources modal to close (upload & extraction finished, job initiated)
+        page.wait_for_selector("#sources-modal", state="hidden", timeout=30000)
+
+        # Wait for zip pipeline to complete
+        page.wait_for_selector("#job-progress-banner", state="visible", timeout=15000)
+        t0 = time.time()
+        completed = False
+        while time.time() - t0 < 120:
+            status = page.evaluate("() => document.getElementById('job-status-text')?.textContent || ''")
+            pct = page.evaluate("() => document.getElementById('job-percent-text')?.textContent || ''")
+            stage = page.evaluate("() => document.getElementById('job-stage-label')?.textContent || ''")
+            print(f"[ZIP {time.time()-t0:.1f}s] status='{status}', pct='{pct}', stage='{stage}'")
+            if ("Pipeline complete" in status or "Pipeline completed" in status or pct == "100%") and time.time() - t0 > 2.0:
+                completed = True
+                break
+            if "failed" in status.lower() or "error" in status.lower():
+                raise RuntimeError(f"ZIP Pipeline failed: {status}")
+            time.sleep(2)
+        assert completed, f"ZIP Pipeline did not complete in 120s. Last status: {status}"
+
+        # ── Step 3: Verify All Photos View has 80 images ──
+        page.wait_for_selector("#tab-all-photos", timeout=10000)
+        page.click("#tab-all-photos")
+        page.wait_for_selector("#library-view-panel", state="visible", timeout=10000)
+        page.wait_for_function("() => document.getElementById('lib-total-count')?.textContent.trim() === '80'", timeout=20000)
+        assert page.locator("#lib-total-count").inner_text().strip() == "80"
+
+        # ── Step 4: Verify Duplicates Detected Across Folders ──
+        page.click("#tab-duplicates")
+        page.wait_for_selector("#duplicates-view-panel", state="visible", timeout=10000)
+        page.wait_for_selector("#cluster-list .cluster-item", timeout=10000)
+        clusters = page.locator("#cluster-list .cluster-item").all()
+        assert len(clusters) >= 3, f"Expected at least 3 duplicate clusters across folder and zip, got {len(clusters)}"
+
+        context.close()
+        browser.close()
+
