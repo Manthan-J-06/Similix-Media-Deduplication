@@ -2207,3 +2207,47 @@ class TestPipelineResumable:
         assert "batch_zero_planned" not in batch_ids
         assert "batch_valid_planned" in batch_ids
 
+    def test_dismiss_cluster_member_and_entire_cluster(self, api_test_env):
+        """Test dismissing an individual image from a cluster and dismissing an entire cluster."""
+        client = api_test_env["client"]
+        db_file = api_test_env["db_file"]
+
+        # Cluster 1 in api_test_env has 3 members (ids 1, 2, 3)
+        res_before = client.get("/clusters/1")
+        assert res_before.status_code == 200
+        assert len(res_before.json()["members"]) == 3
+
+        # 1. Dismiss member 3
+        res_dis1 = client.post("/clusters/1/dismiss/3")
+        assert res_dis1.status_code == 200
+        data1 = res_dis1.json()
+        assert data1["success"] is True
+        assert data1["remaining_members"] == 2
+        assert data1["cluster_deleted"] is False
+
+        # Member 3 is now unclustered
+        with sqlite3.connect(db_file) as conn:
+            m3 = conn.execute("SELECT cluster_id FROM images WHERE id = 3").fetchone()
+            assert m3[0] is None
+
+        # 2. Dismiss member 2: now only member 1 would remain, so cluster auto-closes (<2 members)
+        res_dis2 = client.post("/clusters/1/dismiss/2")
+        assert res_dis2.status_code == 200
+        data2 = res_dis2.json()
+        assert data2["success"] is True
+        assert data2["cluster_deleted"] is True
+
+        # Cluster 1 is gone
+        res_cl1 = client.get("/clusters/1")
+        assert res_cl1.status_code == 404
+
+        # 3. Test dismiss entire cluster on Cluster 2
+        res_cl2_before = client.get("/clusters/2")
+        assert res_cl2_before.status_code == 200
+        res_dis_all = client.post("/clusters/2/dismiss")
+        assert res_dis_all.status_code == 200
+        assert res_dis_all.json()["cluster_deleted"] is True
+
+        res_cl2_after = client.get("/clusters/2")
+        assert res_cl2_after.status_code == 404
+

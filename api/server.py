@@ -1696,6 +1696,113 @@ def create_app(
             "manual_category": None,
         }
 
+    @app.post("/clusters/{cluster_id}/dismiss/{image_id}")
+    def dismiss_cluster_member(
+        cluster_id: int,
+        image_id: int,
+        request: Request = None,
+        user: UserContext = Depends(get_current_user),
+        conn: sqlite3.Connection = Depends(get_db),
+    ) -> dict[str, Any]:
+        """Dismiss an image from a cluster without deleting files from disk."""
+        c_row = conn.execute("SELECT id, representative_id FROM clusters WHERE id = ?", (cluster_id,)).fetchone()
+        if not c_row:
+            raise HTTPException(status_code=404, detail=f"Cluster {cluster_id} not found")
+
+        img = conn.execute(
+            "SELECT id, cluster_id, file_path, is_keeper FROM images WHERE id = ? AND cluster_id = ?",
+            (image_id, cluster_id),
+        ).fetchone()
+        if not img:
+            raise HTTPException(status_code=404, detail=f"Image {image_id} not found in cluster {cluster_id}")
+
+        conn.execute(
+            """
+            UPDATE images
+            SET cluster_id = NULL,
+                is_keeper = 0,
+                status = CASE WHEN status = 'trashed' THEN 'trashed' ELSE 'discovered' END,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            WHERE id = ?
+            """,
+            (image_id,),
+        )
+
+        remaining_members = conn.execute(
+            """
+            SELECT id, is_keeper FROM images
+            WHERE cluster_id = ? AND (status IS NULL OR status NOT IN ('trashed', 'deleted'))
+            ORDER BY id
+            """,
+            (cluster_id,),
+        ).fetchall()
+
+        remaining_count = len(remaining_members)
+        if remaining_count < 2:
+            if remaining_count == 1:
+                survivor_id = remaining_members[0]["id"]
+                conn.execute(
+                    """
+                    UPDATE images
+                    SET cluster_id = NULL,
+                        is_keeper = 0,
+                        status = CASE WHEN status = 'trashed' THEN 'trashed' ELSE 'discovered' END,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                    WHERE id = ?
+                    """,
+                    (survivor_id,),
+                )
+            conn.execute("DELETE FROM clusters WHERE id = ?", (cluster_id,))
+        else:
+            rep_id = c_row["representative_id"]
+            if rep_id == image_id:
+                new_rep_id = remaining_members[0]["id"]
+                conn.execute(
+                    "UPDATE clusters SET member_count = ?, representative_id = ? WHERE id = ?",
+                    (remaining_count, new_rep_id, cluster_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE clusters SET member_count = ? WHERE id = ?",
+                    (remaining_count, cluster_id),
+                )
+
+        conn.commit()
+        return {
+            "success": True,
+            "cluster_id": cluster_id,
+            "dismissed_image_id": image_id,
+            "remaining_members": remaining_count if remaining_count >= 2 else 0,
+            "cluster_deleted": remaining_count < 2,
+        }
+
+    @app.post("/clusters/{cluster_id}/dismiss")
+    def dismiss_entire_cluster(
+        cluster_id: int,
+        request: Request = None,
+        user: UserContext = Depends(get_current_user),
+        conn: sqlite3.Connection = Depends(get_db),
+    ) -> dict[str, Any]:
+        """Dismiss an entire cluster without deleting files from disk."""
+        c_row = conn.execute("SELECT id FROM clusters WHERE id = ?", (cluster_id,)).fetchone()
+        if not c_row:
+            raise HTTPException(status_code=404, detail=f"Cluster {cluster_id} not found")
+
+        conn.execute(
+            """
+            UPDATE images
+            SET cluster_id = NULL,
+                is_keeper = 0,
+                status = CASE WHEN status = 'trashed' THEN 'trashed' ELSE 'discovered' END,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            WHERE cluster_id = ?
+            """,
+            (cluster_id,),
+        )
+        conn.execute("DELETE FROM clusters WHERE id = ?", (cluster_id,))
+        conn.commit()
+        return {"success": True, "cluster_id": cluster_id, "cluster_deleted": True}
+
     @app.get("/thumb/{image_id}")
     def get_thumbnail(
         image_id: int,
