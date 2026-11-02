@@ -389,7 +389,11 @@ class GoogleDriveSource(ImageSource):
         elif self.folder_id:
             folder_queue.append(self.folder_id)
         else:
-            folder_queue.append("root")
+            logger.warning(
+                "GoogleDriveSource: neither folder_id nor all_drive was set. "
+                "Refusing to crawl Google Drive root to protect user privacy."
+            )
+            return
 
         while folder_queue:
             curr_folder = folder_queue.pop(0)
