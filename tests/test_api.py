@@ -1937,14 +1937,15 @@ class TestPipelineResumable:
             assert any("orig.jpg" in n for n in names)
             assert any("alone.jpg" in n for n in names)
 
-        # 3. Download recommended keepers
+        # 3. Download recommended keepers (includes unique images + cluster keepers)
         res_kp = client.get("/download/keepers?mode=balanced")
         assert res_kp.status_code == 200
         assert res_kp.headers["content-type"] == "application/zip"
         assert 'attachment; filename="recommended_keepers.zip"' in res_kp.headers["content-disposition"]
         with zipfile.ZipFile(io.BytesIO(res_kp.content)) as zf:
             names = zf.namelist()
-            assert len(names) >= 2  # Keeper from cluster 1 and keeper from cluster 2
+            assert len(names) >= 3  # Keeper from cluster 1, keeper from cluster 2, plus alone.jpg
+            assert any("alone.jpg" in n for n in names)
 
         # 4. Error handling: non-existent cluster
         res_err = client.get("/download/cluster/9999")

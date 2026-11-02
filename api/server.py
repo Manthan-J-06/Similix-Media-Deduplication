@@ -1198,22 +1198,32 @@ def create_app(
         user: UserContext = Depends(get_current_user),
         conn: sqlite3.Connection = Depends(get_db),
     ):
-        """Stream a zip archive of recommended keepers from all duplicate clusters (local or Google Drive)."""
+        """Stream a zip archive of the complete deduplicated dataset: all unique images plus the recommended keeper from each cluster (local or Google Drive)."""
         clusters = conn.execute("SELECT id, reference_uncertain FROM clusters").fetchall()
         gdrive_source = _get_user_gdrive_source(request, user, conn)
 
         keeper_files = []
+        cluster_keeper_ids: set[int] = set()
+
         for c in clusters:
             cid = c["id"]
             ref_unc = c["reference_uncertain"] if "reference_uncertain" in c.keys() else 0
             members = conn.execute(
-                "SELECT * FROM images WHERE cluster_id = ? AND (status IS NULL OR status != 'deleted')",
+                "SELECT * FROM images WHERE cluster_id = ? AND (status IS NULL OR status NOT IN ('trashed', 'deleted'))",
                 (cid,),
             ).fetchall()
             live_members = [
                 m for m in members
                 if str(m["file_path"]).startswith("drive://") or (os.path.exists(m["file_path"]) and not os.path.islink(m["file_path"]))
             ]
+            if len(live_members) == 1:
+                m = live_members[0]
+                cluster_keeper_ids.add(m["id"])
+                fp_str = str(m["file_path"])
+                item = _collect_download_file(fp_str, Path(fp_str).name, user, request, gdrive_source)
+                if item:
+                    keeper_files.append(item)
+                continue
             if len(live_members) < 2:
                 continue
 
@@ -1226,13 +1236,30 @@ def create_app(
             )
             k_id = res.get("keeper_id")
             if k_id:
+                cluster_keeper_ids.add(k_id)
                 k_row = next((m for m in live_members if m["id"] == k_id), None)
                 if k_row:
                     fp_str = str(k_row["file_path"])
-                    default_name = f"cluster_{cid}_{Path(fp_str).name}"
-                    item = _collect_download_file(fp_str, default_name, user, request, gdrive_source)
+                    item = _collect_download_file(fp_str, Path(fp_str).name, user, request, gdrive_source)
                     if item:
-                        keeper_files.append((item[0], f"cluster_{cid}_{item[1]}"))
+                        keeper_files.append(item)
+
+        # Collect all unique images (not belonging to any duplicate cluster)
+        unique_members = conn.execute(
+            """
+            SELECT id, file_path FROM images
+            WHERE (cluster_id IS NULL OR cluster_id = 0)
+              AND (status IS NULL OR status NOT IN ('trashed', 'deleted'))
+            ORDER BY id
+            """
+        ).fetchall()
+        for u in unique_members:
+            if u["id"] in cluster_keeper_ids:
+                continue
+            fp_str = str(u["file_path"])
+            item = _collect_download_file(fp_str, Path(fp_str).name, user, request, gdrive_source)
+            if item:
+                keeper_files.append(item)
 
         return stream_zip_archive(keeper_files, "recommended_keepers.zip")
 
