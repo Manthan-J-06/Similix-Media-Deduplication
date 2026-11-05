@@ -13,12 +13,15 @@ from pathlib import Path
 from typing import Iterator
 
 from PIL import Image
-import pillow_heif
+
+try:
+    import pillow_heif
+    # Register HEIC/HEIF opener
+    pillow_heif.register_heif_opener()
+except ImportError:
+    pass
 
 from sources.base import ImageMetadata, ImageSource
-
-# Register HEIC/HEIF opener
-pillow_heif.register_heif_opener()
 
 RAW_EXTENSIONS = frozenset({
     ".arw", ".cr2", ".cr3", ".nef", ".orf",
