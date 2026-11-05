@@ -495,3 +495,40 @@ class TestCategoryEvaluationAndCLI:
         assert row["manual_category"] == "User Custom"
         assert row["category"] == "User Custom"
 
+
+class TestAutonomousFolderDiscovery:
+
+    def test_discover_folder_labels_extracts_leaf_directories(self, tmp_path: Path):
+        """Dynamic folder discovery automatically extracts meaningful dataset folder names."""
+        from core.categories import discover_folder_labels
+
+        db_path = tmp_path / "test_discovery.db"
+        conn = init_db(db_path)
+
+        conn.execute(
+            "INSERT INTO images (file_path) VALUES ('/root/.similix/users/2/library/sorghum/Covered Kernel smut/t1.jpg')"
+        )
+        conn.execute(
+            "INSERT INTO images (file_path) VALUES ('/root/.similix/users/2/library/sorghum/Covered Kernel smut/t2.jpg')"
+        )
+        conn.execute(
+            "INSERT INTO images (file_path) VALUES ('/root/.similix/users/2/library/sorghum/Anthracnose/a1.jpg')"
+        )
+        conn.execute(
+            "INSERT INTO images (file_path) VALUES ('/root/.similix/users/2/library/sorghum/Anthracnose/a2.jpg')"
+        )
+        conn.execute(
+            "INSERT INTO images (file_path) VALUES ('/root/.similix/users/2/library/single_isolated/s1.jpg')"
+        )
+        conn.commit()
+
+        discovered = discover_folder_labels(conn)
+        assert "Covered Kernel smut" in discovered
+        assert "Anthracnose" in discovered
+        # Single isolated file should not form a category
+        assert "single_isolated" not in discovered
+        # System directories should not form categories
+        assert "library" not in discovered
+        assert "root" not in discovered
+        assert "users" not in discovered
+

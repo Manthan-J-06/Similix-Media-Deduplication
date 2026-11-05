@@ -56,11 +56,12 @@ class WorkerState:
 class JobHeartbeatThread(threading.Thread):
     """Background thread that writes a heartbeat timestamp to the job file and monitors for stalled stages (>60s)."""
 
-    def __init__(self, job_file: Path, interval: float = 5.0, worker_state: WorkerState | None = None):
+    def __init__(self, job_file: Path, interval: float = 5.0, worker_state: WorkerState | None = None, stall_timeout: float = 900.0):
         super().__init__(daemon=True, name="JobHeartbeat")
         self.job_file = job_file
         self.interval = interval
         self.worker_state = worker_state
+        self.stall_timeout = stall_timeout
         self._stop_event = threading.Event()
 
     def run(self) -> None:
@@ -68,13 +69,13 @@ class JobHeartbeatThread(threading.Thread):
             try:
                 now = time.time()
                 if self.worker_state is not None:
-                    # Check if stage has stalled (no progress for 60s)
+                    # Check if stage has stalled
                     elapsed_since_prog = now - self.worker_state.last_progress_time
-                    if elapsed_since_prog > 60.0 and not self.worker_state.is_stalled:
+                    if self.stall_timeout > 0 and elapsed_since_prog > self.stall_timeout and not self.worker_state.is_stalled:
                         self.worker_state.is_stalled = True
                         stalled_stage = self.worker_state.stage
                         stalled_file = self.worker_state.current_file_path or "unknown"
-                        stall_err = f"Stage '{stalled_stage}' stalled on file '{stalled_file}' (no progress for 60s)"
+                        stall_err = f"Stage '{stalled_stage}' stalled on file '{stalled_file}' (no progress for {int(self.stall_timeout)}s)"
                         logger.error(stall_err)
                         print(f"PIPELINE STALL: {stall_err}", file=sys.stderr)
                         update_job_file(
@@ -86,7 +87,7 @@ class JobHeartbeatThread(threading.Thread):
                             message=f"Pipeline failed: {stall_err}",
                             failed_stage=stalled_stage,
                             failed_file=stalled_file,
-                            actionable_advice="Processing stalled for over 60 seconds with no progress. Check network connectivity, source availability, or file integrity.",
+                            actionable_advice="Processing stalled. Check network connectivity, source availability, or file integrity.",
                         )
                         break
 
@@ -281,8 +282,7 @@ def run_pipeline(
     logger.info("Worker targeting per-user database: %s", resolved_db)
     print(f"Worker targeting per-user database: {resolved_db}")
     cfg = load_config(config_path) if config_path else load_config()
-    init_db(db_path)
-    conn = get_connection(db_path)
+    conn = init_db(db_path)
     images_before = conn.execute("SELECT COUNT(*) FROM images").fetchone()[0]
     clusters_before = conn.execute("SELECT COUNT(*) FROM clusters").fetchone()[0]
 
@@ -294,7 +294,8 @@ def run_pipeline(
     job_start_time = time.time()
 
     worker_state = WorkerState()
-    heartbeat = JobHeartbeatThread(job_file, interval=5.0, worker_state=worker_state)
+    stall_timeout = float(cfg.get("general", {}).get("stall_timeout_seconds", 900.0))
+    heartbeat = JobHeartbeatThread(job_file, interval=5.0, worker_state=worker_state, stall_timeout=stall_timeout)
     heartbeat.start()
 
     try:
@@ -329,6 +330,20 @@ def run_pipeline(
 
         if source_type == "drive":
             from sources.google_drive import GoogleDriveSource
+            if not drive_folder_id:
+                fid_file = resolved_db.parent / "drive_folder_id.txt"
+                if fid_file.exists():
+                    try:
+                        drive_folder_id = fid_file.read_text(encoding="utf-8").strip() or None
+                    except Exception:
+                        pass
+                if not drive_folder_id:
+                    try:
+                        row_fid = conn.execute("SELECT drive_id FROM images WHERE source = 'gdrive' AND drive_id IS NOT NULL LIMIT 1").fetchone()
+                        if row_fid and row_fid[0]:
+                            drive_folder_id = row_fid[0].split(":", 1)[0]
+                    except Exception:
+                        pass
             user_tok = resolved_db.parent / "drive_token.json"
             tok_path = user_tok if user_tok.exists() else None
             cache_p = resolved_db.parent / "drive_cache"
@@ -338,6 +353,7 @@ def run_pipeline(
                 stage="stage0",
                 token_path=tok_path,
                 cache_dir=cache_p,
+                is_public=bool(not tok_path),
             )
 
             def on_drive_scan(cur: int, tot: int, fpath: str):
@@ -359,6 +375,8 @@ def run_pipeline(
             s0_res = run_stage0(source0, conn, cfg, progress_callback=on_drive_scan)
             for p, r in s0_res.skipped_reasons:
                 all_warnings.append(f"{Path(p).name}: {r}")
+            if s0_res.files_discovered == 0:
+                all_warnings.append(f"No supported image files found in Google Drive folder '{drive_folder_id or 'root'}'.")
             source_active = source0
             source_active.stage = "stage1"
         else:
@@ -633,6 +651,19 @@ def run_pipeline(
             logger.info("Stage 4 (quality) already complete — skipping.")
 
         stage_timings["quality"] = round(time.time() - t_stage, 3)
+
+        # ── Stage 4.5: Keeper Selection ──
+        t_stage = time.time()
+        current_stage = "keeper"
+        worker_state.stage = "keeper"
+        worker_state.stage_display = "Selecting keepers"
+        worker_state.last_progress_time = time.time()
+        try:
+            from core.keeper import run_keeper_pipeline
+            run_keeper_pipeline(conn, cfg, mode="balanced")
+        except Exception as exc:
+            logger.warning("Stage 4.5 keeper pipeline failed: %s", exc)
+        stage_timings["keeper"] = round(time.time() - t_stage, 3)
 
         # ── Stage 5: Semantic Categorization ──
         t_stage = time.time()

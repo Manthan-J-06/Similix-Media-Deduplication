@@ -55,10 +55,13 @@ def _compute_hash(
 
 
 def _hamming_distance(hash1_hex: str, hash2_hex: str) -> int:
-    """Compute Hamming distance between two hex hash strings."""
-    h1 = imagehash.hex_to_hash(hash1_hex)
-    h2 = imagehash.hex_to_hash(hash2_hex)
-    return h1 - h2
+    """Compute Hamming distance between two hex hash strings using fast integer XOR popcount."""
+    try:
+        return (int(hash1_hex, 16) ^ int(hash2_hex, 16)).bit_count()
+    except Exception:
+        h1 = imagehash.hex_to_hash(hash1_hex)
+        h2 = imagehash.hex_to_hash(hash2_hex)
+        return h1 - h2
 
 
 def compute_stage1_hashes(
@@ -77,6 +80,21 @@ def compute_stage1_hashes(
     batch_size = config.get("stage1", {}).get("batch_size", 50)
     hash_algo = config.get("stage1", {}).get("hash_algorithm", "phash")
     hash_size = config.get("stage1", {}).get("hash_size", 8)
+
+    thumb_cache_dir_raw = config.get("sources", {}).get("thumb_cache_dir") or config.get("general", {}).get("thumb_cache_dir")
+    if thumb_cache_dir_raw:
+        thumb_cache_dir = Path(thumb_cache_dir_raw).expanduser().resolve()
+    else:
+        try:
+            from core.config import resolve_data_dir
+            thumb_cache_dir = resolve_data_dir() / "thumbnails"
+        except Exception:
+            thumb_cache_dir = None
+    if thumb_cache_dir:
+        try:
+            thumb_cache_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
 
     total_to_hash = conn.execute(
         """
@@ -129,9 +147,14 @@ def compute_stage1_hashes(
         updates: list[tuple[str, int]] = []
         failed_ids: list[int] = []
 
-        for row in batch:
+        for idx, row in enumerate(batch):
             fid = row["id"]
             fpath = row["file_path"]
+            if progress_callback:
+                try:
+                    progress_callback(hashes_processed + idx, total_to_hash, fpath)
+                except Exception:
+                    pass
             thumb = thumbs_map.get(fpath)
             if thumb is None:
                 # Try single get_thumbnail fallback if not in map
@@ -143,6 +166,17 @@ def compute_stage1_hashes(
                         result.skipped_reasons.append((fpath, f"Thumbnail generation failed: {exc}"))
                     failed_ids.append(fid)
                     continue
+
+            # Pre-cache thumbnail on ingestion to eliminate CPU starvation during UI browsing
+            if thumb_cache_dir is not None and thumb is not None:
+                try:
+                    row_md5 = row["md5"] if "md5" in row.keys() and row["md5"] else None
+                    cache_fname = f"{row_md5}_{thumb_size}.jpg" if row_md5 else f"{fid}_{thumb_size}.jpg"
+                    pre_thumb_path = thumb_cache_dir / cache_fname
+                    if not pre_thumb_path.exists():
+                        thumb.save(str(pre_thumb_path), format="JPEG", quality=85)
+                except Exception:
+                    pass
 
             try:
                 phash_val = str(_compute_hash(thumb, algo=hash_algo, hash_size=hash_size))
@@ -226,16 +260,31 @@ def cluster_stage1_candidates(
         """
     ).fetchall()
 
-    unclustered_list = list(unclustered)
+    def _to_phash_dict(r):
+        d = dict(r)
+        p = d.get("phash")
+        try:
+            d["phash_int"] = int(p, 16) if p else None
+        except Exception:
+            d["phash_int"] = None
+        return d
+
+    existing_clusters = [_to_phash_dict(c) for c in existing_clusters]
+    unclustered_list = [_to_phash_dict(u) for u in unclustered]
 
     # Match unclustered against existing representatives
     for cluster in existing_clusters:
         cluster_id = cluster["id"]
         rep_phash = cluster["phash"]
+        rep_int = cluster.get("phash_int")
         still_unclustered = []
 
         for img in unclustered_list:
-            dist = _hamming_distance(img["phash"], rep_phash)
+            img_int = img.get("phash_int")
+            if img_int is not None and rep_int is not None:
+                dist = (img_int ^ rep_int).bit_count()
+            else:
+                dist = _hamming_distance(img["phash"], rep_phash)
             if dist <= hamming_threshold:
                 # Add to existing cluster
                 similarity = round((1.0 - (dist / max_bits)) * 100.0, 1)
@@ -271,12 +320,17 @@ def cluster_stage1_candidates(
     i = 0
     while i < len(unclustered_list):
         candidate_rep = unclustered_list[i]
+        rep_int = candidate_rep.get("phash_int")
         matched_members = []
         still_unclustered = []
 
         for j in range(i + 1, len(unclustered_list)):
             other = unclustered_list[j]
-            dist = _hamming_distance(candidate_rep["phash"], other["phash"])
+            other_int = other.get("phash_int")
+            if rep_int is not None and other_int is not None:
+                dist = (rep_int ^ other_int).bit_count()
+            else:
+                dist = _hamming_distance(candidate_rep["phash"], other["phash"])
             if dist <= hamming_threshold:
                 matched_members.append((other, dist))
             else:
@@ -296,13 +350,18 @@ def cluster_stage1_candidates(
             sorted_candidates = sorted(all_candidates, key=keeper_sort_key)
             representative = sorted_candidates[0]
             rep_phash = representative["phash"]
+            rep_phash_int = representative.get("phash_int")
 
             # Filter members to ensure strictly dist(member, representative) <= threshold
             valid_members = []
             for img in all_candidates:
                 if img["id"] == representative["id"]:
                     continue
-                dist = _hamming_distance(img["phash"], rep_phash)
+                img_int = img.get("phash_int")
+                if img_int is not None and rep_phash_int is not None:
+                    dist = (img_int ^ rep_phash_int).bit_count()
+                else:
+                    dist = _hamming_distance(img["phash"], rep_phash)
                 if dist <= hamming_threshold:
                     valid_members.append((img, dist))
                 else:

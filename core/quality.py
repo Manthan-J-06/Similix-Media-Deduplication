@@ -22,6 +22,7 @@ For each duplicate cluster:
 
 from __future__ import annotations
 
+import concurrent.futures
 from dataclasses import dataclass, field
 import hashlib
 import io
@@ -945,6 +946,8 @@ def load_proxy_rgb(
                 orig_dims = (meta.width or im.size[0], meta.height or im.size[1])
             except Exception:
                 orig_dims = im.size
+        else:
+            raise FileNotFoundError(f"File not found: {file_path}")
 
     w, h = im.size
     max_dim = max(w, h)
@@ -1002,22 +1005,48 @@ def align_and_compute_metrics(
     conn: sqlite3.Connection | None = None,
     config: dict | None = None,
     source: ImageSource | None = None,
+    ref_rgb_cached: np.ndarray | None = None,
+    ref_sift_cached: tuple[list[cv2.KeyPoint], np.ndarray | None] | None = None,
+    cached_transform: np.ndarray | None = None,
+    cached_inliers: int = 0,
+    cached_ratio: float = 0.0,
 ) -> QualityMetrics:
     """
     Align member image to reference image and compute quality metrics:
     SSIM (gray + color), sharpness ratio, pixel ratio, bytes ratio.
     """
     cfg = (config or {}).get("quality", {})
-    proxy_size = int(cfg.get("proxy_size", 1024))
+    proxy_size = int(cfg.get("proxy_size", 512))
     min_inliers = int(cfg.get("min_align_inliers", 15))
     min_inlier_ratio = float(cfg.get("min_align_inlier_ratio", 0.50))
     ransac_reproj = float(cfg.get("ransac_reproj_threshold", 4.0))
     ratio_threshold = float(cfg.get("ratio_threshold", 0.75))
     max_features = int(cfg.get("max_features", 2000))
 
-    # Load 1024px proxies
+    # Fast path: exact MD5 match skips proxy load, SIFT, RANSAC, and SSIM
+    if conn is not None and member_id is not None and reference_id is not None:
+        m_row = conn.execute("SELECT md5 FROM images WHERE id = ?", (member_id,)).fetchone()
+        r_row = conn.execute("SELECT md5 FROM images WHERE id = ?", (reference_id,)).fetchone()
+        if m_row and r_row and m_row["md5"] and m_row["md5"] == r_row["md5"]:
+            return QualityMetrics(
+                quality_status="aligned",
+                ssim=1.0,
+                ssim_color=1.0,
+                sharpness_ratio=1.0,
+                pixel_ratio=1.0,
+                bytes_ratio=1.0,
+                inlier_count=500,
+                inlier_ratio=1.0,
+                blur_flag=False,
+            )
+
+    # Load proxies
     try:
-        ref_rgb, _s_ref, ref_dims_detected = load_proxy_rgb(reference_path, proxy_size=proxy_size, source=source)
+        if ref_rgb_cached is not None:
+            ref_rgb = ref_rgb_cached
+            ref_dims_detected = (ref_rgb.shape[1], ref_rgb.shape[0])
+        else:
+            ref_rgb, _s_ref, ref_dims_detected = load_proxy_rgb(reference_path, proxy_size=proxy_size, source=source)
         m_rgb, _s_m, m_dims_detected = load_proxy_rgb(member_path, proxy_size=proxy_size, source=source)
     except Exception as exc:
         logger.warning("Failed to load proxies for %s vs %s: %s", reference_path, member_path, exc)
@@ -1072,7 +1101,11 @@ def align_and_compute_metrics(
     inlier_count = 0
     inlier_ratio = 0.0
 
-    if conn is not None and member_id is not None and reference_id is not None:
+    if cached_transform is not None:
+        M_full = cached_transform
+        inlier_count = cached_inliers
+        inlier_ratio = cached_ratio
+    elif conn is not None and member_id is not None and reference_id is not None:
         # 1. Try forward transform (member -> ref)
         row = conn.execute(
             "SELECT transform_matrix, inlier_count, inlier_ratio FROM pair_transforms WHERE source_id = ? AND target_id = ?",
@@ -1103,9 +1136,13 @@ def align_and_compute_metrics(
 
     # If missing from cache, recompute directly on proxy images
     if M_full is None:
-        sift = cv2.SIFT_create(max_features)
-        kp_m, des_m = sift.detectAndCompute(m_gray, None)
-        kp_ref, des_ref = sift.detectAndCompute(ref_gray, None)
+        if ref_sift_cached is not None:
+            kp_ref, des_ref = ref_sift_cached
+        else:
+            sift_ref = cv2.SIFT_create(max_features)
+            kp_ref, des_ref = sift_ref.detectAndCompute(ref_gray, None)
+        sift_m = cv2.SIFT_create(max_features)
+        kp_m, des_m = sift_m.detectAndCompute(m_gray, None)
 
         if (
             des_m is not None
@@ -1257,6 +1294,297 @@ def ensure_quality_columns(conn: sqlite3.Connection) -> None:
             pass
 
 
+@dataclass
+class _EvaluatedCluster:
+    cid: int
+    c_elapsed: float
+    ref_id: int
+    ref_uncertain: int
+    ref_q_basis: str
+    member_dim_updates: list[tuple[int, int, int, int]]
+    member_mtime_updates: list[tuple[float, int]]
+    member_jpeg_updates: list[tuple[int, int]]
+    member_sl_updates: list[tuple[float | None, int]]
+    member_quality_updates: list[tuple[Any, ...]]
+    member_records: list[MemberQualityRecord]
+    pruned_mids: list[int]
+    aligned_count: int
+    unalignable_count: int
+
+
+def _evaluate_cluster_worker(
+    cid: int,
+    members: list[dict[str, Any]],
+    cfg: dict,
+    source: ImageSource | None,
+    pt_cache: dict[tuple[int, int], tuple[np.ndarray, int, float]],
+) -> _EvaluatedCluster:
+    c_t0 = time.perf_counter()
+    q_cfg = cfg.get("quality", {})
+    min_cluster_match_pct = float(q_cfg.get("min_cluster_match_pct", 75.0))
+    cluster_timeout = float(q_cfg.get("cluster_timeout_seconds", 60.0))
+    max_comparisons = int(q_cfg.get("max_pairwise_comparisons", 40))
+
+    member_dim_updates: list[tuple[int, int, int, int]] = []
+    member_mtime_updates: list[tuple[float, int]] = []
+    member_jpeg_updates: list[tuple[int, int]] = []
+    member_sl_updates: list[tuple[float | None, int]] = []
+    member_quality_updates: list[tuple[Any, ...]] = []
+    member_records: list[MemberQualityRecord] = []
+    pruned_mids: list[int] = []
+    aligned_count = 0
+    unalignable_count = 0
+
+    member_rows: list[dict[str, Any]] = []
+    for d in members:
+        p = d["file_path"]
+        if not d.get("width") or not d.get("height") or not d.get("file_size"):
+            try:
+                if source is not None:
+                    meta = source.get_metadata(p)
+                    d["width"] = meta.width or 0
+                    d["height"] = meta.height or 0
+                    d["file_size"] = meta.file_size or 0
+                else:
+                    with Image.open(p) as im:
+                        d["width"], d["height"] = im.size
+                    d["file_size"] = os.path.getsize(p)
+                member_dim_updates.append((d["width"], d["height"], d["file_size"], d["id"]))
+            except Exception:
+                pass
+
+        if not d.get("modified_time") and os.path.exists(p):
+            try:
+                mtime_val = os.path.getmtime(p)
+                d["modified_time"] = mtime_val
+                member_mtime_updates.append((mtime_val, d["id"]))
+            except Exception:
+                pass
+
+        if d.get("jpeg_quality_est") is None and os.path.exists(p):
+            q_est = extract_jpeg_quality_estimate(p)
+            d["jpeg_quality_est"] = q_est
+            if q_est is not None:
+                member_jpeg_updates.append((q_est, d["id"]))
+
+        has_time, has_make = check_exif_metadata(p)
+        d["has_exif_time"] = has_time
+        d["has_exif_make"] = has_make
+        member_rows.append(d)
+
+    ref_member = select_reference_member(member_rows, source=source, max_comparisons=max_comparisons)
+    ref_id = ref_member["id"]
+    ref_path = ref_member["file_path"]
+    ref_orig = (ref_member["width"] or 0, ref_member["height"] or 0)
+    ref_sz = ref_member["file_size"] or 0
+    ref_uncertain = ref_member.get("reference_uncertain", 0)
+
+    ref_ck = _member_content_key(ref_member)
+    if len(member_rows) > 1 and all(_member_content_key(m) == ref_ck for m in member_rows):
+        ref_uncertain = 0
+        ref_member["reference_uncertain"] = 0
+
+    for d in member_rows:
+        member_sl_updates.append((d.get("source_likelihood"), d["id"]))
+
+    is_ref_gdrive = (
+        ref_member.get("source") == "gdrive"
+        or str(ref_path).startswith("drive://")
+    )
+    ref_q_basis = ref_member.get("quality_basis") if ref_member.get("quality_basis") == "full" else ("thumbnail" if is_ref_gdrive else "full")
+
+    ref_record = MemberQualityRecord(
+        member_id=ref_id,
+        cluster_id=cid,
+        file_path=ref_path,
+        is_reference=True,
+        quality_status="reference",
+        ssim=1.0,
+        ssim_color=1.0,
+        sharpness_ratio=1.0,
+        pixel_ratio=1.0,
+        bytes_ratio=1.0,
+        width=ref_orig[0],
+        height=ref_orig[1],
+        file_size=ref_sz,
+        source_likelihood=ref_member.get("source_likelihood"),
+        match_pct=100.0,
+        resolution_pct=100.0,
+    )
+    member_records.append(ref_record)
+
+    # Pre-cache reference proxy and SIFT
+    ref_rgb_cached = None
+    ref_sift_cached = None
+    proxy_sz = int(q_cfg.get("proxy_size", 512))
+    max_feat = int(q_cfg.get("max_features", 2000))
+    try:
+        ref_rgb_cached, _, _ = load_proxy_rgb(ref_path, proxy_size=proxy_sz, source=source)
+        ref_gray_cached = cv2.cvtColor(ref_rgb_cached, cv2.COLOR_RGB2GRAY)
+        sift_ref_init = cv2.SIFT_create(max_feat)
+        ref_sift_cached = sift_ref_init.detectAndCompute(ref_gray_cached, None)
+    except Exception:
+        pass
+
+    for m in member_rows:
+        if m["id"] == ref_id:
+            continue
+        if (time.perf_counter() - c_t0) > cluster_timeout:
+            break
+
+        mid = m["id"]
+        m_path = m["file_path"]
+        m_orig = (m["width"] or 0, m["height"] or 0)
+        m_sz = m["file_size"] or 0
+
+        is_exact_copy = bool(m.get("md5") and m.get("md5") == ref_member.get("md5"))
+        if is_exact_copy:
+            metrics = QualityMetrics(
+                quality_status="aligned",
+                ssim=1.0,
+                ssim_color=1.0,
+                sharpness_ratio=1.0,
+                pixel_ratio=1.0,
+                bytes_ratio=1.0,
+                inlier_count=500,
+                inlier_ratio=1.0,
+                blur_flag=False,
+            )
+            match_pct = 100.0
+            resolution_pct = 100.0
+        else:
+            cached_xf = pt_cache.get((mid, ref_id))
+            cached_inv = pt_cache.get((ref_id, mid))
+            inv_matrix = None
+            if cached_inv and cached_inv[0] is not None:
+                try:
+                    inv_matrix = cv2.invertAffineTransform(cached_inv[0])
+                except Exception:
+                    inv_matrix = None
+
+            metrics = align_and_compute_metrics(
+                member_path=m_path,
+                reference_path=ref_path,
+                member_id=mid,
+                reference_id=ref_id,
+                member_orig_dims=m_orig,
+                reference_orig_dims=ref_orig,
+                member_file_size=m_sz,
+                reference_file_size=ref_sz,
+                conn=None,
+                config=cfg,
+                source=source,
+                ref_rgb_cached=ref_rgb_cached,
+                ref_sift_cached=ref_sift_cached,
+                cached_transform=cached_xf[0] if (cached_xf and cached_xf[0] is not None) else inv_matrix,
+                cached_inliers=cached_xf[1] if cached_xf else (cached_inv[1] if cached_inv else 0),
+                cached_ratio=cached_xf[2] if cached_xf else (cached_inv[2] if cached_inv else 0.0),
+            )
+            if metrics.ssim_color is not None:
+                match_pct = round(metrics.ssim_color * 100.0, 1)
+            elif metrics.ssim is not None:
+                match_pct = round(metrics.ssim * 100.0, 1)
+            else:
+                match_pct = None
+
+            resolution_pct = round(metrics.pixel_ratio * 100.0, 1) if metrics.pixel_ratio is not None else None
+            if resolution_pct is None and m_orig[0] and m_orig[1] and ref_orig[0] and ref_orig[1]:
+                ref_px = max(1, ref_orig[0] * ref_orig[1])
+                m_px = max(1, m_orig[0] * m_orig[1])
+                resolution_pct = round((m_px / ref_px) * 100.0, 1)
+
+            if match_pct is None and m.get("clip_vector") and ref_member.get("clip_vector"):
+                try:
+                    from core.embeddings import deserialize_embedding
+                    v_m = deserialize_embedding(m["clip_vector"]).astype(np.float32)
+                    v_r = deserialize_embedding(ref_member["clip_vector"]).astype(np.float32)
+                    nm = np.linalg.norm(v_m)
+                    nr = np.linalg.norm(v_r)
+                    if nm > 0 and nr > 0:
+                        sim = float(np.dot(v_m / nm, v_r / nr))
+                        match_pct = round(max(0.0, min(100.0, sim * 100.0)), 1)
+                except Exception:
+                    pass
+            if match_pct is None and m.get("phash") and ref_member.get("phash"):
+                try:
+                    h1 = int(m["phash"], 16)
+                    h2 = int(ref_member["phash"], 16)
+                    dist = bin(h1 ^ h2).count("1")
+                    match_pct = round(max(0.0, (1.0 - (dist / 64.0)) * 100.0), 1)
+                except Exception:
+                    pass
+
+        is_gdrive_member = (
+            m.get("source") == "gdrive"
+            or str(m_path).startswith("drive://")
+        )
+        existing_basis = m.get("quality_basis")
+        q_basis = existing_basis if existing_basis == "full" else ("thumbnail" if is_gdrive_member else "full")
+
+        member_quality_updates.append((
+            metrics.ssim,
+            metrics.ssim_color,
+            metrics.sharpness_ratio,
+            metrics.pixel_ratio,
+            metrics.bytes_ratio,
+            metrics.quality_status,
+            match_pct,
+            resolution_pct,
+            q_basis,
+            mid,
+        ))
+
+        if metrics.quality_status == "aligned":
+            aligned_count += 1
+        else:
+            unalignable_count += 1
+
+        member_records.append(
+            MemberQualityRecord(
+                member_id=mid,
+                cluster_id=cid,
+                file_path=m_path,
+                is_reference=False,
+                quality_status=metrics.quality_status,
+                ssim=metrics.ssim,
+                ssim_color=metrics.ssim_color,
+                sharpness_ratio=metrics.sharpness_ratio,
+                pixel_ratio=metrics.pixel_ratio,
+                bytes_ratio=metrics.bytes_ratio,
+                width=m_orig[0],
+                height=m_orig[1],
+                file_size=m_sz,
+                source_likelihood=m.get("source_likelihood"),
+                match_pct=match_pct,
+                resolution_pct=resolution_pct,
+            )
+        )
+
+        # Impostor or unalignable pruning: if an image cannot be geometrically aligned to reference
+        # (unalignable / match_pct is None) or match_pct < min_cluster_match_pct, prune it from cluster!
+        is_unalignable = (metrics.quality_status == "unalignable" or match_pct is None)
+        is_low_match = (min_cluster_match_pct > 0.0 and match_pct is not None and match_pct < min_cluster_match_pct)
+        if not is_exact_copy and (is_unalignable or is_low_match):
+            pruned_mids.append(mid)
+
+    return _EvaluatedCluster(
+        cid=cid,
+        c_elapsed=time.perf_counter() - c_t0,
+        ref_id=ref_id,
+        ref_uncertain=ref_uncertain,
+        ref_q_basis=ref_q_basis,
+        member_dim_updates=member_dim_updates,
+        member_mtime_updates=member_mtime_updates,
+        member_jpeg_updates=member_jpeg_updates,
+        member_sl_updates=member_sl_updates,
+        member_quality_updates=member_quality_updates,
+        member_records=member_records,
+        pruned_mids=pruned_mids,
+        aligned_count=aligned_count,
+        unalignable_count=unalignable_count,
+    )
+
+
 def run_quality_pipeline(
     conn: sqlite3.Connection,
     config: dict | None = None,
@@ -1268,26 +1596,43 @@ def run_quality_pipeline(
     Stores per-member metrics in images table.
     """
     ensure_quality_columns(conn)
+    if conn.row_factory is None:
+        conn.row_factory = sqlite3.Row
     t0 = time.perf_counter()
     res = QualityResult()
 
     cfg = config or {}
     q_cfg = cfg.get("quality", {})
-    min_cluster_match_pct = float(q_cfg.get("min_cluster_match_pct", 75.0))
-    cluster_timeout = float(q_cfg.get("cluster_timeout_seconds", 60.0))
-    max_comparisons = int(q_cfg.get("max_pairwise_comparisons", 40))
 
-    # Query all clusters
+    # Pre-fetch pair transforms cache into memory for thread-safe access
+    pt_rows = conn.execute(
+        "SELECT source_id, target_id, transform_matrix, inlier_count, inlier_ratio FROM pair_transforms"
+    ).fetchall()
+    pt_cache: dict[tuple[int, int], tuple[np.ndarray, int, float]] = {}
+    for r in pt_rows:
+        if r["transform_matrix"]:
+            try:
+                pt_cache[(r["source_id"], r["target_id"])] = (
+                    pickle.loads(r["transform_matrix"]),
+                    r["inlier_count"],
+                    r["inlier_ratio"],
+                )
+            except Exception:
+                pass
+
+    # Query all clusters and their members upfront
     clusters = conn.execute("SELECT id FROM clusters ORDER BY id").fetchall()
     total_clusters = len(clusters)
     cluster_times: list[tuple[int, float]] = []
 
-    for idx, c in enumerate(clusters, 1):
-        c_t0 = time.perf_counter()
+    clusters_to_process: list[tuple[int, list[dict[str, Any]]]] = []
+    processed_count = 0
+
+    for c in clusters:
         cid = c["id"]
         members = conn.execute(
             """
-            SELECT id, cluster_id, file_path, width, height, file_size, format, modified_time, jpeg_quality_est, source_likelihood, md5
+            SELECT id, cluster_id, file_path, width, height, file_size, format, modified_time, jpeg_quality_est, source_likelihood, md5, clip_vector, phash
             FROM images
             WHERE cluster_id = ?
             ORDER BY id
@@ -1296,96 +1641,30 @@ def run_quality_pipeline(
         ).fetchall()
 
         if len(members) < 2:
-            cluster_times.append((cid, time.perf_counter() - c_t0))
+            cluster_times.append((cid, 0.0))
+            processed_count += 1
             if progress_callback is not None:
-                progress_callback(idx, total_clusters, cid)
+                progress_callback(processed_count, total_clusters, cid)
             continue
 
-        res.clusters_evaluated += 1
+        clusters_to_process.append((cid, [dict(m) for m in members]))
 
-        # Fill missing dimensions, modified_time, and jpeg_quality_est
-        member_rows: list[dict[str, Any]] = []
-        for m in members:
-            d = dict(m)
-            p = d["file_path"]
-            if not d["width"] or not d["height"] or not d["file_size"]:
-                try:
-                    if source is not None:
-                        meta = source.get_metadata(p)
-                        d["width"] = meta.width or 0
-                        d["height"] = meta.height or 0
-                        d["file_size"] = meta.file_size or 0
-                    else:
-                        with Image.open(p) as im:
-                            d["width"], d["height"] = im.size
-                        d["file_size"] = os.path.getsize(p)
-                    conn.execute(
-                        "UPDATE images SET width = ?, height = ?, file_size = ? WHERE id = ?",
-                        (d["width"], d["height"], d["file_size"], d["id"]),
-                    )
-                except Exception:
-                    pass
+    def _apply_cluster_result(ev: _EvaluatedCluster):
+        nonlocal processed_count
+        if ev.member_dim_updates:
+            conn.executemany("UPDATE images SET width = ?, height = ?, file_size = ? WHERE id = ?", ev.member_dim_updates)
+        if ev.member_mtime_updates:
+            conn.executemany("UPDATE images SET modified_time = ? WHERE id = ?", ev.member_mtime_updates)
+        if ev.member_jpeg_updates:
+            conn.executemany("UPDATE images SET jpeg_quality_est = ? WHERE id = ?", ev.member_jpeg_updates)
+        if ev.member_sl_updates:
+            conn.executemany("UPDATE images SET source_likelihood = ? WHERE id = ?", ev.member_sl_updates)
 
-            if not d.get("modified_time") and os.path.exists(p):
-                try:
-                    d["modified_time"] = os.path.getmtime(p)
-                    conn.execute(
-                        "UPDATE images SET modified_time = ? WHERE id = ?",
-                        (d["modified_time"], d["id"]),
-                    )
-                except Exception:
-                    pass
-
-            # Estimate and persist jpeg_quality_est in SQLite
-            if d.get("jpeg_quality_est") is None and os.path.exists(p):
-                q_est = extract_jpeg_quality_estimate(p)
-                d["jpeg_quality_est"] = q_est
-                if q_est is not None:
-                    conn.execute(
-                        "UPDATE images SET jpeg_quality_est = ? WHERE id = ?",
-                        (q_est, d["id"]),
-                    )
-
-            # Extract EXIF presence for reference selection
-            has_time, has_make = check_exif_metadata(p)
-            d["has_exif_time"] = has_time
-            d["has_exif_make"] = has_make
-
-            member_rows.append(d)
-
-        ref_member = select_reference_member(member_rows, source=source, conn=conn, max_comparisons=max_comparisons)
-        ref_id = ref_member["id"]
-        ref_path = ref_member["file_path"]
-        ref_orig = (ref_member["width"] or 0, ref_member["height"] or 0)
-        ref_sz = ref_member["file_size"] or 0
-        ref_uncertain = ref_member.get("reference_uncertain", 0)
-
-        # Mark reference_uncertain = 0 when all non-identical members of a cluster
-        # are byte-identical to the reference (exact-copy-only clusters).
-        ref_ck = _member_content_key(ref_member)
-        if len(member_rows) > 1 and all(_member_content_key(m) == ref_ck for m in member_rows):
-            ref_uncertain = 0
-            ref_member["reference_uncertain"] = 0
-
-        # Update cluster representative and reference_uncertain in SQLite
         conn.execute(
             "UPDATE clusters SET representative_id = ?, reference_uncertain = ? WHERE id = ?",
-            (ref_id, ref_uncertain, cid),
+            (ev.ref_id, ev.ref_uncertain, ev.cid),
         )
 
-        # Update source_likelihood for all members in SQLite
-        for d in member_rows:
-            conn.execute(
-                "UPDATE images SET source_likelihood = ? WHERE id = ?",
-                (d.get("source_likelihood"), d["id"]),
-            )
-
-        # Mark reference member in DB
-        is_ref_gdrive = (
-            ref_member.get("source") == "gdrive"
-            or str(ref_path).startswith("drive://")
-        )
-        ref_q_basis = ref_member.get("quality_basis") if ref_member.get("quality_basis") == "full" else ("thumbnail" if is_ref_gdrive else "full")
         conn.execute(
             """
             UPDATE images
@@ -1401,81 +1680,11 @@ def run_quality_pipeline(
                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
             WHERE id = ?
             """,
-            (ref_q_basis, ref_id),
-        )
-        res.members_evaluated += 1
-        res.member_records.append(
-            MemberQualityRecord(
-                member_id=ref_id,
-                cluster_id=cid,
-                file_path=ref_path,
-                is_reference=True,
-                quality_status="reference",
-                ssim=1.0,
-                ssim_color=1.0,
-                sharpness_ratio=1.0,
-                pixel_ratio=1.0,
-                bytes_ratio=1.0,
-                width=ref_orig[0],
-                height=ref_orig[1],
-                file_size=ref_sz,
-                source_likelihood=ref_member.get("source_likelihood"),
-                match_pct=100.0,
-                resolution_pct=100.0,
-            )
+            (ev.ref_q_basis, ev.ref_id),
         )
 
-        # Align and evaluate every other member
-        timed_out = False
-        for m in member_rows:
-            if m["id"] == ref_id:
-                continue
-
-            # Check per-cluster time limit (default 60s)
-            if (time.perf_counter() - c_t0) > cluster_timeout:
-                logger.warning(
-                    "Cluster %s evaluation exceeded time limit of %.1fs; moving on",
-                    cid,
-                    cluster_timeout,
-                )
-                timed_out = True
-                break
-
-            mid = m["id"]
-            m_path = m["file_path"]
-            m_orig = (m["width"] or 0, m["height"] or 0)
-            m_sz = m["file_size"] or 0
-
-            metrics = align_and_compute_metrics(
-                member_path=m_path,
-                reference_path=ref_path,
-                member_id=mid,
-                reference_id=ref_id,
-                member_orig_dims=m_orig,
-                reference_orig_dims=ref_orig,
-                member_file_size=m_sz,
-                reference_file_size=ref_sz,
-                conn=conn,
-                config=config,
-                source=source,
-            )
-
-            is_exact_copy = bool(m.get("md5") and m.get("md5") == ref_member.get("md5"))
-            if is_exact_copy:
-                match_pct = 100.0
-                resolution_pct = 100.0
-            else:
-                match_pct = round(metrics.ssim_color * 100.0, 1) if metrics.ssim_color is not None else None
-                resolution_pct = round(metrics.pixel_ratio * 100.0, 1) if metrics.pixel_ratio is not None else None
-
-            is_gdrive_member = (
-                m.get("source") == "gdrive"
-                or str(m_path).startswith("drive://")
-            )
-            existing_basis = m.get("quality_basis")
-            q_basis = existing_basis if existing_basis == "full" else ("thumbnail" if is_gdrive_member else "full")
-
-            conn.execute(
+        if ev.member_quality_updates:
+            conn.executemany(
                 """
                 UPDATE images
                 SET ssim = ?,
@@ -1490,72 +1699,25 @@ def run_quality_pipeline(
                     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
                 WHERE id = ?
                 """,
-                (
-                    metrics.ssim,
-                    metrics.ssim_color,
-                    metrics.sharpness_ratio,
-                    metrics.pixel_ratio,
-                    metrics.bytes_ratio,
-                    metrics.quality_status,
-                    match_pct,
-                    resolution_pct,
-                    q_basis,
-                    mid,
-                ),
+                ev.member_quality_updates,
             )
 
-            res.members_evaluated += 1
-            if metrics.quality_status == "aligned":
-                res.members_aligned += 1
-            else:
-                res.members_unalignable += 1
-
-            res.member_records.append(
-                MemberQualityRecord(
-                    member_id=mid,
-                    cluster_id=cid,
-                    file_path=m_path,
-                    is_reference=False,
-                    quality_status=metrics.quality_status,
-                    ssim=metrics.ssim,
-                    ssim_color=metrics.ssim_color,
-                    sharpness_ratio=metrics.sharpness_ratio,
-                    pixel_ratio=metrics.pixel_ratio,
-                    bytes_ratio=metrics.bytes_ratio,
-                    width=m_orig[0],
-                    height=m_orig[1],
-                    file_size=m_sz,
-                    source_likelihood=m.get("source_likelihood"),
-                    match_pct=match_pct,
-                    resolution_pct=resolution_pct,
-                )
+        if ev.pruned_mids:
+            conn.executemany(
+                """
+                UPDATE images
+                SET cluster_id = NULL,
+                    status = 'embedded',
+                    is_keeper = 0,
+                    is_cluster_anchor = 0,
+                    confidence = NULL,
+                    link_signal = NULL,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                WHERE id = ?
+                """,
+                [(mid,) for mid in ev.pruned_mids],
             )
-
-        # Gate: prune members failing minimum cluster match percentage
-        if min_cluster_match_pct > 0.0:
-            for m in member_rows:
-                if m["id"] == ref_id:
-                    continue
-                mid = m["id"]
-                m_rec = next((r for r in res.member_records if r.member_id == mid), None)
-                if not m_rec:
-                    continue
-                if m_rec.quality_status != "aligned" or m_rec.match_pct is None or m_rec.match_pct < min_cluster_match_pct:
-                    conn.execute(
-                        """
-                        UPDATE images
-                        SET cluster_id = NULL,
-                            status = 'embedded',
-                            is_keeper = 0,
-                            is_cluster_anchor = 0,
-                            confidence = NULL,
-                            link_signal = NULL,
-                            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
-                        WHERE id = ?
-                        """,
-                        (mid,),
-                    )
-            surviving = conn.execute("SELECT id FROM images WHERE cluster_id = ?", (cid,)).fetchall()
+            surviving = conn.execute("SELECT id FROM images WHERE cluster_id = ?", (ev.cid,)).fetchall()
             if len(surviving) <= 1:
                 conn.execute(
                     """
@@ -1569,17 +1731,38 @@ def run_quality_pipeline(
                         updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
                     WHERE cluster_id = ?
                     """,
-                    (cid,),
+                    (ev.cid,),
                 )
-                conn.execute("DELETE FROM clusters WHERE id = ?", (cid,))
+                conn.execute("DELETE FROM clusters WHERE id = ?", (ev.cid,))
             else:
-                conn.execute("UPDATE clusters SET member_count = ? WHERE id = ?", (len(surviving), cid))
-            conn.commit()
+                conn.execute("UPDATE clusters SET member_count = ? WHERE id = ?", (len(surviving), ev.cid))
 
-        c_elapsed = time.perf_counter() - c_t0
-        cluster_times.append((cid, c_elapsed))
+        res.clusters_evaluated += 1
+        res.members_evaluated += len(ev.member_records)
+        res.members_aligned += ev.aligned_count
+        res.members_unalignable += ev.unalignable_count
+        res.member_records.extend(ev.member_records)
+        cluster_times.append((ev.cid, ev.c_elapsed))
+
+        processed_count += 1
         if progress_callback is not None:
-            progress_callback(idx, total_clusters, cid)
+            progress_callback(processed_count, total_clusters, ev.cid)
+
+    # Process clusters with thread pool
+    max_workers = min(8, os.cpu_count() or 4)
+    if len(clusters_to_process) <= 1:
+        for cid, mems in clusters_to_process:
+            ev = _evaluate_cluster_worker(cid, mems, cfg, source, pt_cache)
+            _apply_cluster_result(ev)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_cid = {
+                executor.submit(_evaluate_cluster_worker, cid, mems, cfg, source, pt_cache): cid
+                for cid, mems in clusters_to_process
+            }
+            for fut in concurrent.futures.as_completed(future_to_cid):
+                ev = fut.result()
+                _apply_cluster_result(ev)
 
     conn.commit()
     res.elapsed_seconds = round(time.perf_counter() - t0, 3)

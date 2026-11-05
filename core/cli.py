@@ -122,6 +122,7 @@ def cmd_embed(args: argparse.Namespace) -> None:
     conn = init_db(db_path)
 
     source = None
+    has_gdrive = False
     if args.folder:
         folder = Path(args.folder).resolve()
         if not folder.exists() or not folder.is_dir():
@@ -246,6 +247,7 @@ def cmd_verify(args: argparse.Namespace) -> None:
 
     has_gdrive = conn.execute("SELECT 1 FROM images WHERE source = 'gdrive' LIMIT 1").fetchone() is not None
     source = None
+    has_gdrive = False
     if args.folder:
         folder = Path(args.folder).resolve()
         if folder.exists() and folder.is_dir():
@@ -297,6 +299,7 @@ def cmd_quality(args: argparse.Namespace) -> None:
 
     has_gdrive = conn.execute("SELECT 1 FROM images WHERE source = 'gdrive' LIMIT 1").fetchone() is not None
     source = None
+    has_gdrive = False
     if args.folder:
         folder = Path(args.folder).resolve()
         if folder.exists() and folder.is_dir():
@@ -560,6 +563,8 @@ def cmd_categorize(args: argparse.Namespace) -> None:
             db_path = str(target / "argus.db")
         elif (target.parent / f"{target.name}.db").is_file():
             db_path = str(target.parent / f"{target.name}.db")
+        elif target.is_dir():
+            db_path = str(target / "argus.db")
         else:
             db_path = str(target)
     if not db_path:
@@ -673,6 +678,8 @@ def cmd_show(args: argparse.Namespace) -> None:
             db_path = str(target / "demo.db")
         elif (target.parent / f"{target.name}.db").is_file():
             db_path = str(target.parent / f"{target.name}.db")
+        elif target.is_dir():
+            db_path = str(target / "argus.db")
         else:
             db_path = str(target)
     if not db_path:
@@ -789,6 +796,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
             db_path = str(target / "demo.db")
         elif (target.parent / f"{target.name}.db").is_file():
             db_path = str(target.parent / f"{target.name}.db")
+        elif target.is_dir():
+            db_path = str(target / "argus.db")
         else:
             db_path = str(target)
     resolved_db = str(Path(db_path).expanduser().resolve()) if db_path else None

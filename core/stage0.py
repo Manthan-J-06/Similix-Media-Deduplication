@@ -21,8 +21,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator
 
-import pillow_heif
-pillow_heif.register_heif_opener()
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+except ImportError:
+    pass
 
 from sources.base import ImageSource, ImageMetadata
 from sources.local_folder import LocalFolderSource, RAW_EXTENSIONS

@@ -16,8 +16,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+from pathlib import Path
+import re
 import sqlite3
 from typing import Any, Callable
+from collections import Counter
 
 import numpy as np
 import open_clip
@@ -66,6 +69,9 @@ DEFAULT_LABELS = [
     "phone",
     "product photo",
     "map",
+    "plants & flora",
+    "agriculture & crops",
+    "science & biology",
 ]
 
 DEFAULT_SCENE_LABELS = [
@@ -87,6 +93,82 @@ DEFAULT_SUBJECT_LABELS = [
     "artifact",
     "people_working",
 ]
+
+SUPER_CATEGORIES_TEMPLATES: dict[str, list[str]] = {
+    "plants & flora": [
+        "a photo of plants, plant leaves, trees, or flora",
+        "a botanical photo of green plants, leaves, or flora",
+        "a close-up photograph of plant foliage or botany",
+        "a picture of agricultural plants, crops, or vegetation",
+        "a natural botanical picture of plants and greenery",
+    ],
+    "agriculture & crops": [
+        "a photo of agricultural crops, grain, or farm fields",
+        "a photograph of farming crops, cultivated plants, or harvest",
+        "a picture of agricultural fields, ears of grain, or harvest",
+        "a close-up picture of crop plants or farm produce",
+        "an agricultural photography shot of crops in the field",
+    ],
+    "science & biology": [
+        "a scientific photo of biological specimens, samples, or botany",
+        "a close-up scientific or laboratory photo of specimens",
+        "a photograph of diseased plant leaves, fungus, or biology",
+        "a scientific study photograph of plant pathology or specimens",
+        "a macro photo of biological textures or plant pathology",
+    ],
+}
+
+
+def discover_folder_labels(conn: sqlite3.Connection, max_labels: int = 50) -> dict[str, list[str]]:
+    """
+    Extract meaningful category labels from the directory names of ingested images.
+    Returns a dict mapping label -> prompt_templates.
+    """
+    try:
+        rows = conn.execute("SELECT file_path FROM images WHERE file_path IS NOT NULL").fetchall()
+    except Exception:
+        return {}
+
+    if not rows:
+        return {}
+
+    IGNORED_FOLDERS = {
+        "images", "photos", "pictures", "dcim", "thumbnails", "temp", "tmp",
+        "cache", "raw", "export", "exports", "library", "users", "root", "home",
+        "content", "data", "dataset", "datasets", "train", "test", "val", "validation",
+        "similix", ".similix", "drive", "gdrive", "my drive", "google drive",
+    }
+
+    folder_counts: Counter[str] = Counter()
+
+    for row in rows:
+        fp = row["file_path"] if isinstance(row, sqlite3.Row) or isinstance(row, dict) else row[0]
+        if not fp:
+            continue
+        try:
+            p = Path(fp)
+            parts = p.parts
+            if len(parts) >= 2:
+                parent = parts[-2].strip()
+                clean = parent.strip("_.-")
+                if clean and clean.lower() not in IGNORED_FOLDERS and not clean.isdigit() and len(clean) >= 3:
+                    folder_counts[clean] += 1
+        except Exception:
+            continue
+
+    discovered: dict[str, list[str]] = {}
+    for folder, count in folder_counts.most_common(max_labels):
+        if count >= 2:
+            clean_name = folder.replace("_", " ").replace("-", " ")
+            clean_name = re.sub(r"\s+", " ", clean_name).strip()
+            discovered[folder] = [
+                f"a photo of {clean_name}",
+                f"a close-up photograph of {clean_name}",
+                f"a picture showing {clean_name}",
+                f"a clear photo of {clean_name}",
+            ]
+
+    return discovered
 
 
 @dataclass
@@ -404,6 +486,22 @@ def run_categorization(
     Classifies using UPRIGHT clip_vector ONLY (never clip_vector_90/180/270).
     """
     cat_cfg = parse_category_config(config)
+
+    # Augment with universal super-categories if not present
+    for sclabel, sctmpls in SUPER_CATEGORIES_TEMPLATES.items():
+        if sclabel not in cat_cfg.templates:
+            cat_cfg.templates[sclabel] = sctmpls
+        if sclabel not in cat_cfg.labels:
+            cat_cfg.labels.append(sclabel)
+
+    # Dynamic folder discovery from database
+    folder_templates = discover_folder_labels(conn)
+    for flabel, ftmpls in folder_templates.items():
+        if flabel not in cat_cfg.templates:
+            cat_cfg.templates[flabel] = ftmpls
+        if flabel not in cat_cfg.labels:
+            cat_cfg.labels.append(flabel)
+
     if not cat_cfg.labels:
         raise ValueError(
             "No categories configured in config.toml [categories]. "

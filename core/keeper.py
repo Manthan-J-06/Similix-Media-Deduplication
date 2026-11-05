@@ -291,7 +291,9 @@ def choose_keeper(
     # If no other candidate qualifies, the reference is the keeper.
     if mode == "conservative":
         keeper = ref_member
-    else:
+    elif mode == "balanced":
+        # Balanced: prefers candidates with high quality tier (SSIM >= 0.95 or match_pct >= 95%)
+        # that save meaningful space, balancing fidelity and file size.
         candidates = []
         for m in members:
             is_ref = (m.get("id") == ref_id)
@@ -299,7 +301,33 @@ def choose_keeper(
                 m_w = m.get("width") or 0
                 m_h = m.get("height") or 0
                 m_px = m_w * m_h
-                # A keeper with lower pixel count than reference is allowed only when allow_resolution_loss is True
+                if (not res_loss_allowed) and (m_px < ref_px):
+                    continue
+                if is_ref:
+                    candidates.append(m)
+                else:
+                    m_sz = m.get("file_size") or 0
+                    if m_sz <= max_non_ref_sz:
+                        candidates.append(m)
+
+        if candidates:
+            def _balanced_sort_key(m):
+                m_ssim = float(m.get("ssim") or 1.0)
+                m_sz = m.get("file_size") or 0
+                tier = 0 if m_ssim >= 0.98 else (1 if m_ssim >= 0.95 else 2)
+                return (tier, m_sz, -m_ssim, len(str(m.get("file_path") or "")), m.get("id", 0))
+            keeper = min(candidates, key=_balanced_sort_key)
+        else:
+            keeper = ref_member
+    else:  # aggressive
+        # Aggressive: picks the smallest file size among all candidates meeting the threshold
+        candidates = []
+        for m in members:
+            is_ref = (m.get("id") == ref_id)
+            if _is_member_candidate(m, limits, is_reference=is_ref):
+                m_w = m.get("width") or 0
+                m_h = m.get("height") or 0
+                m_px = m_w * m_h
                 if (not res_loss_allowed) and (m_px < ref_px):
                     continue
                 if is_ref:

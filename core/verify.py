@@ -42,13 +42,13 @@ logger = logging.getLogger("argus.verify")
 @dataclass
 class MatchResult:
     """Detailed result of keypoint matching and RANSAC verification between two images."""
-    status: str  # "verified" | "failed" | "inconclusive"
-    verified: bool
-    inlier_count: int
-    inlier_ratio: float
-    good_matches: int
-    total_keypoints_1: int
-    total_keypoints_2: int
+    status: str = "inconclusive"  # "verified" | "failed" | "inconclusive"
+    verified: bool = False
+    inlier_count: int = 0
+    inlier_ratio: float = 0.0
+    good_matches: int = 0
+    total_keypoints_1: int = 0
+    total_keypoints_2: int = 0
     message: str = ""
     transform_matrix: np.ndarray | None = None
 
@@ -404,6 +404,20 @@ class KeypointVerifier:
         inlier_count = int(np.sum(mask))
         inlier_ratio = inlier_count / len(good_matches) if good_matches else 0.0
 
+        verified = (inlier_count >= self.min_inliers) and (inlier_ratio >= self.min_inlier_ratio)
+        if verified:
+            return MatchResult(
+                status="verified",
+                verified=True,
+                inlier_count=inlier_count,
+                inlier_ratio=round(inlier_ratio, 4),
+                good_matches=len(good_matches),
+                total_keypoints_1=nkp1,
+                total_keypoints_2=nkp2,
+                message="Verified",
+                transform_matrix=M,
+            )
+
         if nkp1 < self.min_keypoints or nkp2 < self.min_keypoints:
             return MatchResult(
                 status="inconclusive",
@@ -417,18 +431,15 @@ class KeypointVerifier:
                 transform_matrix=M,
             )
 
-        verified = (inlier_count >= self.min_inliers) and (inlier_ratio >= self.min_inlier_ratio)
-        status = "verified" if verified else "failed"
-
         return MatchResult(
-            status=status,
-            verified=verified,
+            status="failed",
+            verified=False,
             inlier_count=inlier_count,
             inlier_ratio=round(inlier_ratio, 4),
             good_matches=len(good_matches),
             total_keypoints_1=nkp1,
             total_keypoints_2=nkp2,
-            message="Verified" if verified else f"Failed thresholds (inliers={inlier_count}/{self.min_inliers}, ratio={inlier_ratio:.3f}/{self.min_inlier_ratio})",
+            message=f"Failed thresholds (inliers={inlier_count}/{self.min_inliers}, ratio={inlier_ratio:.3f}/{self.min_inlier_ratio})",
             transform_matrix=M,
         )
 
@@ -598,10 +609,12 @@ def run_stage3_verification(
         rep_path = c_row["rep_path"]
 
         rep_kp, rep_des = get_features(rep_id, rep_path)
+        rep_md5_row = conn.execute("SELECT md5 FROM images WHERE id = ?", (rep_id,)).fetchone()
+        rep_md5 = rep_md5_row["md5"] if rep_md5_row else None
 
         members = conn.execute(
             """
-            SELECT id, file_path
+            SELECT id, file_path, md5
             FROM images
             WHERE cluster_id = ? AND id != ?
             ORDER BY id
@@ -610,14 +623,29 @@ def run_stage3_verification(
         ).fetchall()
 
         members_to_split: list[tuple[int, str]] = []
-        cluster_has_inconclusive = (len(rep_kp) < verifier.min_keypoints)
+        cluster_has_inconclusive = False
 
         for m_row in members:
             m_id = m_row["id"]
             m_path = m_row["file_path"]
+            m_md5 = m_row["md5"]
 
-            m_kp, m_des = get_features(m_id, m_path)
-            match_res = verifier.match_features(rep_kp, rep_des, m_kp, m_des)
+            # Fast path: Byte-for-byte exact duplicate files bypass SIFT entirely
+            if rep_md5 and m_md5 and rep_md5 == m_md5:
+                match_res = MatchResult(
+                    verified=True,
+                    status="verified",
+                    inlier_count=500,
+                    inlier_ratio=1.0,
+                    good_matches=500,
+                    total_keypoints_1=500,
+                    total_keypoints_2=500,
+                    transform_matrix=np.eye(3, dtype=np.float32),
+                    message="Exact MD5 duplicate",
+                )
+            else:
+                m_kp, m_des = get_features(m_id, m_path)
+                match_res = verifier.match_features(rep_kp, rep_des, m_kp, m_des)
 
             res.pairs_evaluated += 1
             if progress_callback:
@@ -625,6 +653,55 @@ def run_stage3_verification(
                     progress_callback(res.pairs_evaluated, max(1, total_pairs), m_path)
                 except Exception:
                     pass
+
+            if match_res.status == "inconclusive":
+                # Guard against impostor false-positives masquerading as inconclusive due to low keypoints
+                rep_meta = conn.execute("SELECT phash, clip_vector FROM images WHERE id = ?", (rep_id,)).fetchone()
+                m_meta = conn.execute("SELECT phash, clip_vector FROM images WHERE id = ?", (m_id,)).fetchone()
+                is_obvious_mismatch = False
+                is_confirmed_match = False
+                if rep_meta and m_meta:
+                    p1, p2 = rep_meta["phash"], m_meta["phash"]
+                    v1, v2 = rep_meta["clip_vector"], m_meta["clip_vector"]
+                    pdist = None
+                    if p1 and p2 and len(p1) == len(p2):
+                        try:
+                            pdist = (int(p1, 16) ^ int(p2, 16)).bit_count()
+                        except Exception:
+                            pass
+                    csim = None
+                    if v1 and v2:
+                        try:
+                            from core.embeddings import deserialize_embedding
+                            arr1 = deserialize_embedding(v1).astype(np.float32)
+                            arr2 = deserialize_embedding(v2).astype(np.float32)
+                            norm1 = np.linalg.norm(arr1)
+                            norm2 = np.linalg.norm(arr2)
+                            if norm1 > 0 and norm2 > 0:
+                                csim = float(np.dot(arr1, arr2) / (norm1 * norm2))
+                        except Exception:
+                            pass
+
+                    # 1. Obvious mismatch: different scenes (e.g., baseball glove vs coffee cup)
+                    if pdist is not None and pdist > 12:
+                        is_obvious_mismatch = True
+                    elif csim is not None and csim < 0.80:
+                        is_obvious_mismatch = True
+                    elif (pdist is not None and pdist > 8) and (csim is not None and csim < 0.88):
+                        is_obvious_mismatch = True
+
+                    # 2. Confirmed genuine duplicate on low-texture images (e.g., solid color / smooth scenes)
+                    if (pdist is not None and pdist <= 8) or (csim is not None and csim >= 0.92):
+                        is_confirmed_match = True
+
+                if is_obvious_mismatch:
+                    match_res.status = "failed"
+                    match_res.verified = False
+                    match_res.message = "Failed: distinct images (pHash/CLIP mismatch)"
+                elif is_confirmed_match:
+                    match_res.status = "verified"
+                    match_res.verified = True
+                    match_res.message = "Verified: low-texture match confirmed by pHash/CLIP"
 
             if match_res.status == "inconclusive":
                 res.pairs_inconclusive += 1
@@ -738,17 +815,87 @@ def run_stage3_verification(
             """
         ).fetchall()
 
+        # Vector-first gating: pre-cache CLIP normalized vectors to avoid futile SIFT matching
+        from core.embeddings import deserialize_embedding
+        rep_ids = [sc["representative_id"] for sc in surviving_clusters]
+        rep_vec_map: dict[int, np.ndarray] = {}
+        if rep_ids:
+            placeholders = ",".join("?" for _ in rep_ids)
+            r_rows = conn.execute(f"SELECT id, clip_vector FROM images WHERE id IN ({placeholders})", rep_ids).fetchall()
+            for r in r_rows:
+                if r["clip_vector"]:
+                    try:
+                        v = deserialize_embedding(r["clip_vector"]).astype(np.float32)
+                        n = np.linalg.norm(v)
+                        if n > 0:
+                            rep_vec_map[r["id"]] = v / n
+                    except Exception:
+                        pass
+
+        split_ids = [sp[0] for sp in split_pool]
+        split_vec_map: dict[int, np.ndarray] = {}
+        if split_ids:
+            placeholders = ",".join("?" for _ in split_ids)
+            s_rows = conn.execute(f"SELECT id, clip_vector FROM images WHERE id IN ({placeholders})", split_ids).fetchall()
+            for r in s_rows:
+                if r["clip_vector"]:
+                    try:
+                        v = deserialize_embedding(r["clip_vector"]).astype(np.float32)
+                        n = np.linalg.norm(v)
+                        if n > 0:
+                            split_vec_map[r["id"]] = v / n
+                    except Exception:
+                        pass
+
         still_split: list[tuple[int, str]] = []
 
+        # Pre-build vectorized array of surviving cluster representatives for ultra-fast dot products
+        sc_with_vec = [sc for sc in surviving_clusters if sc["representative_id"] in rep_vec_map]
+        if sc_with_vec:
+            sc_matrix = np.vstack([rep_vec_map[sc["representative_id"]] for sc in sc_with_vec])
+        else:
+            sc_matrix = None
+
         # 1. Try matching against other surviving clusters
-        for mid, mpath in split_pool:
+        for idx_sp, (mid, mpath) in enumerate(split_pool):
+            if progress_callback:
+                try:
+                    progress_callback(min(total_pairs, res.pairs_evaluated + idx_sp), max(1, total_pairs), mpath)
+                except Exception:
+                    pass
+
+            m_vec = split_vec_map.get(mid)
             mkp, mdes = get_features(mid, mpath)
             matched_cid: int | None = None
 
-            for sc in surviving_clusters:
-                rep_kp, rep_des = get_features(sc["representative_id"], sc["rep_path"])
+            # Vector-first candidate filtering: rank candidates by cosine similarity >= 0.85
+            if m_vec is not None and sc_matrix is not None and len(sc_with_vec) > 0:
+                sims = np.dot(sc_matrix, m_vec)
+                passing_idx = np.where(sims >= 0.85)[0]
+                if len(passing_idx) > 0:
+                    sorted_passing = passing_idx[np.argsort(-sims[passing_idx])]
+                    candidates_to_try = [sc_with_vec[i] for i in sorted_passing]
+                else:
+                    candidates_to_try = []
+            else:
+                candidates_to_try = surviving_clusters
+
+            for sc in candidates_to_try:
+                sc_rep_id = sc["representative_id"]
+                rep_kp, rep_des = get_features(sc_rep_id, sc["rep_path"])
                 mres = verifier.match_features(rep_kp, rep_des, mkp, mdes)
                 if mres.status == "verified":
+                    # Extra cross-check: ensure pHash does not contradict verified match (e.g. repetitive facade false positive)
+                    r_p_row = conn.execute("SELECT phash FROM images WHERE id = ?", (sc_rep_id,)).fetchone()
+                    m_p_row = conn.execute("SELECT phash FROM images WHERE id = ?", (mid,)).fetchone()
+                    if r_p_row and m_p_row and r_p_row["phash"] and m_p_row["phash"]:
+                        try:
+                            pdist = (int(r_p_row["phash"], 16) ^ int(m_p_row["phash"], 16)).bit_count()
+                            if pdist > 16:
+                                continue
+                        except Exception:
+                            pass
+
                     matched_cid = sc["id"]
                     if mres.transform_matrix is not None:
                         p1_s = get_proxy_shape(sc["representative_id"])
@@ -783,11 +930,25 @@ def run_stage3_verification(
         # 2. Group remaining split members amongst each other
         while still_split:
             seed_id, seed_path = still_split.pop(0)
+            if progress_callback:
+                try:
+                    progress_callback(max(1, total_pairs), max(1, total_pairs), seed_path)
+                except Exception:
+                    pass
+            seed_vec = split_vec_map.get(seed_id)
             seed_kp, seed_des = get_features(seed_id, seed_path)
             cand_members: list[tuple[int, str]] = [(seed_id, seed_path)]
 
             unmatched: list[tuple[int, str]] = []
             for mid, mpath in still_split:
+                m_vec = split_vec_map.get(mid)
+                # Gating: if both vectors are available and similarity < 0.85, skip SIFT
+                if seed_vec is not None and m_vec is not None:
+                    sim = float(np.dot(seed_vec, m_vec))
+                    if sim < 0.85:
+                        unmatched.append((mid, mpath))
+                        continue
+
                 mkp, mdes = get_features(mid, mpath)
                 mres = verifier.match_features(seed_kp, seed_des, mkp, mdes)
                 if mres.status == "verified":

@@ -15,12 +15,15 @@ Features:
 from __future__ import annotations
 
 import gc
+import logging
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator
 
 import os
+
+logger = logging.getLogger("similix.embeddings")
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -39,12 +42,17 @@ from sources.local_folder import LocalFolderSource
 
 
 def get_device() -> torch.device:
-    """Return Apple Silicon MPS device if available and built, else CPU."""
+    """Return CUDA device if available, else Apple Silicon MPS, else CPU."""
     dev_str = os.environ.get("SIMILIX_DEVICE") or os.environ.get("ARGUS_DEVICE") or os.environ.get("TORCH_DEVICE")
     if dev_str:
+        if "cuda" in dev_str.lower() and not torch.cuda.is_available():
+            logger.warning("CUDA requested via env but torch is not compiled with CUDA; falling back to CPU")
+            return torch.device("cpu")
         return torch.device(dev_str)
     if os.environ.get("CI"):
         return torch.device("cpu")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
     if torch.backends.mps.is_available() and torch.backends.mps.is_built():
         return torch.device("mps")
     return torch.device("cpu")
@@ -119,9 +127,6 @@ class CLIPEmbedder:
 
         # Free memory immediately
         del tensors, features
-        if self.device.type == "mps":
-            torch.mps.empty_cache()
-
         return emb_np
 
 
@@ -170,6 +175,16 @@ def run_embeddings(
     enable_rotations = stage2_cfg.get("enable_rotation_embeddings", False)
     thumb_size = config.get("general", {}).get("thumbnail_size", 256)
 
+    thumb_cache_dir_raw = config.get("sources", {}).get("thumb_cache_dir") or config.get("general", {}).get("thumb_cache_dir")
+    if thumb_cache_dir_raw:
+        thumb_cache_dir = Path(thumb_cache_dir_raw).expanduser().resolve()
+    else:
+        try:
+            from core.config import resolve_data_dir
+            thumb_cache_dir = resolve_data_dir() / "thumbnails"
+        except Exception:
+            thumb_cache_dir = None
+
     # Count pending images
     total_pending = conn.execute(
         """
@@ -202,13 +217,18 @@ def run_embeddings(
             model_name=model_name,
             pretrained=pretrained,
         )
+    if embedder.device.type == "cpu":
+        try:
+            torch.set_num_threads(os.cpu_count() or 2)
+        except Exception:
+            pass
 
     processed_count = 0
 
     while True:
         batch_rows = conn.execute(
             """
-            SELECT id, file_path FROM images
+            SELECT id, file_path, md5 FROM images
             WHERE clip_vector IS NULL
               AND is_raw_pair = 0
               AND (status IS NULL OR status != 'skipped')
@@ -229,13 +249,24 @@ def run_embeddings(
         for row in batch_rows:
             img_id = row["id"]
             file_id = row["file_path"]
-            try:
-                t = source.get_thumbnail(file_id, size=(thumb_size, thumb_size))
-                thumbs_0.append(t)
-                valid_ids.append(img_id)
-            except Exception:
-                failed_ids.append(img_id)
-                continue
+            row_md5 = row.get("md5") if hasattr(row, "get") else None
+            t = None
+            if thumb_cache_dir is not None and row_md5:
+                cached_thumb = thumb_cache_dir / f"{row_md5}_{thumb_size}.jpg"
+                if cached_thumb.is_file():
+                    try:
+                        with Image.open(cached_thumb) as im:
+                            t = im.convert("RGB")
+                    except Exception:
+                        t = None
+            if t is None:
+                try:
+                    t = source.get_thumbnail(file_id, size=(thumb_size, thumb_size))
+                except Exception:
+                    failed_ids.append(img_id)
+                    continue
+            thumbs_0.append(t)
+            valid_ids.append(img_id)
 
         if failed_ids:
             conn.executemany(
@@ -313,6 +344,17 @@ def run_embeddings(
 
         # Free memory between batches
         gc.collect()
+
+    if embedder.device.type == "mps":
+        try:
+            torch.mps.empty_cache()
+        except Exception:
+            pass
+    elif embedder.device.type == "cuda":
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
     return EmbeddingResult(
         images_embedded=processed_count,

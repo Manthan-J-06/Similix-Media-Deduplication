@@ -16,6 +16,7 @@ READ-ONLY integration:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import io
 import json
 import logging
@@ -29,7 +30,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -73,6 +74,75 @@ def parse_drive_uri(uri: str) -> tuple[str, str]:
             return file_id, name
         return remainder, ""
     return uri, ""
+
+
+class RemoteHTTPRangeReader(io.RawIOBase):
+    """Seekable read-only stream over HTTP Range requests for remote files (e.g. zip archives)."""
+
+    def __init__(self, url: str, timeout: float = 15.0):
+        self.url = url
+        self.timeout = timeout
+        self._size = 0
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Range": "bytes=0-0"})
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    cr = resp.headers.get("Content-Range")
+                    if cr and "/" in cr:
+                        self._size = int(cr.split("/")[1])
+                    else:
+                        cl = resp.headers.get("Content-Length")
+                        self._size = int(cl) if cl and cl.isdigit() else 0
+                break
+            except Exception:
+                if attempt == 2:
+                    raise
+                time.sleep(0.5 * (attempt + 1))
+        self._pos = 0
+
+    def seekable(self) -> bool:
+        return True
+
+    def readable(self) -> bool:
+        return True
+
+    def writable(self) -> bool:
+        return False
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        if whence == io.SEEK_SET:
+            self._pos = offset
+        elif whence == io.SEEK_CUR:
+            self._pos += offset
+        elif whence == io.SEEK_END:
+            self._pos = self._size + offset
+        return self._pos
+
+    def tell(self) -> int:
+        return self._pos
+
+    def readinto(self, b) -> int:
+        l = len(b)
+        if self._pos >= self._size or l == 0:
+            return 0
+        end = min(self._pos + l - 1, self._size - 1)
+        req = urllib.request.Request(
+            self.url,
+            headers={"User-Agent": "Mozilla/5.0", "Range": f"bytes={self._pos}-{end}"},
+        )
+        data = b""
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    data = resp.read()
+                break
+            except Exception:
+                if attempt == 2:
+                    raise
+                time.sleep(0.5 * (attempt + 1))
+        b[: len(data)] = data
+        self._pos += len(data)
+        return len(data)
 
 
 def retry_with_backoff(
@@ -143,6 +213,12 @@ def get_drive_credentials(
     creds = None
     if tok_path.exists():
         try:
+            raw_text = tok_path.read_text(encoding="utf-8")
+            tok_data = json.loads(raw_text)
+            if not tok_data.get("expiry") and tok_data.get("token"):
+                tok_data["expiry"] = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                tok_path.write_text(json.dumps(tok_data, indent=2), encoding="utf-8")
+                tok_path.chmod(0o600)
             creds = Credentials.from_authorized_user_file(str(tok_path), SCOPES)
         except Exception as exc:
             logger.warning("Could not read credentials from %s: %s", tok_path, exc)
@@ -158,7 +234,9 @@ def get_drive_credentials(
             return creds
         except Exception as exc:
             logger.warning("Could not refresh token: %s", exc)
-            creds = None
+            # If creds has a token, keep it rather than discarding immediately
+            if not getattr(creds, "token", None):
+                creds = None
 
     if not creds or not creds.valid:
         if not prompt_if_missing:
@@ -302,12 +380,16 @@ class GoogleDriveSource(ImageSource):
         max_cache_bytes: int = DEFAULT_MAX_CACHE_BYTES,
         config: dict | None = None,
         token_path: str | Path | None = None,
+        is_public: bool = False,
     ):
         self.folder_id = folder_id
         self.all_drive = all_drive
         self._service = service
         self._credentials = credentials
         self.token_path = Path(token_path).expanduser() if token_path else None
+        self.is_public = is_public
+        self._remote_zip = None
+        self._remote_reader = None
         self.config = config or {}
         cfg_cache = self.config.get("sources", {}).get("google_drive", {}).get("cache_dir")
         self.cache_dir = Path(cache_dir or cfg_cache or DEFAULT_CACHE_DIR).expanduser()
@@ -361,6 +443,17 @@ class GoogleDriveSource(ImageSource):
                 if total_size <= target_size:
                     break
 
+    def _ensure_remote_zip(self, zip_id: str | None = None) -> None:
+        target_id = zip_id or self.folder_id
+        if getattr(self, "_remote_zip", None) is None and target_id:
+            try:
+                import zipfile
+                download_url = f"https://drive.usercontent.google.com/download?id={target_id}&export=download&confirm=t"
+                self._remote_reader = RemoteHTTPRangeReader(download_url)
+                self._remote_zip = zipfile.ZipFile(self._remote_reader)
+            except Exception as exc:
+                logger.debug("Remote ZIP initialization for %s skipped/failed: %s", target_id, exc)
+
     @property
     def service(self) -> Any:
         if self._service is None:
@@ -369,8 +462,26 @@ class GoogleDriveSource(ImageSource):
 
     @property
     def credentials(self) -> Any:
+        from google.auth.transport.requests import Request
         if self._credentials is None:
-            self._credentials = get_drive_credentials(token_path=self.token_path, prompt_if_missing=False)
+            try:
+                self._credentials = get_drive_credentials(token_path=self.token_path, prompt_if_missing=False)
+            except FileNotFoundError as exc:
+                if getattr(self, "is_public", False) or self.token_path is None:
+                    raise FileNotFoundError(
+                        "This Google Drive folder is private or requires sign-in. "
+                        "Please sign in with Google to access private folders."
+                    ) from exc
+                raise
+        elif getattr(self._credentials, "expired", False) and getattr(self._credentials, "refresh_token", None):
+            try:
+                self._credentials.refresh(Request())
+                if self.token_path:
+                    self.token_path.parent.mkdir(parents=True, exist_ok=True)
+                    self.token_path.write_text(self._credentials.to_json())
+                    self.token_path.chmod(0o600)
+            except Exception as exc:
+                logger.warning("Auto-refresh of Drive credentials in GoogleDriveSource failed: %s", exc)
         return self._credentials
 
     def parse_file_id(self, file_id_or_uri: str) -> tuple[str, str]:
@@ -385,6 +496,43 @@ class GoogleDriveSource(ImageSource):
         """
         self.skipped_files.clear()
         folder_queue: list[str | None] = []
+
+        # Check if scanning a public file/ZIP archive without Google credentials
+        if self.folder_id and (self.token_path is None or getattr(self, "is_public", False)):
+            try:
+                from api.server import check_drive_link_accessibility
+                pub_res = check_drive_link_accessibility(self.folder_id)
+                if pub_res.get("is_public") and (pub_res.get("is_file") or str(pub_res.get("folder_name", "")).lower().endswith(".zip")):
+                    import zipfile
+                    download_url = f"https://drive.usercontent.google.com/download?id={self.folder_id}&export=download&confirm=t"
+                    self._remote_reader = RemoteHTTPRangeReader(download_url)
+                    self._remote_zip = zipfile.ZipFile(self._remote_reader)
+                    for info in self._remote_zip.infolist():
+                        if info.is_dir():
+                            continue
+                        ext = Path(info.filename).suffix.lower()
+                        if ext not in DEFAULT_EXTENSIONS:
+                            continue
+                        clean_fn = Path(info.filename).name
+                        drive_id = f"{self.folder_id}:{info.filename}"
+                        virtual_path = build_drive_uri(drive_id, clean_fn)
+                        mtime = time.mktime(info.date_time + (0, 0, -1)) if info.date_time else time.time()
+                        md5_proxy = hashlib.md5(f"{info.CRC}_{info.file_size}_{info.filename}".encode()).hexdigest()
+                        meta = ImageMetadata(
+                            file_id=virtual_path,
+                            file_size=info.file_size,
+                            modified_time=mtime,
+                            format=ext.lstrip(".").upper(),
+                            md5=md5_proxy,
+                            source="gdrive",
+                            drive_id=drive_id,
+                        )
+                        self._metadata_cache[virtual_path] = meta
+                        self._metadata_cache[drive_id] = meta
+                        yield virtual_path
+                    return
+            except Exception as exc:
+                logger.warning("Remote public ZIP discovery failed for %s: %s", self.folder_id, exc)
 
         if self.all_drive:
             folder_queue.append(None)
@@ -500,11 +648,56 @@ class GoogleDriveSource(ImageSource):
         """Return ImageMetadata from cache or directly via Google Drive API."""
         with self._cache_lock:
             if file_id in self._metadata_cache:
-                return self._metadata_cache[file_id]
+                meta = self._metadata_cache[file_id]
+                if (meta.width is None or meta.height is None) and ":" in str(meta.drive_id or ""):
+                    try:
+                        self._ensure_remote_zip(str(meta.drive_id).split(":", 1)[0])
+                        if self._remote_zip is not None:
+                            entry_name = str(meta.drive_id).split(":", 1)[1]
+                            with self._remote_zip.open(entry_name) as zf_item:
+                                with Image.open(zf_item) as im:
+                                    meta.width, meta.height = im.size
+                    except Exception:
+                        pass
+                return meta
 
             drive_id, name = self.parse_file_id(file_id)
             if drive_id in self._metadata_cache:
                 return self._metadata_cache[drive_id]
+
+        if ":" in drive_id:
+            try:
+                self._ensure_remote_zip(drive_id.split(":", 1)[0])
+                if self._remote_zip is not None:
+                    entry_name = drive_id.split(":", 1)[1]
+                    info = self._remote_zip.getinfo(entry_name)
+                    ext = Path(info.filename).suffix.lower()
+                    mtime = time.mktime(info.date_time + (0, 0, -1)) if info.date_time else time.time()
+                    md5_proxy = hashlib.md5(f"{info.CRC}_{info.file_size}_{info.filename}".encode()).hexdigest()
+                    w, h = None, None
+                    try:
+                        with self._remote_zip.open(entry_name) as zf_item:
+                            with Image.open(zf_item) as im:
+                                w, h = im.size
+                    except Exception:
+                        pass
+                    meta = ImageMetadata(
+                        file_id=file_id,
+                        file_size=info.file_size,
+                        modified_time=mtime,
+                        width=w,
+                        height=h,
+                        format=ext.lstrip(".").upper(),
+                        md5=md5_proxy,
+                        source="gdrive",
+                        drive_id=drive_id,
+                    )
+                    with self._cache_lock:
+                        self._metadata_cache[file_id] = meta
+                        self._metadata_cache[drive_id] = meta
+                    return meta
+            except Exception as exc:
+                logger.warning("Remote ZIP metadata fetch failed for %s: %s", drive_id, exc)
 
         # Fetch metadata from API
         with self._api_lock:
@@ -745,7 +938,8 @@ class GoogleDriveSource(ImageSource):
                 except Exception as exc:
                     logger.debug("Failed to fetch mtime for %s: %s", file_id, exc)
 
-        cache_path = self.cache_dir / f"{drive_id}_{mtime}.jpg"
+        safe_name = drive_id.replace('/', '_').replace(':', '_')
+        cache_path = self.cache_dir / f"{safe_name}_{mtime}.jpg"
 
         # Check local cache
         if cache_path.exists():
@@ -765,6 +959,26 @@ class GoogleDriveSource(ImageSource):
                     cache_path.unlink(missing_ok=True)
                 except OSError:
                     pass
+
+        if ":" in drive_id:
+            try:
+                zip_id = drive_id.split(":", 1)[0]
+                entry_name = drive_id.split(":", 1)[1]
+                self._ensure_remote_zip(zip_id)
+                if self._remote_zip is not None:
+                    with self._remote_zip.open(entry_name) as zf_item:
+                        raw_bytes = zf_item.read()
+                    with Image.open(io.BytesIO(raw_bytes)) as img:
+                        thumb = img.convert("RGB")
+                        thumb.thumbnail(size, Image.Resampling.LANCZOS)
+                    try:
+                        self.cache_dir.mkdir(parents=True, exist_ok=True)
+                        thumb.save(cache_path, "JPEG", quality=85)
+                    except Exception:
+                        pass
+                    return thumb
+            except Exception as exc:
+                logger.error("Failed to read thumbnail for %s from remote zip: %s", file_id, exc)
 
         # Retrieve thumbnailLink
         link = None
@@ -861,6 +1075,19 @@ class GoogleDriveSource(ImageSource):
             raise ValueError(
                 f"File {file_id} size ({meta.file_size} bytes) exceeds download cap ({self.max_file_download_size} bytes)"
             )
+
+        if ":" in drive_id:
+            try:
+                zip_id = drive_id.split(":", 1)[0]
+                entry_name = drive_id.split(":", 1)[1]
+                self._ensure_remote_zip(zip_id)
+                if self._remote_zip is not None:
+                    with self._remote_zip.open(entry_name) as zf_item:
+                        raw_bytes = zf_item.read()
+                    record_bandwidth(self.conn, self.stage, drive_id, len(raw_bytes), "full_download")
+                    return raw_bytes
+            except Exception as exc:
+                logger.error("Failed to read bytes for %s from remote zip: %s", file_id, exc)
 
         from googleapiclient.http import MediaIoBaseDownload
 

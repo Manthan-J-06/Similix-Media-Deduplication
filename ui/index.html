@@ -1006,6 +1006,7 @@
       <div style="display: flex; gap: 12px; align-items: center;">
         <span id="job-elapsed-text" style="color: var(--text-muted); font-size: 12px;">Elapsed: 0s</span>
         <span id="job-percent-text" style="color: var(--text-muted); font-size: 12px; font-weight: 600;">0%</span>
+        <button type="button" class="btn btn-secondary btn-sm" id="job-banner-dismiss-btn" style="display:none; padding: 2px 8px; font-size: 11px;">Dismiss</button>
       </div>
     </div>
     <!-- Overall progress -->
@@ -1039,8 +1040,8 @@
       <button type="button" class="view-tab-btn" id="tab-all-photos">All photos</button>
     </div>
     <div class="view-tabs-actions" style="display:flex; align-items:center; gap:8px;">
-      <button type="button" class="btn" id="btn-download-all-keepers" title="Download clean deduplicated dataset (all unique photos + cluster keepers)" style="font-size:12px; padding:4px 10px;">
-        ⬇ Download all keepers
+      <button type="button" class="btn" id="btn-download-all-keepers" title="Download clean deduplicated dataset: exactly 1 best keeper per duplicate cluster + all unique photos (excludes all duplicate copies)" style="font-size:12px; padding:4px 10px;">
+        ⬇ Download clean dataset (keepers + unique)
       </button>
     </div>
   </div>
@@ -1051,10 +1052,7 @@
     <!-- Left Column: Cluster List -->
     <aside class="sidebar" id="cluster-list-panel">
       <div class="sidebar-controls">
-        <div class="search-row">
-          <input type="text" class="search-input" id="search-input" placeholder="Search images by content...">
-          <button type="button" class="search-clear" id="search-clear">&times;</button>
-        </div>
+        <input type="hidden" id="search-input" value="">
         <div class="filter-row">
           <select class="filter-select" id="category-filter">
             <option value="">All Categories</option>
@@ -1072,6 +1070,10 @@
           <label class="checkbox-label">
             <input type="checkbox" id="has-savings-toggle"> Has savings only
           </label>
+        </div>
+        <div id="cluster-list-status" style="display: flex; justify-content: space-between; align-items: center; padding: 4px 2px 2px 2px; font-size: 11px; color: var(--text-muted);">
+          <span id="cluster-list-count"></span>
+          <span id="cluster-list-spinner" class="spinner-inline" style="display: none; width: 12px; height: 12px;"></span>
         </div>
       </div>
 
@@ -1102,7 +1104,7 @@
             </div>
           </div>
           <div class="detail-actions">
-            <button type="button" class="btn" id="btn-download-cluster" title="Download all files in this cluster">⬇ Download cluster</button>
+            <button type="button" class="btn" id="btn-download-cluster" title="Download all copies in this specific cluster (both original and duplicates)">⬇ Download cluster</button>
             <button type="button" class="btn" id="btn-download-selected" title="Download selected images" style="display:none;">⬇ Download selected</button>
             <button type="button" class="btn" id="btn-select-safe">Select all safe copies</button>
             <button type="button" class="btn" id="btn-dismiss-cluster" title="Dismiss this cluster without deleting any files from disk">Dismiss cluster</button>
@@ -1326,22 +1328,50 @@
 
         <!-- Tab 2: Drive -->
         <div id="tab-drive" class="source-tab-pane" style="display:none;">
-          <div id="drive-auth-panel" style="margin-bottom:14px; padding:12px 14px; border-radius:6px; background:rgba(255,255,255,0.03); border:1px solid var(--border);">
-            <div id="drive-status-message" style="font-size:0.85rem; padding:8px 12px; border-radius:6px; margin-bottom:10px; display:none;"></div>
-            <div id="drive-connect-view">
-              <p style="font-size:0.82rem; color:var(--text-muted); margin-bottom:10px;">Connect Google Drive with read-only access to scan folders for duplicates.</p>
-              <button type="button" class="btn btn-primary" id="btn-connect-drive">Connect Google Drive</button>
+          <!-- Primary Section: Public / Shared Link Scanner -->
+          <div id="drive-scan-panel" style="margin-bottom:16px;">
+            <label style="font-size:0.88rem; font-weight:600; display:block; margin-bottom:6px;">Google Drive Link (Folder, File, or ZIP Archive):</label>
+            <input type="text" id="drive-link-input" class="search-input" style="width:100%; box-sizing:border-box;" placeholder="https://drive.google.com/file/d/... or https://drive.google.com/drive/folders/...">
+            <div style="font-size:0.8rem; color:var(--success); margin-top:6px; display:flex; align-items:center; gap:6px;">
+              <span>✓</span> <span>Public &amp; shared links work directly — no Google sign-in required!</span>
             </div>
+            <button type="button" class="btn btn-primary" id="btn-scan-drive" style="margin-top:10px; width:100%;">Scan Drive (Read-Only)</button>
+          </div>
+
+          <!-- Secondary Section: Private Drive Access & Settings -->
+          <div id="drive-auth-panel" style="padding:12px 14px; border-radius:6px; background:rgba(255,255,255,0.02); border:1px solid var(--border);">
+            <div id="drive-status-message" style="font-size:0.85rem; padding:8px 12px; border-radius:6px; margin-bottom:10px; display:none;"></div>
+
+            <div id="drive-connect-view">
+              <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+                <div>
+                  <div style="font-size:0.82rem; font-weight:500;">Private Google Drive Files (Optional)</div>
+                  <div style="font-size:0.75rem; color:var(--text-muted);">Only needed if accessing private, non-shared files from your personal drive.</div>
+                </div>
+                <div style="display:flex; gap:8px; align-items:center;">
+                  <button type="button" class="btn btn-secondary" id="btn-connect-drive" style="font-size:0.8rem; padding:4px 10px;">Sign in with Google</button>
+                  <button type="button" class="btn" id="btn-toggle-config" style="font-size:0.75rem; padding:4px 8px; opacity:0.6;" title="Server OAuth configuration">⚙ Server Settings</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Optional Server OAuth Configuration Section (Hidden by default) -->
+            <div id="drive-configure-view" style="display:none; margin-top:12px; padding:10px 12px; border-radius:6px; background:rgba(59,130,246,0.05); border:1px dashed var(--accent);">
+              <div style="font-size:0.85rem; font-weight:600; margin-bottom:4px;">Server OAuth Credentials</div>
+              <p style="font-size:0.8rem; color:var(--text-muted); margin-bottom:8px;">
+                Optional server configuration for private Google Drive access.
+              </p>
+              <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                <input type="file" id="drive-secret-input" accept=".json,application/json" style="display:none;">
+                <button type="button" class="btn btn-primary" id="btn-browse-secret" style="font-size:0.8rem; padding:6px 12px;">Choose client_secret.json</button>
+                <span id="drive-secret-filename" style="font-size:0.8rem; color:var(--text-muted);">No file selected</span>
+              </div>
+            </div>
+
             <div id="drive-connected-view" style="display:none; align-items:center; justify-content:space-between; gap:10px;">
               <span style="font-size:0.85rem; color:var(--success); font-weight:500;" id="drive-connected-user">Connected as ...</span>
               <button type="button" class="btn" id="btn-disconnect-drive" style="padding:4px 10px; font-size:0.8rem;">Disconnect</button>
             </div>
-          </div>
-          <div id="drive-scan-panel">
-            <label style="font-size:0.85rem; font-weight:500; display:block; margin-bottom:6px;">Google Drive Folder URL or ID:</label>
-            <input type="text" id="drive-link-input" class="search-input" style="width:100%; box-sizing:border-box;" placeholder="https://drive.google.com/drive/folders/...">
-            <div style="font-size:0.8rem; color:var(--text-muted); margin-top:6px;">Read-only scan. Scopes strictly limited to drive.readonly.</div>
-            <button type="button" class="btn btn-primary" id="btn-scan-drive" style="margin-top:12px; width:100%;">Scan Drive (Read-Only)</button>
           </div>
         </div>
 
@@ -1555,26 +1585,21 @@
 
     function renderCategoriesDropdown(cats) {
       const sel = document.getElementById("category-filter");
-      const libSel = document.getElementById("lib-category-filter");
       const catWrap = document.getElementById("categorize-now-wrap");
       const prevVal = sel ? sel.value : "";
-      const prevLibVal = libSel ? libSel.value : "";
       const entries = Object.entries(cats || {});
 
       if (entries.length === 0) {
         // Not categorized yet: show explanatory message and Categorize now button
         if (sel) sel.innerHTML = '<option value="" disabled selected>Categories are computed after processing</option>';
-        if (libSel) libSel.innerHTML = '<option value="">All Categories</option>';
         if (catWrap) catWrap.style.display = "block";
         return;
       }
 
       if (catWrap) catWrap.style.display = "none";
       if (sel) sel.innerHTML = '<option value="">All Categories</option>';
-      if (libSel) libSel.innerHTML = '<option value="">All Categories</option>';
 
       let foundPrev = false;
-      let foundLibPrev = false;
       for (const [name, count] of entries) {
         if (sel) {
           const opt = document.createElement("option");
@@ -1586,7 +1611,24 @@
           }
           sel.appendChild(opt);
         }
-        if (libSel) {
+      }
+      if (sel && !foundPrev && prevVal) {
+        sel.value = "";
+      }
+    }
+
+    async function loadLibraryCategories() {
+      const libSel = document.getElementById("lib-category-filter");
+      if (!libSel) return;
+      const prevLibVal = libSel.value || "";
+      try {
+        const res = await fetch("/library/categories");
+        if (!res.ok) return;
+        const cats = await res.json();
+        const entries = Object.entries(cats || {});
+        libSel.innerHTML = '<option value="">All Categories</option>';
+        let foundLibPrev = false;
+        for (const [name, count] of entries) {
           const libOpt = document.createElement("option");
           libOpt.value = name;
           libOpt.textContent = `${name} (${count})`;
@@ -1596,16 +1638,17 @@
           }
           libSel.appendChild(libOpt);
         }
-      }
-      if (sel && !foundPrev && prevVal) {
-        sel.value = "";
-      }
-      if (libSel && !foundLibPrev && prevLibVal) {
-        libSel.value = "";
+        if (!foundLibPrev && prevLibVal) {
+          libSel.value = "";
+        }
+      } catch (err) {
+        console.debug("Failed to load library categories:", err);
       }
     }
 
     function showClusterListError(message, retryFn) {
+      const statusSpinner = document.getElementById("cluster-list-spinner");
+      if (statusSpinner) statusSpinner.style.display = "none";
       const container = document.getElementById("cluster-list");
       container.innerHTML = `
         <div style="padding:24px 16px; text-align:center; color:var(--danger); font-size:0.85rem;">
@@ -1633,15 +1676,26 @@
 
     // Render left sidebar clusters
     function renderClusterList(clusters, totalCount) {
+      const statusSpinner = document.getElementById("cluster-list-spinner");
+      if (statusSpinner) statusSpinner.style.display = "none";
+      const statusCount = document.getElementById("cluster-list-count");
+      if (statusCount) {
+        if (!clusters || clusters.length === 0) {
+          statusCount.textContent = "0 clusters";
+        } else {
+          statusCount.innerHTML = `<span title="Verified duplicate clusters. Gaps in cluster IDs represent candidate pairs that were evaluated and rejected by SIFT geometric verification as false positives.">${clusters.length} verified cluster${clusters.length === 1 ? '' : 's'} ℹ️</span>`;
+        }
+      }
+
       const container = document.getElementById("cluster-list");
       container.innerHTML = "";
 
       const catVal = document.getElementById("category-filter").value;
-      const searchVal = document.getElementById("search-input").value.trim();
+      const searchVal = document.getElementById("search-input") ? document.getElementById("search-input").value.trim() : "";
 
       if (!clusters || clusters.length === 0) {
         if (catVal || searchVal) {
-          container.innerHTML = `<div style="padding:24px; text-align:center; color:var(--text-muted); font-size:0.85rem;">No clusters match the selected category or filter.</div>`;
+          container.innerHTML = `<div style="padding:24px; text-align:center; color:var(--text-muted); font-size:0.85rem;">No clusters match the selected category.</div>`;
         } else {
           const countMsg = (totalCount !== undefined && totalCount !== null && !isNaN(totalCount))
             ? ` in ${totalCount} images`
@@ -1651,8 +1705,10 @@
         return;
       }
 
-      const fragment = document.createDocumentFragment();
-      clusters.forEach(c => {
+      let renderedCount = 0;
+      const BATCH_SIZE = 35;
+
+      function renderClusterItem(c) {
         const item = document.createElement("div");
         item.className = `cluster-item ${c.id === activeClusterId ? "active" : ""}`;
         item.dataset.clusterId = c.id;
@@ -1664,18 +1720,18 @@
           if (c.manual_category) {
             return `<span class="chip chip-category">${escapeHtml(c.manual_category)}</span>`;
           }
-          const top1Val = (c.category_top1_prob !== undefined && c.category_top1_prob !== null) ? c.category_top1_prob : 0;
-          const top2Val = (c.category_top2_prob !== undefined && c.category_top2_prob !== null) ? c.category_top2_prob : 0;
-          const isNeeds = c.category === 'Needs label' || (c.category_top1_prob !== undefined && c.category_top1_prob !== null && (top1Val < 0.15 || (top1Val - top2Val < 0.03)));
-          if (isNeeds) {
+          if (c.category === 'Needs label' || !c.category) {
             return `<span class="chip chip-category" style="background:rgba(234,179,8,0.15);color:#eab308;border-color:rgba(234,179,8,0.4);">Needs label</span>`;
           }
-          if (c.category_top1 && c.category_top2) {
+          if (c.category === 'mixed') {
+            return `<span class="chip chip-category" style="background:rgba(99,102,241,0.15);color:#818cf8;border-color:rgba(99,102,241,0.4);">mixed</span>`;
+          }
+          if (c.category_top1 && c.category_top2 && c.category === c.category_top1) {
             const p1 = Math.round((c.category_top1_prob || 0) * 100);
             const p2 = Math.round((c.category_top2_prob || 0) * 100);
             return `<span class="chip chip-category" title="Top-1: ${escapeHtml(c.category_top1)} (${p1}%) | Top-2: ${escapeHtml(c.category_top2)} (${p2}%)">${escapeHtml(c.category_top1)} (${p1}%) &bull; ${escapeHtml(c.category_top2)} (${p2}%)</span>`;
           }
-          return c.category ? `<span class="chip chip-category">${escapeHtml(c.category)}</span>` : "";
+          return `<span class="chip chip-category">${escapeHtml(c.category)}</span>`;
         })();
 
         item.innerHTML = `
@@ -1697,9 +1753,29 @@
         `;
 
         item.addEventListener("click", () => selectCluster(c.id));
-        fragment.appendChild(item);
-      });
-      container.replaceChildren(fragment);
+        return item;
+      }
+
+      function appendNextBatch() {
+        if (renderedCount >= clusters.length) return;
+        const nextBatch = clusters.slice(renderedCount, renderedCount + BATCH_SIZE);
+        const fragment = document.createDocumentFragment();
+        nextBatch.forEach(c => fragment.appendChild(renderClusterItem(c)));
+        container.appendChild(fragment);
+        renderedCount += nextBatch.length;
+      }
+
+      // Initial batch render (fast initial paint)
+      appendNextBatch();
+
+      // Progressive infinite scroll for subsequent clusters
+      container.onscroll = () => {
+        if (renderedCount < clusters.length) {
+          if (container.scrollTop + container.clientHeight >= container.scrollHeight - 250) {
+            appendNextBatch();
+          }
+        }
+      };
     }
 
     let currentRefreshSeq = 0;
@@ -1738,6 +1814,9 @@
       const seq = ++currentRefreshSeq;
       const preserveActiveCluster = options.preserveActiveCluster !== false;
       const canRetry = options.retryOnNetworkError !== false;
+
+      const statusSpinner = document.getElementById("cluster-list-spinner");
+      if (statusSpinner) statusSpinner.style.display = "inline-block";
 
       async function doFetch(isRetry = false) {
         try {
@@ -1855,28 +1934,28 @@
           catEl.style.background = "";
           catEl.style.color = "";
           catEl.style.borderColor = "";
+        } else if (data.category === 'Needs label' || !data.category) {
+          catEl.textContent = "Needs label";
+          catEl.style.background = "rgba(234, 179, 8, 0.15)";
+          catEl.style.color = "#eab308";
+          catEl.style.borderColor = "rgba(234, 179, 8, 0.4)";
+        } else if (data.category === 'mixed') {
+          catEl.textContent = "mixed";
+          catEl.style.background = "rgba(99, 102, 241, 0.15)";
+          catEl.style.color = "#818cf8";
+          catEl.style.borderColor = "rgba(99, 102, 241, 0.4)";
+        } else if (data.category_top1 && data.category_top2 && data.category === data.category_top1) {
+          const p1 = Math.round((data.category_top1_prob || 0) * 100);
+          const p2 = Math.round((data.category_top2_prob || 0) * 100);
+          catEl.textContent = `${data.category} (${p1}%) · ${data.category_top2} (${p2}%)`;
+          catEl.style.background = "";
+          catEl.style.color = "";
+          catEl.style.borderColor = "";
         } else {
-          const top1Val = (data.category_top1_prob !== undefined && data.category_top1_prob !== null) ? data.category_top1_prob : 0;
-          const top2Val = (data.category_top2_prob !== undefined && data.category_top2_prob !== null) ? data.category_top2_prob : 0;
-          const isNeeds = data.category === 'Needs label' || (data.category_top1_prob !== undefined && data.category_top1_prob !== null && (top1Val < 0.15 || (top1Val - top2Val < 0.03)));
-          if (isNeeds) {
-            catEl.textContent = "Needs label";
-            catEl.style.background = "rgba(234, 179, 8, 0.15)";
-            catEl.style.color = "#eab308";
-            catEl.style.borderColor = "rgba(234, 179, 8, 0.4)";
-          } else if (data.category_top1 && data.category_top2) {
-            const p1 = Math.round((data.category_top1_prob || 0) * 100);
-            const p2 = Math.round((data.category_top2_prob || 0) * 100);
-            catEl.textContent = `${data.category_top1} (${p1}%) · ${data.category_top2} (${p2}%)`;
-            catEl.style.background = "";
-            catEl.style.color = "";
-            catEl.style.borderColor = "";
-          } else {
-            catEl.textContent = data.category;
-            catEl.style.background = "";
-            catEl.style.color = "";
-            catEl.style.borderColor = "";
-          }
+          catEl.textContent = data.category;
+          catEl.style.background = "";
+          catEl.style.color = "";
+          catEl.style.borderColor = "";
         }
       } else {
         catEl.style.display = "none";
@@ -2002,8 +2081,11 @@
         }
 
         // Verified Badge
+        const isVerified = (m.is_recommended_keeper || m.quality_status === "aligned" || m.quality_status === "reference" || (m.match_pct !== null && m.match_pct !== undefined));
         const confPct = m.confidence !== null ? (m.confidence * 100).toFixed(1) : "100.0";
-        const verifiedHtml = `<span class="badge-verified" title="Verified duplicate (${confPct}% confidence)">✓ verified</span>`;
+        const verifiedHtml = isVerified
+          ? `<span class="badge-verified" title="Verified duplicate (${confPct}% confidence)">✓ verified</span>`
+          : `<span class="badge-candidate" style="background:rgba(234,179,8,0.18);color:#eab308;padding:2px 6px;border-radius:4px;font-size:11px;" title="Candidate pending geometric verification">candidate</span>`;
 
         // Recommended label
         const recHtml = m.is_recommended_keeper
@@ -2013,10 +2095,10 @@
         const fname = getBasename(m.file_path);
         const matchStr = (m.match_pct !== null && m.match_pct !== undefined)
           ? `${m.match_pct}%`
-          : (m.is_cluster_anchor || m.quality_status === "reference" ? "100.0%" : "—");
+          : (m.is_cluster_anchor || m.quality_status === "reference" || m.is_recommended_keeper ? "100.0%" : "Computing...");
         const resStr = (m.resolution_pct !== null && m.resolution_pct !== undefined)
           ? `${m.resolution_pct}%`
-          : (m.is_cluster_anchor || m.quality_status === "reference" ? "100.0%" : "—");
+          : (m.is_cluster_anchor || m.quality_status === "reference" || m.is_recommended_keeper ? "100.0%" : "Computing...");
 
         const isChecked = selectedImageIds.has(m.id);
         const vParam = m.md5 ? `&v=${m.md5.slice(0, 12)}` : "";
@@ -2477,39 +2559,40 @@
       });
     }
 
-    // Search Box handler
+    // Search Box handler (eradicated from UI; safely handle if elements exist)
     const searchInput = document.getElementById("search-input");
     const searchClear = document.getElementById("search-clear");
     let searchDebounce = null;
 
-    searchInput.addEventListener("input", () => {
-      const q = searchInput.value.trim();
-      searchClear.style.display = q ? "block" : "none";
-      clearTimeout(searchDebounce);
-      searchDebounce = setTimeout(async () => {
-        if (!q) {
-          refreshAll({ preserveActiveCluster: true });
-          return;
-        }
-        try {
-          const res = await fetch(`/search?q=${encodeURIComponent(q)}&limit=50`);
-          if (!res.ok) return;
-          const results = await res.json();
-          // Map matching cluster IDs
-          const matchingClusterIds = new Set(results.map(r => r.cluster_id).filter(Boolean));
-          const filtered = clustersData.filter(c => matchingClusterIds.has(c.id));
-          renderClusterList(filtered);
-        } catch (err) {
-          console.error("Search error:", err);
-        }
-      }, 300);
-    });
+    if (searchInput && searchClear) {
+      searchInput.addEventListener("input", () => {
+        const q = searchInput.value.trim();
+        searchClear.style.display = q ? "block" : "none";
+        clearTimeout(searchDebounce);
+        searchDebounce = setTimeout(async () => {
+          if (!q) {
+            refreshAll({ preserveActiveCluster: true });
+            return;
+          }
+          try {
+            const res = await fetch(`/search?q=${encodeURIComponent(q)}&limit=50`);
+            if (!res.ok) return;
+            const results = await res.json();
+            const matchingClusterIds = new Set(results.map(r => r.cluster_id).filter(Boolean));
+            const filtered = clustersData.filter(c => matchingClusterIds.has(c.id));
+            renderClusterList(filtered);
+          } catch (err) {
+            console.error("Search error:", err);
+          }
+        }, 300);
+      });
 
-    searchClear.addEventListener("click", () => {
-      searchInput.value = "";
-      searchClear.style.display = "none";
-      refreshAll({ preserveActiveCluster: true });
-    });
+      searchClear.addEventListener("click", () => {
+        searchInput.value = "";
+        searchClear.style.display = "none";
+        refreshAll({ preserveActiveCluster: true });
+      });
+    }
 
     // History Modal
     async function openHistoryModal() {
@@ -2783,6 +2866,11 @@
           percentText.textContent = `${pct}%`;
           fill.style.width = `${pct}%`;
 
+          const dismissBtn = document.getElementById("job-banner-dismiss-btn");
+          if (dismissBtn && data.status !== "failed" && data.status !== "error" && data.status !== "stalled") {
+            dismissBtn.style.display = "none";
+          }
+
           let stgPct = 0;
           if (typeof data.stage_progress === "number") {
             stgPct = Math.round(data.stage_progress);
@@ -2858,8 +2946,10 @@
               jobElapsedInterval = null;
             }
             setSourceButtonsDisabled(false);
+            const dismissBtn = document.getElementById("job-banner-dismiss-btn");
+            if (dismissBtn) dismissBtn.style.display = "inline-block";
             statusText.textContent = data.status === "stalled"
-              ? `Pipeline stalled: ${data.error || "No progress in >60s"}`
+              ? `Pipeline stalled: ${data.error || "No progress"}`
               : `Pipeline error: ${data.error || "Job failed"}`;
             fill.style.background = "var(--danger)";
             if (stageFill) stageFill.style.background = "var(--danger)";
@@ -3351,33 +3441,73 @@
           return;
         }
 
-        if (!data.configured) {
-          connectView.style.display = "block";
-          connectedView.style.display = "none";
-          if (btnConnect) btnConnect.disabled = true;
-          if (btnScan) btnScan.disabled = true;
-          msgEl.style.display = "block";
-          msgEl.style.color = "var(--danger)";
-          msgEl.style.background = "rgba(239, 68, 68, 0.08)";
-          msgEl.style.border = "1px solid var(--danger)";
-          msgEl.textContent = data.message || "Google Drive integration is not configured. An administrator must provide client_secret.json in the data directory.";
-          return;
+        const cfgView = document.getElementById("drive-configure-view");
+        if (cfgView && !cfgView.dataset.userOpened) {
+          cfgView.style.display = "none";
         }
+        if (btnScan) btnScan.disabled = false;
 
-        if (btnConnect) btnConnect.disabled = false;
         if (data.connected) {
           connectView.style.display = "none";
           connectedView.style.display = "flex";
           connectedUser.textContent = `Connected as ${data.email || "Google Account"}`;
-          if (btnScan) btnScan.disabled = false;
         } else {
           connectView.style.display = "block";
           connectedView.style.display = "none";
-          if (btnScan) btnScan.disabled = false;
+          if (btnConnect) {
+            btnConnect.disabled = false;
+          }
         }
       } catch (err) {
         console.error("Drive status error:", err);
       }
+    }
+
+    const btnToggleConfig = document.getElementById("btn-toggle-config");
+    if (btnToggleConfig) {
+      btnToggleConfig.addEventListener("click", () => {
+        const cfgView = document.getElementById("drive-configure-view");
+        if (cfgView) {
+          const isShown = cfgView.style.display !== "none";
+          cfgView.style.display = isShown ? "none" : "block";
+          cfgView.dataset.userOpened = isShown ? "" : "true";
+        }
+      });
+    }
+
+    const btnBrowseSecret = document.getElementById("btn-browse-secret");
+    const secretInput = document.getElementById("drive-secret-input");
+    if (btnBrowseSecret && secretInput) {
+      btnBrowseSecret.addEventListener("click", () => secretInput.click());
+      secretInput.addEventListener("change", async (e) => {
+        const file = e.target.files && e.target.files[0];
+        if (!file) return;
+        const fnSpan = document.getElementById("drive-secret-filename");
+        if (fnSpan) fnSpan.textContent = file.name;
+        btnBrowseSecret.disabled = true;
+        btnBrowseSecret.textContent = "Uploading...";
+        try {
+          const csrf = await getCsrfToken();
+          const formData = new FormData();
+          formData.append("file", file);
+          const res = await fetch("/drive/configure", {
+            method: "POST",
+            headers: { "X-CSRF-Token": csrf },
+            body: formData,
+          });
+          const resData = await res.json();
+          if (!res.ok) {
+            throw new Error(resData.detail || "Failed to configure Google Drive credentials");
+          }
+          showInlineNotice(resData.message || "Credentials configured successfully!", "success");
+          await updateDriveAuthStatus();
+        } catch (err) {
+          showInlineNotice("Configuration error: " + err.message, "error");
+        } finally {
+          btnBrowseSecret.disabled = false;
+          btnBrowseSecret.textContent = "Choose client_secret.json";
+        }
+      });
     }
 
     const btnConnectDrive = document.getElementById("btn-connect-drive");
@@ -3399,13 +3529,13 @@
           }
         } catch (err) {
           btnConnectDrive.disabled = false;
-          btnConnectDrive.textContent = "Connect Google Drive";
+          btnConnectDrive.textContent = "Sign in with Google";
           if (msgEl) {
             msgEl.style.display = "block";
-            msgEl.style.color = "var(--danger)";
-            msgEl.style.background = "rgba(239, 68, 68, 0.08)";
-            msgEl.style.border = "1px solid var(--danger)";
-            msgEl.textContent = err.message || "Failed to connect Google Drive";
+            msgEl.style.color = "var(--text)";
+            msgEl.style.background = "rgba(59, 130, 246, 0.08)";
+            msgEl.style.border = "1px solid var(--accent)";
+            msgEl.innerHTML = `<strong>Notice:</strong> ${escapeHtml(err.message)}<br><span style="font-size:0.8rem; color:var(--text-muted); margin-top:4px; display:inline-block;">Public and shared Drive links don't require sign-in — simply paste the link into the box above and click Scan!</span>`;
           }
         }
       });
@@ -3613,8 +3743,10 @@
           const stageFill = document.getElementById("job-stage-progress-fill");
           if (banner && statusText && fill) {
             banner.style.display = "block";
+            const dismissBtn = document.getElementById("job-banner-dismiss-btn");
+            if (dismissBtn) dismissBtn.style.display = "inline-block";
             statusText.textContent = data.status === "stalled"
-              ? `Pipeline stalled: ${data.error || "No progress in >60s"}`
+              ? `Pipeline stalled: ${data.error || "No progress"}`
               : `Pipeline failed: ${data.error || "Worker process is no longer running"}`;
             fill.style.background = "var(--danger)";
             if (stageFill) stageFill.style.background = "var(--danger)";
@@ -3627,6 +3759,20 @@
         console.error("Failed to check active job on load:", err);
         stopJobPolling();
       }
+    }
+
+    const bannerDismissBtn = document.getElementById("job-banner-dismiss-btn");
+    if (bannerDismissBtn) {
+      bannerDismissBtn.addEventListener("click", async () => {
+        try {
+          await fetch("/jobs/dismiss", { method: "POST" });
+        } catch (e) {
+          console.debug("Dismiss job error:", e);
+        }
+        const banner = document.getElementById("job-progress-banner");
+        if (banner) banner.style.display = "none";
+        stopJobPolling();
+      });
     }
 
     // Stop polling when page is hidden; check/resume when page becomes visible
@@ -3926,6 +4072,7 @@
         if (tabAll) tabAll.classList.add("active");
         if (dupesPanel) dupesPanel.style.display = "none";
         if (libPanel) libPanel.style.display = "flex";
+        loadLibraryCategories();
         loadLibrary(libCurrentPage);
       } else {
         if (tabAll) tabAll.classList.remove("active");
@@ -4106,6 +4253,7 @@
     const libRefreshEl = document.getElementById("lib-refresh-btn");
     if (libRefreshEl) {
       libRefreshEl.addEventListener("click", () => {
+        loadLibraryCategories();
         loadLibrary(libCurrentPage);
       });
     }

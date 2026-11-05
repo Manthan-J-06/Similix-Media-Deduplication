@@ -1133,3 +1133,169 @@ class TestDriveAdminConfig:
             st_resp = client.get("/drive/status")
             assert st_resp.status_code == 200
             assert st_resp.json()["configured"] is True
+
+
+class TestDriveFolderValidationAndHardening:
+    """Tests for Drive folder link extraction, pre-flight validation, and credential auto-refresh."""
+
+    def test_extract_drive_folder_id_variants(self):
+        from api.server import extract_drive_folder_id
+        from fastapi import HTTPException
+
+        # Root aliases
+        assert extract_drive_folder_id("root") == "root"
+        assert extract_drive_folder_id("ROOT") == "root"
+        assert extract_drive_folder_id("My Drive") == "root"
+        assert extract_drive_folder_id("mydrive") == "root"
+        assert extract_drive_folder_id("") == "root"
+
+        # Standard URLs
+        url1 = "https://drive.google.com/drive/folders/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OI"
+        assert extract_drive_folder_id(url1) == "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OI"
+
+        # URL with query params
+        url2 = "https://drive.google.com/drive/folders/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OI?usp=sharing"
+        assert extract_drive_folder_id(url2) == "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OI"
+
+        # URL with user index
+        url3 = "https://drive.google.com/drive/u/2/folders/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OI"
+        assert extract_drive_folder_id(url3) == "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OI"
+
+        # Open link with id parameter
+        url4 = "https://drive.google.com/open?id=1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OI"
+        assert extract_drive_folder_id(url4) == "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OI"
+
+        # Raw valid ID
+        raw_id = "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OI"
+        assert extract_drive_folder_id(raw_id) == raw_id
+
+        # Invalid URLs/IDs
+        with pytest.raises(HTTPException) as exc:
+            extract_drive_folder_id("https://drive.google.com/invalid/link")
+        assert exc.value.status_code == 400
+
+        with pytest.raises(HTTPException) as exc:
+            extract_drive_folder_id("not-a-valid-id-***")
+        assert exc.value.status_code == 400
+
+    def test_drive_credentials_auto_refresh_on_expired(self, tmp_path: Path):
+        from sources.google_drive import GoogleDriveSource
+        tok_file = tmp_path / "drive_token.json"
+        tok_file.write_text(json.dumps({"token": "old_token", "refresh_token": "ref123"}))
+
+        class MockCreds:
+            def __init__(self):
+                self.expired = True
+                self.refresh_token = "ref123"
+                self.token = "old_token"
+                self.refreshed = False
+
+            def refresh(self, request):
+                self.refreshed = True
+                self.expired = False
+                self.token = "new_refreshed_token"
+
+            def to_json(self):
+                return json.dumps({"token": self.token, "refresh_token": self.refresh_token})
+
+        mock_creds = MockCreds()
+        source = GoogleDriveSource(token_path=tok_file, credentials=mock_creds)
+        assert mock_creds.refreshed is False
+
+        # Access property -> triggers auto-refresh
+        active_creds = source.credentials
+        assert mock_creds.refreshed is True
+        assert active_creds.token == "new_refreshed_token"
+        assert "new_refreshed_token" in tok_file.read_text()
+
+    def test_validate_drive_endpoint_flow(self, tmp_path: Path, monkeypatch):
+        from fastapi.testclient import TestClient
+        from api.server import create_app
+        from core.config import load_config
+        from unittest.mock import MagicMock
+
+        cfg = load_config()
+        data_dir = tmp_path / "argus_data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+
+        with patch.dict(os.environ, {"ARGUS_DATA_DIR": str(data_dir), "SECRET_KEY": "testsecretkey12345678901234567890"}):
+            app = create_app(config=cfg)
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            client.post("/auth/register", json={"email": "val_test@example.com", "password": "TestPass123!"})
+            login = client.post("/auth/login", json={"email": "val_test@example.com", "password": "TestPass123!"})
+            login_data = login.json()
+            token = login_data.get("token")
+            csrf = login_data.get("csrf_token")
+            if token:
+                client.cookies.set("argus_session", token)
+            if csrf:
+                client.headers["X-CSRF-Token"] = csrf
+
+            # 1. Not connected yet
+            val_unauthed = client.get("/sources/drive/validate?link=root")
+            assert val_unauthed.status_code == 200
+            assert val_unauthed.json()["valid"] is False
+            assert val_unauthed.json()["error"] == "not_authenticated"
+
+            # 2. Connect token
+            tok_file = data_dir / "users" / "1" / "drive_token.json"
+            tok_file.parent.mkdir(parents=True, exist_ok=True)
+            tok_file.write_text(json.dumps({
+                "token": "valid_token",
+                "refresh_token": "valid_refresh",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "client_id": "test_client_id",
+                "client_secret": "test_client_secret",
+                "scopes": ["https://www.googleapis.com/auth/drive.readonly"],
+                "expiry": "2099-01-01T00:00:00Z",
+            }))
+
+            class DummyValidCreds:
+                valid = True
+                expired = False
+                token = "valid_token"
+                refresh_token = "valid_refresh"
+
+            monkeypatch.setattr("sources.google_drive.get_drive_credentials", lambda *args, **kwargs: DummyValidCreds())
+
+            # Mock get_drive_service
+            mock_service = MagicMock()
+            mock_files = MagicMock()
+            mock_get = MagicMock()
+            mock_get.execute.return_value = {
+                "id": "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OI",
+                "name": "My Holiday Photos",
+                "mimeType": "application/vnd.google-apps.folder",
+                "trashed": False,
+            }
+            mock_files.get.return_value = mock_get
+            mock_service.files.return_value = mock_files
+
+            monkeypatch.setattr("sources.google_drive.get_drive_service", lambda *args, **kwargs: mock_service)
+
+            # 3. Validate root folder
+            val_root = client.get("/sources/drive/validate?link=root")
+            assert val_root.status_code == 200
+            assert val_root.json()["valid"] is True
+            assert val_root.json()["folder_id"] == "root"
+
+            # 4. Validate specific folder via GET
+            val_folder = client.get("/sources/drive/validate?link=1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OI")
+            assert val_folder.status_code == 200
+            assert val_folder.json()["valid"] is True
+            assert val_folder.json()["folder_name"] == "My Holiday Photos"
+
+            # 5. Validate specific folder via POST
+            val_post = client.post("/sources/drive/validate", json={"link": "https://drive.google.com/drive/folders/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OI"})
+            assert val_post.status_code == 200
+            assert val_post.json()["valid"] is True
+            assert val_post.json()["folder_name"] == "My Holiday Photos"
+
+            # 6. Pre-flight rejection on trashed folder
+            mock_get.execute.return_value["trashed"] = True
+            val_trashed = client.get("/sources/drive/validate?link=1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OI")
+            assert val_trashed.status_code == 200
+            assert val_trashed.json()["valid"] is False
+            assert val_trashed.json()["error"] == "folder_trashed"
+

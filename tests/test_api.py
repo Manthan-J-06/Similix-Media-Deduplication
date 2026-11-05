@@ -274,6 +274,41 @@ class TestAPIServer:
         sort_data = res_sorted.json()
         assert sort_data[0]["member_count"] >= sort_data[1]["member_count"]
 
+    def test_clusters_pagination(self, api_test_env):
+        """GET /clusters supports limit, offset, page, and paginated wrapped responses."""
+        client = api_test_env["client"]
+
+        # 1. Limit=1 returns exactly 1 item and sets pagination headers
+        res_lim1 = client.get("/clusters?limit=1&offset=0")
+        assert res_lim1.status_code == 200
+        data1 = res_lim1.json()
+        assert isinstance(data1, list)
+        assert len(data1) == 1
+        assert res_lim1.headers["X-Total-Clusters"] == "2"
+        assert res_lim1.headers["X-Total-Pages"] == "2"
+        assert res_lim1.headers["X-Current-Page"] == "1"
+        assert res_lim1.headers["X-Has-Next"] == "true"
+
+        # 2. Page 2 with page_size=1
+        res_p2 = client.get("/clusters?page=2&page_size=1")
+        assert res_p2.status_code == 200
+        data2 = res_p2.json()
+        assert len(data2) == 1
+        assert data2[0]["id"] != data1[0]["id"]
+        assert res_p2.headers["X-Current-Page"] == "2"
+        assert res_p2.headers["X-Has-Next"] == "false"
+
+        # 3. paginated=true envelope returns structured JSON
+        res_envelope = client.get("/clusters?paginated=true&page=1&page_size=1")
+        assert res_envelope.status_code == 200
+        env = res_envelope.json()
+        assert env["total"] == 2
+        assert env["total_pages"] == 2
+        assert env["page"] == 1
+        assert env["page_size"] == 1
+        assert env["has_next"] is True
+        assert len(env["items"]) == 1
+
     def test_cluster_detail(self, api_test_env):
         """GET /clusters/{id} returns live keeper, member metrics, match_pct, res_pct."""
         client = api_test_env["client"]
@@ -1294,6 +1329,12 @@ class TestAPIServer:
         assert resp_none.status_code == 200
         assert resp_none.json() == {"active": False}
 
+        # Test POST /jobs/dismiss removes completed or stalled job files
+        resp_dismiss = client.post("/jobs/dismiss")
+        assert resp_dismiss.status_code == 200
+        assert resp_dismiss.json()["ok"] is True
+        assert not job_file.exists()
+
     def test_ui_smoke_no_jobs_undefined_request(self, api_test_env):
         """
         Requirement 4:
@@ -1907,6 +1948,17 @@ class TestPipelineResumable:
 
         res_land = client.get("/library?category=landscape")
         assert res_land.status_code == 200
+        assert res_land.json()["total"] == 3
+
+        # Library categories endpoint
+        res_lib_cats = client.get("/library/categories")
+        assert res_lib_cats.status_code == 200
+        lib_cats = res_lib_cats.json()
+        assert "landscape" in lib_cats
+        assert "animal" in lib_cats
+        assert "mixed" not in lib_cats  # Images are never 'mixed'
+        assert lib_cats["animal"] == 1
+        assert lib_cats["landscape"] == 3
         assert res_land.json()["total"] == 3
 
     def test_download_cluster_selected_and_keepers(self, api_test_env):

@@ -16,14 +16,14 @@ def get_connection(db_path: str | Path) -> sqlite3.Connection:
     """
     Open a SQLite connection with sensible defaults:
     - WAL journal mode  → concurrent reads during writes
-    - 10-second busy timeout for concurrent read/write tolerance
+    - 60-second busy timeout for concurrent read/write tolerance
     - Foreign key enforcement
     - Row factory       → rows accessible as dicts / by column name
     """
-    conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=10.0)
+    conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=60.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=10000;")
+    conn.execute("PRAGMA busy_timeout=60000;")
     conn.execute("PRAGMA foreign_keys=ON;")
     conn.execute("PRAGMA synchronous=NORMAL;")  # safe with WAL, faster than FULL
     return conn

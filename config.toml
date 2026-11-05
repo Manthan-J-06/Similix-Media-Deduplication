@@ -12,6 +12,8 @@ batch_size = 500
 db_path = "similix.db"
 # Directory where thumbnail cache is stored.
 thumbnail_cache_dir = "thumbnails/"
+# Maximum time (seconds) of zero pipeline progress before flagging as stalled (default 15 minutes).
+stall_timeout_seconds = 900.0
 
 # ── Stage 0: Exact duplicate detection ───────────────────────────────────────
 [stage0]
@@ -34,10 +36,10 @@ hamming_threshold = 8
 clip_model = "ViT-B-32"
 # Pretrained weights: "laion2b_s34b_b79k" (permissively licensed under MIT).
 clip_pretrained = "laion2b_s34b_b79k"
-# Embedding batch size (default 32). Memory is freed between batches.
-batch_size = 32
-# Also store embeddings for 90/180/270 degree rotated thumbnails (default: true).
-enable_rotation_embeddings = true
+# Embedding batch size (default 64). Memory is freed between batches.
+batch_size = 64
+# Also store embeddings for 90/180/270 degree rotated thumbnails (default: false for speed).
+enable_rotation_embeddings = false
 # Cosine-similarity threshold to accept a candidate pair.
 cosine_threshold = 0.90
 # Number of neighbours to retrieve per query.
@@ -47,7 +49,7 @@ faiss_k = 20
 [stage3]
 # Feature detector algorithm: "sift" (patent expired, Apache 2.0) or "orb".
 algorithm = "sift"
-# Maximum number of keypoint features to extract per image proxy.
+# Maximum number of keypoint features to extract per image proxy (2000 per spec).
 max_features = 2000
 # Minimum keypoints required on each image. Below this, verdict is 'inconclusive'.
 min_keypoints = 100
@@ -97,20 +99,20 @@ allow_blur_flag = false
 allow_resolution_loss = false
 
 [keeper.modes.balanced]
-ssim_gray = 0.98
-ssim_color = 0.97
-pixel_ratio_floor = 0.60
-min_saving_ratio = 0.30
+ssim_gray = 0.92
+ssim_color = 0.90
+pixel_ratio_floor = 0.50
+min_saving_ratio = 0.15
 allow_blur_flag = false
-allow_resolution_loss = false
+allow_resolution_loss = true
 
 [keeper.modes.aggressive]
-ssim_gray = 0.95
-ssim_color = 0.94
-pixel_ratio_floor = 0.25
-min_saving_ratio = 0.30
+ssim_gray = 0.82
+ssim_color = 0.80
+pixel_ratio_floor = 0.15
+min_saving_ratio = 0.05
 allow_blur_flag = true
-allow_resolution_loss = false
+allow_resolution_loss = true
 
 # ── Semantic categorization & zero-shot classification (core/categories.py) ──
 [categories]
@@ -439,6 +441,27 @@ map = [
     "a picture of a printed navigational map, street map, or atlas",
     "a detailed geographic map showing borders, topography, or streets",
     "a visual cartography map with roads, contours, and geographical features",
+]
+"plants & flora" = [
+    "a photo of plants, plant leaves, trees, or vegetation",
+    "a botanical photo of green plants, leaves, or flora",
+    "a close-up photograph of plant foliage or botany",
+    "a picture of agricultural plants, crops, or vegetation",
+    "a natural botanical picture of plants and greenery",
+]
+"agriculture & crops" = [
+    "a photo of agricultural crops, grain, or farm fields",
+    "a photograph of farming crops, cultivated plants, or harvest",
+    "a picture of agricultural fields, ears of grain, or harvest",
+    "a close-up picture of crop plants or farm produce",
+    "an agricultural photography shot of crops in the field",
+]
+"science & biology" = [
+    "a scientific photo of biological specimens, samples, or botany",
+    "a close-up scientific or laboratory photo of specimens",
+    "a photograph of diseased plant leaves, fungus, or biology",
+    "a scientific study photograph of plant pathology or specimens",
+    "a macro photo of biological textures or plant pathology",
 ]
 
 # ── Deletion ledger & trash (core/ledger.py) ──────────────────────────────────
