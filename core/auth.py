@@ -24,7 +24,10 @@ import threading
 import time
 from typing import Any, Callable
 
-import bcrypt
+try:
+    import bcrypt
+except ImportError:
+    bcrypt = None
 from fastapi import HTTPException
 
 # Thread lock for synchronizing operations on shared sqlite3 auth connection
@@ -91,22 +94,34 @@ def init_auth_db(db_path: Path | str) -> sqlite3.Connection:
 
 
 def hash_password(password: str) -> str:
-    """Hash password using bcrypt with salt rounds=12."""
+    """Hash password using bcrypt (or standard PBKDF2 fallback if bcrypt unavailable)."""
     if len(password) < MIN_PASSWORD_LENGTH:
         raise HTTPException(
             status_code=400,
             detail=f"Password must be at least {MIN_PASSWORD_LENGTH} characters long",
         )
-    salt = bcrypt.gensalt(rounds=12)
-    return bcrypt.hashpw(password.encode("utf-8"), salt).decode("utf-8")
+    if bcrypt is not None:
+        salt = bcrypt.gensalt(rounds=12)
+        return bcrypt.hashpw(password.encode("utf-8"), salt).decode("utf-8")
+    salt = secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 100_000)
+    return f"pbkdf2_sha256${salt}${dk.hex()}"
 
 
 def verify_password(password: str, hashed_password: str) -> bool:
-    """Constant-time password verification via bcrypt."""
+    """Constant-time password verification supporting bcrypt and PBKDF2."""
     try:
-        return bcrypt.checkpw(password.encode("utf-8"), hashed_password.encode("utf-8"))
+        if hashed_password.startswith("pbkdf2_sha256$"):
+            parts = hashed_password.split("$")
+            if len(parts) == 3:
+                salt, expected_hex = parts[1], parts[2]
+                dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 100_000)
+                return secrets.compare_digest(dk.hex(), expected_hex)
+        if bcrypt is not None:
+            return bcrypt.checkpw(password.encode("utf-8"), hashed_password.encode("utf-8"))
     except Exception:
         return False
+    return False
 
 
 def hash_token(raw_token: str) -> str:
