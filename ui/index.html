@@ -983,7 +983,6 @@
     </div>
 
     <div class="header-actions">
-      <button type="button" class="btn btn-primary" id="btn-scan-library" style="display: none; background: #22c55e; border-color: #16a34a; font-weight: 600; box-shadow: 0 0 10px rgba(34,197,94,0.35);">🚀 Scan Library (<span id="lib-photo-count">0</span> photos)</button>
       <button type="button" class="btn" id="btn-rescan">🔄 Rescan</button>
       <button type="button" class="btn btn-primary" id="btn-open-sources">➕ Add Sources</button>
       <button type="button" class="btn" id="btn-open-history">📜 History</button>
@@ -1259,7 +1258,6 @@
           <button type="button" class="source-tab-btn" data-tab="tab-zip" id="tab-btn-zip">Upload ZIP</button>
           <button type="button" class="source-tab-btn" data-tab="tab-drive">Google Drive</button>
           <button type="button" class="source-tab-btn" data-tab="tab-dataset">Dataset URL</button>
-          <button type="button" class="source-tab-btn" data-tab="tab-library" id="tab-btn-library">📁 Server Library</button>
         </div>
 
         <!-- Tab 1: Upload Files -->
@@ -1383,20 +1381,6 @@
           <input type="text" id="dataset-url-input" class="search-input" style="width:100%; box-sizing:border-box;" placeholder="https://huggingface.co/...">
           <div style="font-size:0.8rem; color:var(--text-muted); margin-top:6px;">Accepts image files or zip archives (max 500 MB, 1000 files).</div>
           <button type="button" class="btn btn-primary" id="btn-import-dataset" style="margin-top:12px; width:100%;">Import Dataset</button>
-        </div>
-
-        <!-- Tab 6: Server Library -->
-        <div id="tab-library" class="source-tab-pane" style="display:none;">
-          <div style="padding:24px 16px; border-radius:8px; background:rgba(34,197,94,0.06); border:1px solid rgba(34,197,94,0.25); text-align:center;">
-            <div style="font-size:36px; margin-bottom:8px;">📁</div>
-            <div style="font-weight:600; font-size:1.05rem; margin-bottom:6px;">Pre-Loaded Server Library</div>
-            <div style="font-size:0.85rem; color:var(--text-muted); margin-bottom:16px;">
-              Ready to process directly on GPU: <strong id="modal-library-count-display" style="color:var(--text);">0</strong> images detected
-            </div>
-            <button type="button" class="btn btn-primary" id="btn-modal-scan-library" style="width:100%; padding:10px 16px; font-weight:600; background:#22c55e; border-color:#16a34a;">
-              🚀 Run GPU Pipeline on Library
-            </button>
-          </div>
         </div>
 
         <div id="source-status-msg" style="display:none; padding:8px 12px; border-radius:6px; font-size:0.82rem;"></div>
@@ -2720,8 +2704,6 @@
     function setSourceButtonsDisabled(disabled) {
       const btnSources = document.getElementById("btn-open-sources");
       const btnRescan = document.getElementById("btn-rescan");
-      const btnScanLib = document.getElementById("btn-scan-library");
-      const btnModalScanLib = document.getElementById("btn-modal-scan-library");
       if (btnSources) {
         btnSources.disabled = disabled;
         btnSources.style.opacity = disabled ? "0.5" : "1.0";
@@ -2733,18 +2715,6 @@
         btnRescan.style.opacity = disabled ? "0.5" : "1.0";
         btnRescan.style.cursor = disabled ? "not-allowed" : "pointer";
         btnRescan.title = disabled ? "Pipeline job is currently running..." : "";
-      }
-      if (btnScanLib) {
-        btnScanLib.disabled = disabled;
-        btnScanLib.style.opacity = disabled ? "0.5" : "1.0";
-        btnScanLib.style.cursor = disabled ? "not-allowed" : "pointer";
-        btnScanLib.title = disabled ? "Pipeline job is currently running..." : "";
-      }
-      if (btnModalScanLib) {
-        btnModalScanLib.disabled = disabled;
-        btnModalScanLib.style.opacity = disabled ? "0.5" : "1.0";
-        btnModalScanLib.style.cursor = disabled ? "not-allowed" : "pointer";
-        btnModalScanLib.title = disabled ? "Pipeline job is currently running..." : "";
       }
     }
 
@@ -2959,7 +2929,6 @@
             const catFilter = document.getElementById("category-filter");
             if (catFilter) catFilter.value = "";
             await refreshAll({ preserveActiveCluster: true });
-            checkLibraryInfo();
 
             setTimeout(() => {
               banner.style.display = "none";
@@ -3013,7 +2982,6 @@
       sourcesModal.style.display = "flex";
       document.getElementById("source-status-msg").style.display = "none";
       updateDriveAuthStatus();
-      checkLibraryInfo();
     });
     document.getElementById("btn-close-sources").addEventListener("click", () => {
       sourcesModal.style.display = "none";
@@ -3756,66 +3724,6 @@
       }
     });
 
-    // Server Library scanning logic
-    async function checkLibraryInfo() {
-      try {
-        const res = await fetch("/sources/library-info");
-        if (!res.ok) return;
-        const data = await res.json();
-        const scanBtn = document.getElementById("btn-scan-library");
-        const countSpan = document.getElementById("lib-photo-count");
-        const modalCount = document.getElementById("modal-library-count-display");
-        if (modalCount && data.file_count !== undefined) {
-          modalCount.textContent = data.file_count.toLocaleString();
-        }
-        if (scanBtn && countSpan && data.file_count > 0 && data.needs_scan) {
-          countSpan.textContent = data.file_count.toLocaleString();
-          scanBtn.style.display = "inline-flex";
-        } else if (scanBtn) {
-          scanBtn.style.display = "none";
-        }
-      } catch (e) {
-        console.warn("Failed to check library info:", e);
-      }
-    }
-
-    async function triggerLibraryScan() {
-      const btn = document.getElementById("btn-scan-library");
-      const modalBtn = document.getElementById("btn-modal-scan-library");
-      if (btn) btn.disabled = true;
-      if (modalBtn) modalBtn.disabled = true;
-      try {
-        const csrf = await getCsrfToken();
-        const res = await fetch("/sources/scan-library", {
-          method: "POST",
-          headers: { "X-CSRF-Token": csrf },
-        });
-        if (!res.ok) {
-          const err = await res.json().catch(() => ({}));
-          throw new Error(err.detail || "Library scan failed");
-        }
-        const data = await res.json();
-        const sourcesModal = document.getElementById("sources-modal");
-        if (sourcesModal) sourcesModal.style.display = "none";
-        if (btn) btn.style.display = "none";
-        refreshAll({ preserveActiveCluster: true });
-        if (data && typeof data.job_id === "string" && data.job_id.trim()) {
-          pollJobProgress(data.job_id);
-        }
-      } catch (err) {
-        showInlineNotice("Scan error: " + (err.message || err), "error");
-      } finally {
-        if (btn) btn.disabled = false;
-        if (modalBtn) modalBtn.disabled = false;
-      }
-    }
-
-    const btnScanLib = document.getElementById("btn-scan-library");
-    if (btnScanLib) btnScanLib.addEventListener("click", triggerLibraryScan);
-
-    const btnModalScanLib = document.getElementById("btn-modal-scan-library");
-    if (btnModalScanLib) btnModalScanLib.addEventListener("click", triggerLibraryScan);
-
     // Check if a background job is already running on page load (survives reload)
     async function checkActiveJob() {
       try {
@@ -4359,7 +4267,6 @@
       if (authenticated) {
         refreshAll();
         checkActiveJob();
-        checkLibraryInfo();
       }
     });
   </script>
