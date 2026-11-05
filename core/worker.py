@@ -382,6 +382,10 @@ def run_pipeline(
         else:
             from sources.local_folder import LocalFolderSource
             scan_dir = Path(folder or cfg.get("sources", {}).get("library_dir", resolve_data_dir() / "library")).expanduser().resolve()
+            if not (scan_dir.is_dir() and any(scan_dir.iterdir())):
+                shared_lib = resolve_data_dir() / "library"
+                if shared_lib.is_dir() and any(shared_lib.iterdir()):
+                    scan_dir = shared_lib.resolve()
             source_active = LocalFolderSource(scan_dir)
             files = list(source_active.list_files())
             total_files = len(files)

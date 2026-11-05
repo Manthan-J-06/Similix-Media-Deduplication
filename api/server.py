@@ -4034,11 +4034,25 @@ def create_app(
                         drive_folder_id = st["drive_folder_id"]
                         break
 
+        target_folder = user.library_dir
+        if not (target_folder.is_dir() and any(target_folder.iterdir())):
+            shared_lib = request.app.state.data_root / "library"
+            if shared_lib.is_dir() and any(shared_lib.iterdir()):
+                target_folder.mkdir(parents=True, exist_ok=True)
+                for f in shared_lib.iterdir():
+                    if f.is_file() and not f.name.startswith("."):
+                        target_f = target_folder / f.name
+                        if not target_f.exists():
+                            try:
+                                target_f.symlink_to(f)
+                            except Exception:
+                                shutil.copy2(f, target_f)
+
         job_id = launch_pipeline_job(
             request.app,
             user=user,
             source_type=source_type,
-            folder=user.library_dir,
+            folder=target_folder,
             drive_folder_id=drive_folder_id,
         )
         return {
