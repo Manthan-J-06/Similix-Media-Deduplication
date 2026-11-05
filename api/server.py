@@ -4013,6 +4013,74 @@ def create_app(
             if tmp_download_path.exists():
                 tmp_download_path.unlink(missing_ok=True)
 
+    def _sync_user_library_from_shared(request: Request, user: UserContext) -> tuple[Path, int]:
+        from sources.local_folder import DEFAULT_EXTENSIONS
+        target_folder = user.library_dir
+        target_folder.mkdir(parents=True, exist_ok=True)
+        local_files = [f for f in target_folder.rglob("*") if f.is_file() and f.suffix.lower() in DEFAULT_EXTENSIONS and not f.name.startswith(".")]
+        if not local_files:
+            candidates = [
+                getattr(request.app.state, "data_root", resolve_data_dir()) / "library",
+                Path("/content/ARGUS-Media-Deduplication/.similix/library"),
+                Path.cwd() / ".similix" / "library",
+            ]
+            for shared_lib in candidates:
+                if shared_lib.is_dir():
+                    shared_images = [f for f in shared_lib.rglob("*") if f.is_file() and f.suffix.lower() in DEFAULT_EXTENSIONS and not f.name.startswith(".")]
+                    if shared_images:
+                        for f in shared_images:
+                            target_f = target_folder / f.name
+                            if not target_f.exists():
+                                try:
+                                    target_f.symlink_to(f)
+                                except Exception:
+                                    try:
+                                        shutil.copy2(f, target_f)
+                                    except Exception:
+                                        pass
+                        break
+            local_files = [f for f in target_folder.rglob("*") if f.is_file() and f.suffix.lower() in DEFAULT_EXTENSIONS and not f.name.startswith(".")]
+        return target_folder, len(local_files)
+
+    @app.get("/sources/library-info")
+    def get_library_info(
+        request: Request = None,
+        user: UserContext = Depends(get_current_user),
+        conn: sqlite3.Connection = Depends(get_db),
+    ) -> dict[str, Any]:
+        """Return counts of image files in user's library and database."""
+        target_folder, count = _sync_user_library_from_shared(request, user)
+        indexed_count = conn.execute("SELECT COUNT(*) FROM images WHERE status != 'trashed' OR status IS NULL").fetchone()[0]
+        return {
+            "file_count": count,
+            "indexed_count": indexed_count,
+            "folder_path": str(target_folder),
+            "needs_scan": count > indexed_count or indexed_count == 0,
+        }
+
+    @app.post("/sources/scan-library")
+    def scan_user_library(
+        request: Request = None,
+        user: UserContext = Depends(get_current_user),
+        conn: sqlite3.Connection = Depends(get_db),
+    ) -> dict[str, Any]:
+        """Trigger local deduplication pipeline directly on user's library directory."""
+        target_folder, count = _sync_user_library_from_shared(request, user)
+        if count == 0:
+            raise HTTPException(status_code=400, detail="No images found in library to scan.")
+        job_id = launch_pipeline_job(
+            request.app,
+            user=user,
+            source_type="local",
+            folder=target_folder,
+        )
+        return {
+            "job_id": job_id,
+            "status": "queued",
+            "file_count": count,
+            "source_type": "local",
+        }
+
     @app.post("/sources/rescan")
     def rescan_sources(
         request: Request = None,
@@ -4020,33 +4088,23 @@ def create_app(
         conn: sqlite3.Connection = Depends(get_db),
     ) -> dict[str, Any]:
         """Re-run the deduplication pipeline on existing user sources."""
-        has_gdrive = conn.execute("SELECT 1 FROM images WHERE source = 'gdrive' LIMIT 1").fetchone() is not None
-        source_type = "drive" if has_gdrive else "local"
+        target_folder, local_count = _sync_user_library_from_shared(request, user)
         drive_folder_id = None
-        if has_gdrive:
-            saved_fid_file = user.root / "drive_folder_id.txt"
-            if saved_fid_file.exists():
-                drive_folder_id = saved_fid_file.read_text(encoding="utf-8").strip() or None
-            if not drive_folder_id and user.jobs_dir.is_dir():
-                for jf in sorted(user.jobs_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
-                    st = read_job_state(jf) or {}
-                    if st.get("drive_folder_id"):
-                        drive_folder_id = st["drive_folder_id"]
-                        break
-
-        target_folder = user.library_dir
-        if not (target_folder.is_dir() and any(target_folder.iterdir())):
-            shared_lib = request.app.state.data_root / "library"
-            if shared_lib.is_dir() and any(shared_lib.iterdir()):
-                target_folder.mkdir(parents=True, exist_ok=True)
-                for f in shared_lib.iterdir():
-                    if f.is_file() and not f.name.startswith("."):
-                        target_f = target_folder / f.name
-                        if not target_f.exists():
-                            try:
-                                target_f.symlink_to(f)
-                            except Exception:
-                                shutil.copy2(f, target_f)
+        if local_count > 0:
+            source_type = "local"
+        else:
+            has_gdrive = conn.execute("SELECT 1 FROM images WHERE source = 'gdrive' LIMIT 1").fetchone() is not None
+            source_type = "drive" if has_gdrive else "local"
+            if has_gdrive:
+                saved_fid_file = user.root / "drive_folder_id.txt"
+                if saved_fid_file.exists():
+                    drive_folder_id = saved_fid_file.read_text(encoding="utf-8").strip() or None
+                if not drive_folder_id and user.jobs_dir.is_dir():
+                    for jf in sorted(user.jobs_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+                        st = read_job_state(jf) or {}
+                        if st.get("drive_folder_id"):
+                            drive_folder_id = st["drive_folder_id"]
+                            break
 
         job_id = launch_pipeline_job(
             request.app,

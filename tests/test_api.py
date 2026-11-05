@@ -1171,6 +1171,16 @@ class TestAPIServer:
         assert resp_job.status_code == 200
         assert len(deletion_called) == 0
 
+    def test_library_info_and_scan_endpoints(self, api_test_env):
+        """Test GET /sources/library-info and POST /sources/scan-library."""
+        client = api_test_env["client"]
+        res_info = client.get("/sources/library-info")
+        assert res_info.status_code == 200
+        data = res_info.json()
+        assert "file_count" in data
+        assert "indexed_count" in data
+        assert "needs_scan" in data
+
     def test_categories_empty_shows_not_categorized_yet(self, tmp_path):
         """
         C.7: In the category filter, show 'Not categorized yet' when the DB has no category rows.
