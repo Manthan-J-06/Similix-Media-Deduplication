@@ -1006,6 +1006,7 @@
       <div style="display: flex; gap: 12px; align-items: center;">
         <span id="job-elapsed-text" style="color: var(--text-muted); font-size: 12px;">Elapsed: 0s</span>
         <span id="job-percent-text" style="color: var(--text-muted); font-size: 12px; font-weight: 600;">0%</span>
+        <button type="button" class="btn btn-secondary btn-sm" id="job-banner-cancel-btn" style="display:none; padding: 2px 8px; font-size: 11px; color: var(--danger); border-color: var(--danger-border); background: var(--danger-bg); cursor: pointer;">⏹ Stop</button>
         <button type="button" class="btn btn-secondary btn-sm" id="job-banner-dismiss-btn" style="display:none; padding: 2px 8px; font-size: 11px;">Dismiss</button>
       </div>
     </div>
@@ -2867,7 +2868,11 @@
           fill.style.width = `${pct}%`;
 
           const dismissBtn = document.getElementById("job-banner-dismiss-btn");
-          if (dismissBtn && data.status !== "failed" && data.status !== "error" && data.status !== "stalled") {
+          const cancelBtn = document.getElementById("job-banner-cancel-btn");
+          if (cancelBtn) {
+            cancelBtn.style.display = (data.status === "running" || data.status === "queued") ? "inline-block" : "none";
+          }
+          if (dismissBtn && data.status !== "failed" && data.status !== "error" && data.status !== "stalled" && data.status !== "canceled") {
             dismissBtn.style.display = "none";
           }
 
@@ -2935,7 +2940,7 @@
               if (summaryDetails) summaryDetails.style.display = "none";
             }, 5000);
             return;
-          } else if (data.status === "failed" || data.status === "error" || data.status === "stalled") {
+          } else if (data.status === "failed" || data.status === "error" || data.status === "stalled" || data.status === "canceled") {
             currentPollingJobId = null;
             if (activeJobPollTimeout) {
               clearTimeout(activeJobPollTimeout);
@@ -2948,11 +2953,19 @@
             setSourceButtonsDisabled(false);
             const dismissBtn = document.getElementById("job-banner-dismiss-btn");
             if (dismissBtn) dismissBtn.style.display = "inline-block";
-            statusText.textContent = data.status === "stalled"
-              ? `Pipeline stalled: ${data.error || "No progress"}`
-              : `Pipeline error: ${data.error || "Job failed"}`;
-            fill.style.background = "var(--danger)";
-            if (stageFill) stageFill.style.background = "var(--danger)";
+            const cancelBtn = document.getElementById("job-banner-cancel-btn");
+            if (cancelBtn) cancelBtn.style.display = "none";
+            if (data.status === "canceled") {
+              statusText.textContent = data.message || "Pipeline stopped by user.";
+              fill.style.background = "#eab308";
+              if (stageFill) stageFill.style.background = "#eab308";
+            } else {
+              statusText.textContent = data.status === "stalled"
+                ? `Pipeline stalled: ${data.error || "No progress"}`
+                : `Pipeline error: ${data.error || "Job failed"}`;
+              fill.style.background = "var(--danger)";
+              if (stageFill) stageFill.style.background = "var(--danger)";
+            }
             return;
           }
         } catch (err) {
@@ -3759,6 +3772,34 @@
         console.error("Failed to check active job on load:", err);
         stopJobPolling();
       }
+    }
+
+    const bannerCancelBtn = document.getElementById("job-banner-cancel-btn");
+    if (bannerCancelBtn) {
+      bannerCancelBtn.addEventListener("click", async () => {
+        if (!confirm("Are you sure you want to stop this pipeline job?")) return;
+        bannerCancelBtn.disabled = true;
+        try {
+          const csrf = await getCsrfToken();
+          await fetch("/jobs/cancel-active", {
+            method: "POST",
+            headers: { "X-CSRF-Token": csrf },
+          });
+          const statusText = document.getElementById("job-status-text");
+          if (statusText) statusText.textContent = "Pipeline stopped by user.";
+          const fill = document.getElementById("job-progress-fill");
+          if (fill) fill.style.background = "#eab308";
+          const dismissBtn = document.getElementById("job-banner-dismiss-btn");
+          if (dismissBtn) dismissBtn.style.display = "inline-block";
+          bannerCancelBtn.style.display = "none";
+          setSourceButtonsDisabled(false);
+          refreshAll({ preserveActiveCluster: true });
+        } catch (e) {
+          showInlineNotice("Stop error: " + (e.message || e), "error");
+        } finally {
+          bannerCancelBtn.disabled = false;
+        }
+      });
     }
 
     const bannerDismissBtn = document.getElementById("job-banner-dismiss-btn");

@@ -1232,7 +1232,9 @@ def create_app(
         response: Response,
         user: UserContext = Depends(get_current_user),
     ):
-        """Invalidate session in auth.db and clear auth cookies."""
+        """Invalidate session in auth.db, stop running user jobs, and clear auth cookies."""
+        if user and user.jobs_dir:
+            stop_user_jobs(request.app, user.id, user.jobs_dir)
         token = request.cookies.get("similix_session") or request.cookies.get("argus_session")
         if not token:
             auth_h = request.headers.get("Authorization", "")
@@ -4244,13 +4246,58 @@ def create_app(
         if jobs_dir.is_dir():
             for jf in jobs_dir.glob("*.json"):
                 state = read_job_state(jf)
-                if state and state.get("status") in ("failed", "stalled", "completed", "error"):
+                if state and state.get("status") in ("failed", "stalled", "completed", "error", "canceled"):
                     try:
                         jf.unlink(missing_ok=True)
                         count += 1
                     except Exception:
                         pass
         return {"ok": True, "dismissed": count}
+
+    @app.post("/jobs/cancel-active")
+    @app.post("/jobs/{job_id}/cancel")
+    def cancel_job_endpoint(
+        job_id: str | None = None,
+        request: Request = None,
+        user: UserContext = Depends(get_current_user),
+    ) -> dict[str, Any]:
+        """Cancel an active or queued pipeline job for the user."""
+        jobs_dir = user.jobs_dir
+        canceled_any = False
+        with request.app.state.job_queue_lock:
+            job_files = []
+            if job_id:
+                jf = jobs_dir / f"{job_id}.json"
+                if jf.exists():
+                    job_files.append(jf)
+            elif jobs_dir.is_dir():
+                for jf in jobs_dir.glob("*.json"):
+                    st = read_job_state(jf)
+                    if st and st.get("status") in ("running", "queued"):
+                        job_files.append(jf)
+
+            for jf in job_files:
+                st = read_job_state(jf) or {}
+                pid = st.get("pid")
+                if pid:
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except OSError:
+                        pass
+                st["status"] = "canceled"
+                st["stage"] = "canceled"
+                st["stage_display"] = "Canceled"
+                st["message"] = "Job stopped by user"
+                st["updated_at"] = time.time()
+                write_job_state(jf, st)
+                jid = st.get("id") or jf.stem
+                if jid in request.app.state.jobs:
+                    request.app.state.jobs[jid] = st
+                canceled_any = True
+
+            maybe_start_next_queued_job(request.app)
+
+        return {"ok": True, "canceled": canceled_any}
 
     return app
 
