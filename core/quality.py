@@ -1574,12 +1574,10 @@ def _evaluate_cluster_worker(
             )
         )
 
-        # Impostor or unalignable pruning: if an image cannot be geometrically aligned to reference
-        # (unalignable / match_pct is None) or match_pct < min_cluster_match_pct, prune it from cluster!
-        is_unalignable = (metrics.quality_status == "unalignable" or match_pct is None)
-        is_low_match = (min_cluster_match_pct > 0.0 and match_pct is not None and match_pct < min_cluster_match_pct)
-        if not is_exact_copy and (is_unalignable or is_low_match):
-            pruned_mids.append(mid)
+        # Quality metrics recorded for keeper selection.
+        # Members with lower match_pct or unalignable status are safely retained in the cluster
+        # and marked for manual review (review_ids) by core/keeper.py, rather than being
+        # destructively unclustered or falsely marked as unique.
 
     return _EvaluatedCluster(
         cid=cid,
@@ -1716,40 +1714,9 @@ def run_quality_pipeline(
                 ev.member_quality_updates,
             )
 
-        if ev.pruned_mids:
-            conn.executemany(
-                """
-                UPDATE images
-                SET cluster_id = NULL,
-                    status = 'embedded',
-                    is_keeper = 0,
-                    is_cluster_anchor = 0,
-                    confidence = NULL,
-                    link_signal = NULL,
-                    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
-                WHERE id = ?
-                """,
-                [(mid,) for mid in ev.pruned_mids],
-            )
-            surviving = conn.execute("SELECT id FROM images WHERE cluster_id = ?", (ev.cid,)).fetchall()
-            if len(surviving) <= 1:
-                conn.execute(
-                    """
-                    UPDATE images
-                    SET cluster_id = NULL,
-                        status = 'embedded',
-                        is_keeper = 0,
-                        is_cluster_anchor = 0,
-                        confidence = NULL,
-                        link_signal = NULL,
-                        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
-                    WHERE cluster_id = ?
-                    """,
-                    (ev.cid,),
-                )
-                conn.execute("DELETE FROM clusters WHERE id = ?", (ev.cid,))
-            else:
-                conn.execute("UPDATE clusters SET member_count = ? WHERE id = ?", (len(surviving), ev.cid))
+        # Ensure cluster member_count reflects current members
+        surviving = conn.execute("SELECT id FROM images WHERE cluster_id = ?", (ev.cid,)).fetchall()
+        conn.execute("UPDATE clusters SET member_count = ? WHERE id = ?", (len(surviving), ev.cid))
 
         res.clusters_evaluated += 1
         res.members_evaluated += len(ev.member_records)
