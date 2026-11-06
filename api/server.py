@@ -834,6 +834,28 @@ def _collect_download_file(
         from sources.google_drive import parse_drive_uri
         drive_id, filename = parse_drive_uri(file_path_str)
         arcname = filename or arcname_default or f"{drive_id}.jpg"
+
+        # Check local disk cache first (orders of magnitude faster than remote API)
+        cfg = getattr(request.app.state, "config", {}) or {}
+        configured_drive_cache = cfg.get("sources", {}).get("google_drive", {}).get("cache_dir")
+        drive_cache_dir = Path(configured_drive_cache).expanduser() if configured_drive_cache else user.drive_cache_dir
+
+        search_dirs = [
+            drive_cache_dir,
+            user.root / "drive_cache",
+            Path.home() / ".similix" / "users" / str(user.id) / "drive_cache",
+        ]
+        for dcd in search_dirs:
+            if dcd and dcd.is_dir():
+                matches = sorted(dcd.glob(f"{drive_id}_*.jpg"))
+                if not matches:
+                    matches = sorted(dcd.glob(f"{drive_id}.jpg"))
+                if not matches:
+                    matches = sorted(dcd.glob(f"{drive_id}*"))
+                if matches and matches[0].is_file():
+                    return (matches[0], arcname)
+
+        # Fallback to remote Google Drive fetch only if missing from local cache
         if gdrive_source is not None:
             try:
                 b = gdrive_source.get_bytes(file_path_str)
@@ -841,17 +863,7 @@ def _collect_download_file(
                     return (b, arcname)
             except Exception as exc:
                 logger.warning("Could not fetch full Google Drive file %s: %s", file_path_str, exc)
-        cfg = getattr(request.app.state, "config", {}) or {}
-        configured_drive_cache = cfg.get("sources", {}).get("google_drive", {}).get("cache_dir")
-        drive_cache_dir = Path(configured_drive_cache).expanduser() if configured_drive_cache else user.drive_cache_dir
-        if drive_cache_dir.is_dir():
-            matches = sorted(drive_cache_dir.glob(f"{drive_id}_*.jpg"))
-            if not matches:
-                matches = sorted(drive_cache_dir.glob(f"{drive_id}.jpg"))
-            if not matches:
-                matches = sorted(drive_cache_dir.glob(f"{drive_id}*"))
-            if matches and matches[0].is_file():
-                return (matches[0], arcname)
+
         return None
 
     fp = Path(file_path_str)
