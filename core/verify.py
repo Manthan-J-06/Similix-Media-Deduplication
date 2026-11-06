@@ -250,6 +250,10 @@ def load_proxy_grayscale(
                 Path.home() / ".similix" / "drive_cache",
                 Path.home() / ".argus" / "drive_cache",
             ])
+            if (Path.home() / ".similix" / "users").is_dir():
+                cache_dirs.extend(sorted((Path.home() / ".similix" / "users").glob("*/drive_cache")))
+            if (Path.cwd() / ".similix" / "users").is_dir():
+                cache_dirs.extend(sorted((Path.cwd() / ".similix" / "users").glob("*/drive_cache")))
             cached_file: Path | None = None
             for cd in cache_dirs:
                 if cd and cd.is_dir():
@@ -689,8 +693,11 @@ def run_stage3_verification(
                 except Exception:
                     pass
 
-            if match_res.status == "inconclusive":
-                # Guard against impostor false-positives masquerading as inconclusive due to low keypoints
+            if match_res.status == "inconclusive" or (match_res.status == "failed" and match_res.inlier_count >= 15 and match_res.transform_matrix is not None):
+                # Guard against impostor false-positives masquerading as inconclusive due to low keypoints,
+                # AND recover genuine high-confidence duplicates where RANSAC found a valid geometric
+                # transformation with substantial inliers (>= 15), but natural background texture/clutter
+                # slightly diluted the inlier ratio below the strict threshold.
                 rep_meta = conn.execute("SELECT phash, clip_vector FROM images WHERE id = ?", (rep_id,)).fetchone()
                 m_meta = conn.execute("SELECT phash, clip_vector FROM images WHERE id = ?", (m_id,)).fetchone()
                 is_obvious_mismatch = False
@@ -718,16 +725,21 @@ def run_stage3_verification(
                             pass
 
                     # 1. Obvious mismatch: different scenes (e.g., baseball glove vs coffee cup)
-                    if pdist is not None and pdist > 12:
+                    if pdist is not None and pdist > 12 and (csim is None or csim < 0.90):
                         is_obvious_mismatch = True
                     elif csim is not None and csim < 0.80:
                         is_obvious_mismatch = True
                     elif (pdist is not None and pdist > 8) and (csim is not None and csim < 0.88):
                         is_obvious_mismatch = True
 
-                    # 2. Confirmed genuine duplicate on low-texture images (e.g., solid color / smooth scenes)
-                    if (pdist is not None and pdist <= 8) or (csim is not None and csim >= 0.92):
-                        is_confirmed_match = True
+                    # 2. Confirmed genuine duplicate on low-texture images OR geometric inliers with high CLIP similarity
+                    if match_res.status == "inconclusive":
+                        if (pdist is not None and pdist <= 8) or (csim is not None and csim >= 0.92):
+                            is_confirmed_match = True
+                    elif match_res.status == "failed":
+                        # For geometrically aligned pairs with >= 15 inliers, if CLIP similarity is high (>= 0.90) and not an obvious mismatch:
+                        if csim is not None and csim >= 0.90 and (pdist is None or pdist <= 16):
+                            is_confirmed_match = True
 
                 if is_obvious_mismatch:
                     match_res.status = "failed"
@@ -736,7 +748,7 @@ def run_stage3_verification(
                 elif is_confirmed_match:
                     match_res.status = "verified"
                     match_res.verified = True
-                    match_res.message = "Verified: low-texture match confirmed by pHash/CLIP"
+                    match_res.message = "Verified: confirmed by geometric alignment and CLIP similarity"
 
             if match_res.status == "inconclusive":
                 res.pairs_inconclusive += 1
@@ -892,10 +904,11 @@ def run_stage3_verification(
             sc_matrix = None
 
         # 1. Try matching against other surviving clusters
+        total_split = len(split_pool)
         for idx_sp, (mid, mpath) in enumerate(split_pool):
             if progress_callback:
                 try:
-                    progress_callback(min(total_pairs, res.pairs_evaluated + idx_sp), max(1, total_pairs), mpath)
+                    progress_callback(total_pairs + idx_sp + 1, total_pairs + total_split, mpath)
                 except Exception:
                     pass
 
@@ -963,11 +976,14 @@ def run_stage3_verification(
                 still_split.append((mid, mpath))
 
         # 2. Group remaining split members amongst each other
+        total_remaining = len(still_split)
+        done_remaining = 0
         while still_split:
             seed_id, seed_path = still_split.pop(0)
+            done_remaining += 1
             if progress_callback:
                 try:
-                    progress_callback(max(1, total_pairs), max(1, total_pairs), seed_path)
+                    progress_callback(total_pairs + total_split + done_remaining, total_pairs + total_split + total_remaining, seed_path)
                 except Exception:
                     pass
             seed_vec = split_vec_map.get(seed_id)
