@@ -640,8 +640,6 @@ def run_stage3_verification(
         mem_cache[image_id] = (kps, des)
         return mem_cache[image_id]
 
-    split_pool: list[tuple[int, str]] = []
-
     for c_row in clusters_rows:
         cluster_id = c_row["id"]
         rep_id = c_row["representative_id"]
@@ -796,9 +794,8 @@ def run_stage3_verification(
             conn.execute("UPDATE images SET is_low_confidence = 0 WHERE id = ?", (rep_id,))
 
         # Split failing members out of the cluster
+        current_split_group: list[tuple[int, str]] = list(members_to_split)
         if members_to_split:
-            for mid, mpath in members_to_split:
-                split_pool.append((mid, mpath))
             conn.executemany(
                 """
                 UPDATE images
@@ -821,10 +818,10 @@ def run_stage3_verification(
         ).fetchone()[0]
 
         if remaining_count < 2:
-            # Cluster reduced below 2 members: disband and add remaining rep to split_pool
+            # Cluster reduced below 2 members: disband and add remaining rep to split group
             rep_row = conn.execute("SELECT id, file_path FROM images WHERE id = ?", (rep_id,)).fetchone()
             if rep_row is not None:
-                split_pool.append((rep_row["id"], rep_row["file_path"]))
+                current_split_group.insert(0, (rep_row["id"], rep_row["file_path"]))
             conn.execute(
                 """
                 UPDATE images
@@ -848,207 +845,46 @@ def run_stage3_verification(
             )
         conn.commit()
 
-    # ── Re-evaluation of Split Members ─────────────────────────────────────
-    # Members split out by Stage 3 must be re-evaluated:
-    # 1. Matched against other surviving clusters' representatives
-    # 2. Matched against each other using the same verification to form new clusters
-    if split_pool:
-        surviving_clusters = conn.execute(
-            """
-            SELECT c.id, c.representative_id, i.file_path as rep_path
-            FROM clusters c
-            JOIN images i ON i.id = c.representative_id
-            ORDER BY c.id
-            """
-        ).fetchall()
-
-        # Vector-first gating: pre-cache CLIP normalized vectors to avoid futile SIFT matching
-        from core.embeddings import deserialize_embedding
-        rep_ids = [sc["representative_id"] for sc in surviving_clusters]
-        rep_vec_map: dict[int, np.ndarray] = {}
-        if rep_ids:
-            placeholders = ",".join("?" for _ in rep_ids)
-            r_rows = conn.execute(f"SELECT id, clip_vector FROM images WHERE id IN ({placeholders})", rep_ids).fetchall()
-            for r in r_rows:
-                if r["clip_vector"]:
-                    try:
-                        v = deserialize_embedding(r["clip_vector"]).astype(np.float32)
-                        n = np.linalg.norm(v)
-                        if n > 0:
-                            rep_vec_map[r["id"]] = v / n
-                    except Exception:
-                        pass
-
-        split_ids = [sp[0] for sp in split_pool]
-        split_vec_map: dict[int, np.ndarray] = {}
-        if split_ids:
-            placeholders = ",".join("?" for _ in split_ids)
-            s_rows = conn.execute(f"SELECT id, clip_vector FROM images WHERE id IN ({placeholders})", split_ids).fetchall()
-            for r in s_rows:
-                if r["clip_vector"]:
-                    try:
-                        v = deserialize_embedding(r["clip_vector"]).astype(np.float32)
-                        n = np.linalg.norm(v)
-                        if n > 0:
-                            split_vec_map[r["id"]] = v / n
-                    except Exception:
-                        pass
-
-        still_split: list[tuple[int, str]] = []
-
-        # Pre-build vectorized array of surviving cluster representatives for ultra-fast dot products
-        sc_with_vec = [sc for sc in surviving_clusters if sc["representative_id"] in rep_vec_map]
-        if sc_with_vec:
-            sc_matrix = np.vstack([rep_vec_map[sc["representative_id"]] for sc in sc_with_vec])
-        else:
-            sc_matrix = None
-
-        # 1. Try matching against other surviving clusters
-        total_split = len(split_pool)
-        for idx_sp, (mid, mpath) in enumerate(split_pool):
-            if progress_callback:
-                try:
-                    progress_callback(total_pairs + idx_sp + 1, total_pairs + total_split, mpath)
-                except Exception:
-                    pass
-
-            m_vec = split_vec_map.get(mid)
-            mkp, mdes = get_features(mid, mpath)
-            matched_cid: int | None = None
-
-            # Vector-first candidate filtering: rank candidates by cosine similarity >= 0.85
-            if m_vec is not None and sc_matrix is not None and len(sc_with_vec) > 0:
-                sims = np.dot(sc_matrix, m_vec)
-                passing_idx = np.where(sims >= 0.85)[0]
-                if len(passing_idx) > 0:
-                    sorted_passing = passing_idx[np.argsort(-sims[passing_idx])]
-                    candidates_to_try = [sc_with_vec[i] for i in sorted_passing]
-                else:
-                    candidates_to_try = []
-            else:
-                candidates_to_try = surviving_clusters
-
-            for sc in candidates_to_try:
-                sc_rep_id = sc["representative_id"]
-                rep_kp, rep_des = get_features(sc_rep_id, sc["rep_path"])
-                mres = verifier.match_features(rep_kp, rep_des, mkp, mdes)
-                if mres.status == "verified":
-                    # Extra cross-check: ensure pHash does not contradict verified match (e.g. repetitive facade false positive)
-                    r_p_row = conn.execute("SELECT phash FROM images WHERE id = ?", (sc_rep_id,)).fetchone()
-                    m_p_row = conn.execute("SELECT phash FROM images WHERE id = ?", (mid,)).fetchone()
-                    if r_p_row and m_p_row and r_p_row["phash"] and m_p_row["phash"]:
-                        try:
-                            pdist = (int(r_p_row["phash"], 16) ^ int(m_p_row["phash"], 16)).bit_count()
-                            if pdist > 16:
-                                continue
-                        except Exception:
-                            pass
-
-                    matched_cid = sc["id"]
-                    if mres.transform_matrix is not None:
-                        p1_s = get_proxy_shape(sc["representative_id"])
-                        o1_s = orig_dims.get(sc["representative_id"], (1024, 1024))
-                        p2_s = get_proxy_shape(mid)
-                        o2_s = orig_dims.get(mid, (1024, 1024))
-                        M_full = proxy_matrix_to_full(mres.transform_matrix, p1_s, o1_s, p2_s, o2_s)
-                        cache_pair_transform(conn, sc["representative_id"], mid, M_full, verifier.model, mres.inlier_count, mres.inlier_ratio)
-                    conn.execute(
-                        """
-                        UPDATE images
-                        SET cluster_id        = ?,
-                            is_keeper         = 0,
-                            confidence        = 100.0,
-                            link_signal       = 'sift',
-                            status            = 'clustered',
-                            is_low_confidence = 0,
-                            updated_at        = strftime('%Y-%m-%dT%H:%M:%SZ','now')
-                        WHERE id = ?
-                        """,
-                        (matched_cid, mid),
-                    )
-                    conn.execute(
-                        "UPDATE clusters SET member_count = member_count + 1 WHERE id = ?",
-                        (matched_cid,),
-                    )
-                    break
-
-            if matched_cid is None:
-                still_split.append((mid, mpath))
-
-        # 2. Group remaining split members amongst each other
-        total_remaining = len(still_split)
-        done_remaining = 0
-        while still_split:
-            seed_id, seed_path = still_split.pop(0)
-            done_remaining += 1
-            if progress_callback:
-                try:
-                    progress_callback(total_pairs + total_split + done_remaining, total_pairs + total_split + total_remaining, seed_path)
-                except Exception:
-                    pass
-            seed_vec = split_vec_map.get(seed_id)
-            seed_kp, seed_des = get_features(seed_id, seed_path)
-            cand_members: list[tuple[int, str]] = [(seed_id, seed_path)]
-
-            unmatched: list[tuple[int, str]] = []
-            for mid, mpath in still_split:
-                m_vec = split_vec_map.get(mid)
-                # Gating: if both vectors are available and similarity < 0.85, skip SIFT
-                if seed_vec is not None and m_vec is not None:
-                    sim = float(np.dot(seed_vec, m_vec))
-                    if sim < 0.85:
+        # Re-evaluate co-split members from this cluster among each other (e.g. mixed-scene clusters)
+        if len(current_split_group) >= 2:
+            sub_pool = list(current_split_group)
+            while len(sub_pool) >= 2:
+                seed_id, seed_path = sub_pool.pop(0)
+                seed_kp, seed_des = get_features(seed_id, seed_path)
+                cand_members: list[tuple[int, str]] = [(seed_id, seed_path)]
+                unmatched: list[tuple[int, str]] = []
+                for mid, mpath in sub_pool:
+                    mkp, mdes = get_features(mid, mpath)
+                    mres = verifier.match_features(seed_kp, seed_des, mkp, mdes)
+                    if mres.status == "verified":
+                        cand_members.append((mid, mpath))
+                        if mres.transform_matrix is not None:
+                            p1_s = get_proxy_shape(seed_id)
+                            o1_s = orig_dims.get(seed_id, (1024, 1024))
+                            p2_s = get_proxy_shape(mid)
+                            o2_s = orig_dims.get(mid, (1024, 1024))
+                            M_full = proxy_matrix_to_full(mres.transform_matrix, p1_s, o1_s, p2_s, o2_s)
+                            cache_pair_transform(conn, seed_id, mid, M_full, verifier.model, mres.inlier_count, mres.inlier_ratio)
+                    else:
                         unmatched.append((mid, mpath))
-                        continue
 
-                mkp, mdes = get_features(mid, mpath)
-                mres = verifier.match_features(seed_kp, seed_des, mkp, mdes)
-                if mres.status == "verified":
-                    cand_members.append((mid, mpath))
-                    if mres.transform_matrix is not None:
-                        p1_s = get_proxy_shape(seed_id)
-                        o1_s = orig_dims.get(seed_id, (1024, 1024))
-                        p2_s = get_proxy_shape(mid)
-                        o2_s = orig_dims.get(mid, (1024, 1024))
-                        M_full = proxy_matrix_to_full(mres.transform_matrix, p1_s, o1_s, p2_s, o2_s)
-                        cache_pair_transform(conn, seed_id, mid, M_full, verifier.model, mres.inlier_count, mres.inlier_ratio)
-                else:
-                    unmatched.append((mid, mpath))
+                sub_pool = unmatched
+                if len(cand_members) >= 2:
+                    conn.execute(
+                        """
+                        INSERT INTO clusters (representative_id, stage_detected, member_count)
+                        VALUES (?, 3, ?)
+                        """,
+                        (seed_id, len(cand_members)),
+                    )
+                    new_cid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                    has_low = 1 if len(seed_kp) < verifier.min_keypoints else 0
 
-            still_split = unmatched
-
-            if len(cand_members) >= 2:
-                # Form new cluster
-                conn.execute(
-                    """
-                    INSERT INTO clusters (representative_id, stage_detected, member_count)
-                    VALUES (?, 3, ?)
-                    """,
-                    (seed_id, len(cand_members)),
-                )
-                new_cid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-
-                has_low = 1 if len(seed_kp) < verifier.min_keypoints else 0
-
-                conn.execute(
-                    """
-                    UPDATE images
-                    SET cluster_id        = ?,
-                        is_keeper         = 1,
-                        confidence        = 100.0,
-                        link_signal       = 'sift',
-                        status            = 'clustered',
-                        is_low_confidence = ?,
-                        updated_at        = strftime('%Y-%m-%dT%H:%M:%SZ','now')
-                    WHERE id = ?
-                    """,
-                    (new_cid, has_low, seed_id),
-                )
-                for mid, _mpath in cand_members[1:]:
                     conn.execute(
                         """
                         UPDATE images
                         SET cluster_id        = ?,
-                            is_keeper         = 0,
+                            is_keeper         = 1,
                             confidence        = 100.0,
                             link_signal       = 'sift',
                             status            = 'clustered',
@@ -1056,24 +892,25 @@ def run_stage3_verification(
                             updated_at        = strftime('%Y-%m-%dT%H:%M:%SZ','now')
                         WHERE id = ?
                         """,
-                        (new_cid, has_low, mid),
+                        (new_cid, has_low, seed_id),
                     )
-                res.new_clusters_formed += 1
-            else:
-                conn.execute(
-                    """
-                    UPDATE images
-                    SET cluster_id        = NULL,
-                        is_keeper         = 0,
-                        confidence        = NULL,
-                        link_signal       = NULL,
-                        status            = 'embedded',
-                        is_low_confidence = 0,
-                        updated_at        = strftime('%Y-%m-%dT%H:%M:%SZ','now')
-                    WHERE id = ?
-                    """,
-                    (seed_id,),
-                )
+                    for mid, _mpath in cand_members[1:]:
+                        conn.execute(
+                            """
+                            UPDATE images
+                            SET cluster_id        = ?,
+                                is_keeper         = 0,
+                                confidence        = 100.0,
+                                link_signal       = 'sift',
+                                status            = 'clustered',
+                                is_low_confidence = ?,
+                                updated_at        = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                            WHERE id = ?
+                            """,
+                            (new_cid, has_low, mid),
+                        )
+                    res.new_clusters_formed += 1
+                    conn.commit()
 
     # Populate images.confidence using the fused logistic regression model
     update_cluster_duplicate_confidences(conn)

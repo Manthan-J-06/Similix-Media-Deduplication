@@ -4175,7 +4175,10 @@ def create_app(
                         last_progress = state.get("last_progress_at") or state.get("updated_at", 0)
                         cfg_stall = float(getattr(request.app.state, "config", {}).get("general", {}).get("stall_timeout_seconds", 900.0)) if hasattr(request.app, "state") else 900.0
                         stall_limit = cfg_stall if (pid is not None and is_alive) else 60.0
-                        is_stalled = ((now - last_heartbeat) > 60) or ((now - last_progress) > stall_limit)
+                        if pid is not None and is_alive:
+                            is_stalled = ((now - last_heartbeat) > 60) or ((now - last_progress) > max(3600.0, stall_limit))
+                        else:
+                            is_stalled = ((now - last_heartbeat) > 60)
 
                         if not is_alive and state.get("status") == "running":
                             state["status"] = "failed"
