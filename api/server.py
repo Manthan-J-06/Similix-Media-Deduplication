@@ -8,6 +8,7 @@ Authentication, session management, and per-user isolation enforced.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import base64
@@ -822,12 +823,16 @@ def _get_user_gdrive_source(request: Request, user: UserContext, conn: sqlite3.C
     return None
 
 
+download_progress: dict[int, dict[str, Any]] = {}
+
+
 def _collect_download_file(
     file_path_str: str,
     arcname_default: str,
     user: UserContext,
     request: Request,
     gdrive_source: Any = None,
+    allow_unclustered: bool = False,
 ) -> tuple[Path | bytes, str] | None:
     """Resolve a local path or drive:// URI to (Path | bytes, arcname)."""
     if file_path_str.startswith("drive://"):
@@ -858,7 +863,10 @@ def _collect_download_file(
         # Fallback to remote Google Drive fetch only if missing from local cache
         if gdrive_source is not None:
             try:
-                b = gdrive_source.get_bytes(file_path_str)
+                try:
+                    b = gdrive_source.get_bytes(file_path_str, allow_unclustered=allow_unclustered)
+                except TypeError:
+                    b = gdrive_source.get_bytes(file_path_str)
                 if b:
                     return (b, arcname)
             except Exception as exc:
@@ -928,6 +936,190 @@ def stream_zip_archive(files_to_zip: list[tuple[Path | bytes, str]], zip_filenam
             except Exception:
                 pass
         raise HTTPException(status_code=500, detail=f"Failed to create zip archive: {exc}")
+
+    def iter_file():
+        try:
+            with open(temp_path, "rb") as f:
+                while chunk := f.read(65536):
+                    yield chunk
+        finally:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except Exception:
+                    pass
+
+    return StreamingResponse(
+        iter_file(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{zip_filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+def build_and_stream_zip(
+    file_records: list[tuple[str, str]],
+    zip_filename: str,
+    user: UserContext,
+    request: Request,
+    gdrive_source: Any = None,
+    allow_unclustered: bool = False,
+    progress_dict: dict[int, dict[str, Any]] | None = None,
+    max_download_size: int = 2 * 1024 * 1024 * 1024,
+):
+    """
+    Build a zip archive directly to disk with concurrent multi-worker fetching for remote files.
+    Streams the finished archive to the client and automatically unlinks the temp file.
+    Does NOT store all file bytes in Python RAM, preserving memory and device performance.
+    """
+    if not file_records:
+        raise HTTPException(status_code=404, detail="No downloadable files found")
+
+    seen_arcnames: set[str] = set()
+    unique_items: list[dict[str, Any]] = []
+
+    for fp_str, arcname_default in file_records:
+        if not fp_str:
+            continue
+        if fp_str.startswith("drive://"):
+            from sources.google_drive import parse_drive_uri
+            drive_id, filename = parse_drive_uri(fp_str)
+            base_name = filename or arcname_default or f"{drive_id}.jpg"
+        else:
+            base_name = arcname_default or Path(fp_str).name or "image.jpg"
+
+        final_arcname = base_name
+        count = 1
+        while final_arcname in seen_arcnames:
+            p = Path(base_name)
+            final_arcname = f"{p.stem}_{count}{p.suffix}"
+            count += 1
+        seen_arcnames.add(final_arcname)
+        unique_items.append({"file_path": fp_str, "arcname": final_arcname})
+
+    if not unique_items:
+        raise HTTPException(status_code=404, detail="No downloadable files found")
+
+    cfg = getattr(request.app.state, "config", {}) or {}
+    configured_drive_cache = cfg.get("sources", {}).get("google_drive", {}).get("cache_dir")
+    drive_cache_dir = Path(configured_drive_cache).expanduser() if configured_drive_cache else user.drive_cache_dir
+
+    search_dirs = [
+        drive_cache_dir,
+        user.root / "drive_cache",
+        Path.home() / ".similix" / "users" / str(user.id) / "drive_cache",
+    ]
+
+    local_items: list[tuple[Path, str]] = []
+    drive_items: list[dict[str, Any]] = []
+
+    for item in unique_items:
+        fp_str = item["file_path"]
+        arcname = item["arcname"]
+        if fp_str.startswith("drive://"):
+            from sources.google_drive import parse_drive_uri
+            drive_id, _ = parse_drive_uri(fp_str)
+            found_local = None
+            for dcd in search_dirs:
+                if dcd and dcd.is_dir():
+                    matches = sorted(dcd.glob(f"{drive_id}_*.jpg"))
+                    if not matches:
+                        matches = sorted(dcd.glob(f"{drive_id}.jpg"))
+                    if not matches:
+                        matches = sorted(dcd.glob(f"{drive_id}*"))
+                    if matches and matches[0].is_file():
+                        found_local = matches[0]
+                        break
+            if found_local:
+                local_items.append((found_local, arcname))
+            else:
+                drive_items.append(item)
+        else:
+            p = Path(fp_str)
+            if p.is_file() and not p.is_symlink():
+                local_items.append((p, arcname))
+
+    total_est_size = sum(p.stat().st_size for p, _ in local_items if p.exists())
+    total_est_size += len(drive_items) * 350 * 1024
+    if total_est_size > max_download_size:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Total download size ({total_est_size // (1024*1024)} MB) exceeds 2GB cap",
+        )
+
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    temp_path = Path(temp_file.name)
+    temp_file.close()
+
+    total_count = len(local_items) + len(drive_items)
+    if progress_dict is not None:
+        progress_dict[user.id] = {
+            "active": True,
+            "total": total_count,
+            "completed": 0,
+            "status": "Archiving files...",
+        }
+
+    written_count = 0
+    try:
+        with zipfile.ZipFile(temp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zip_lock = threading.Lock()
+
+            # 1. Local disk items written directly
+            for local_path, arcname in local_items:
+                try:
+                    zf.write(local_path, arcname=arcname)
+                    with zip_lock:
+                        written_count += 1
+                        if progress_dict is not None and user.id in progress_dict:
+                            progress_dict[user.id]["completed"] += 1
+                except Exception as exc:
+                    logger.warning("Could not add local file %s to zip: %s", local_path, exc)
+
+            # 2. Remote Drive items downloaded concurrently with worker pool
+            if drive_items and gdrive_source is not None:
+                max_workers = min(20, max(4, len(drive_items)))
+
+                def _fetch_worker(item: dict[str, Any]):
+                    nonlocal written_count
+                    fp = item["file_path"]
+                    arc = item["arcname"]
+                    try:
+                        try:
+                            b = gdrive_source.get_bytes(fp, allow_unclustered=allow_unclustered)
+                        except TypeError:
+                            b = gdrive_source.get_bytes(fp)
+                        if b:
+                            with zip_lock:
+                                zf.writestr(arc, b)
+                                written_count += 1
+                    except Exception as exc:
+                        logger.warning("Could not download Drive file %s for zip: %s", fp, exc)
+                    finally:
+                        if progress_dict is not None and user.id in progress_dict:
+                            with zip_lock:
+                                progress_dict[user.id]["completed"] += 1
+
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    list(executor.map(_fetch_worker, drive_items))
+
+    except Exception as exc:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+        if progress_dict is not None and user.id in progress_dict:
+            progress_dict[user.id]["active"] = False
+        raise HTTPException(status_code=500, detail=f"Failed to create zip archive: {exc}")
+
+    if progress_dict is not None and user.id in progress_dict:
+        progress_dict[user.id]["active"] = False
+        progress_dict[user.id]["status"] = "Completed"
+
+    if written_count == 0:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=404, detail="No downloadable files found")
 
     def iter_file():
         try:
@@ -1352,14 +1544,16 @@ def create_app(
         ).fetchall()
 
         gdrive_source = _get_user_gdrive_source(request, user, conn)
-        files_to_zip = []
-        for r in rows:
-            fp_str = str(r["file_path"])
-            item = _collect_download_file(fp_str, Path(fp_str).name, user, request, gdrive_source)
-            if item:
-                files_to_zip.append(item)
-
-        return stream_zip_archive(files_to_zip, f"cluster_{cluster_id}.zip")
+        file_records = [(str(r["file_path"]), Path(str(r["file_path"])).name) for r in rows]
+        return build_and_stream_zip(
+            file_records=file_records,
+            zip_filename=f"cluster_{cluster_id}.zip",
+            user=user,
+            request=request,
+            gdrive_source=gdrive_source,
+            allow_unclustered=False,
+            progress_dict=download_progress,
+        )
 
     @app.post("/download/selected")
     def download_selected(
@@ -1378,15 +1572,20 @@ def create_app(
             req.image_ids,
         ).fetchall()
 
-        gdrive_source = _get_user_gdrive_source(request, user, conn)
-        files_to_zip = []
-        for r in rows:
-            fp_str = str(r["file_path"])
-            item = _collect_download_file(fp_str, Path(fp_str).name, user, request, gdrive_source)
-            if item:
-                files_to_zip.append(item)
+        if not rows:
+            raise HTTPException(status_code=404, detail="No selected images found")
 
-        return stream_zip_archive(files_to_zip, "selected_images.zip")
+        gdrive_source = _get_user_gdrive_source(request, user, conn)
+        file_records = [(str(r["file_path"]), Path(str(r["file_path"])).name) for r in rows]
+        return build_and_stream_zip(
+            file_records=file_records,
+            zip_filename="selected_images.zip",
+            user=user,
+            request=request,
+            gdrive_source=gdrive_source,
+            allow_unclustered=True,
+            progress_dict=download_progress,
+        )
 
     @app.get("/download/keepers")
     def download_keepers(
@@ -1459,7 +1658,7 @@ def create_app(
             ),
         )
 
-        selected_keepers: list[tuple[Path | bytes, str]] = []
+        file_records: list[tuple[str, str]] = []
         selected_md5s: set[str] = set()
 
         for item in candidates:
@@ -1467,14 +1666,29 @@ def create_app(
             md5 = item.get("md5")
             if md5 and md5 in selected_md5s:
                 continue
+            if md5:
+                selected_md5s.add(md5)
+            file_records.append((fp_str, Path(fp_str).name))
 
-            dl_item = _collect_download_file(fp_str, Path(fp_str).name, user, request, gdrive_source)
-            if dl_item:
-                selected_keepers.append(dl_item)
-                if md5:
-                    selected_md5s.add(md5)
+        return build_and_stream_zip(
+            file_records=file_records,
+            zip_filename="recommended_keepers.zip",
+            user=user,
+            request=request,
+            gdrive_source=gdrive_source,
+            allow_unclustered=True,
+            progress_dict=download_progress,
+        )
 
-        return stream_zip_archive(selected_keepers, "recommended_keepers.zip")
+    @app.get("/download/progress")
+    def get_download_progress(
+        user: UserContext = Depends(get_current_user),
+    ):
+        """Return the current archiving/download progress for the active user."""
+        return download_progress.get(
+            user.id,
+            {"active": False, "total": 0, "completed": 0, "status": "idle"},
+        )
 
     @app.get("/library")
     def list_library_images(

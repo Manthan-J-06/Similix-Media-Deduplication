@@ -2070,6 +2070,35 @@ class TestPipelineResumable:
             assert len(names) == 1
             assert any("cloud_photo2.jpg" in n for n in names)
 
+        # Download keepers (including Drive cluster keeper + Drive unclustered unique image)
+        conn = sqlite3.connect(db_file)
+        conn.execute(
+            """
+            INSERT INTO images (
+                id, cluster_id, file_path, file_size, width, height, format, md5,
+                is_keeper, is_recommended_keeper, delete_safe, review_flag,
+                is_low_confidence, quality_status, ssim, ssim_color, sharpness_ratio,
+                pixel_ratio, bytes_ratio, modified_time
+            ) VALUES
+              (503, NULL, 'drive://mock_drive_id_3/cloud_unique.jpg', 1234, 400, 400, 'JPEG', 'md5_503', 0, 0, 0, 0, 0, NULL, NULL, NULL, 1.0, 1.0, 1.0, ?)
+            """,
+            (now,),
+        )
+        conn.commit()
+        conn.close()
+
+        res_prog_before = client.get("/download/progress")
+        assert res_prog_before.status_code == 200
+
+        res_keep = client.get("/download/keepers?mode=balanced")
+        assert res_keep.status_code == 200
+        assert res_keep.headers["content-type"] == "application/zip"
+        with zipfile.ZipFile(io.BytesIO(res_keep.content)) as zf:
+            names = zf.namelist()
+            assert len(names) >= 2
+            assert any("cloud_unique.jpg" in n for n in names)
+            assert any("cloud_photo1.jpg" in n for n in names)
+
     def test_drive_web_oauth_flow(self, api_test_env, tmp_path, monkeypatch):
         """Test Drive web OAuth flow, PKCE, admin message, user-isolated tokens, disconnect."""
         monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))

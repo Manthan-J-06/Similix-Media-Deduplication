@@ -4023,30 +4023,45 @@
     if (btnDlKeepers) {
       btnDlKeepers.addEventListener("click", async () => {
         const origText = btnDlKeepers.textContent;
+        let pollTimer = null;
         try {
           btnDlKeepers.disabled = true;
-          btnDlKeepers.textContent = "⏳ Downloading...";
+          btnDlKeepers.textContent = "⏳ Preparing clean dataset...";
+
+          pollTimer = setInterval(async () => {
+            try {
+              const pres = await fetch("/download/progress");
+              if (pres.ok) {
+                const pdata = await pres.json();
+                if (pdata.active && pdata.total > 0) {
+                  const pct = Math.round((pdata.completed / pdata.total) * 100);
+                  btnDlKeepers.textContent = `⏳ Archiving ${pdata.completed}/${pdata.total} (${pct}%)...`;
+                }
+              }
+            } catch (_) {}
+          }, 800);
+
           const res = await fetch(`/download/keepers?mode=${encodeURIComponent(currentMode)}`);
           if (!res.ok) {
             const err = await res.json().catch(() => ({}));
             showInlineNotice(err.detail || "Download failed", "error");
-            btnDlKeepers.disabled = false;
-            btnDlKeepers.textContent = origText;
             return;
           }
+          btnDlKeepers.textContent = "💾 Saving zip to device...";
           const blob = await res.blob();
           const url = URL.createObjectURL(blob);
           const a = document.createElement("a");
           a.href = url;
-          a.download = "recommended_keepers.zip";
+          a.download = "clean_dataset_keepers_unique.zip";
           document.body.appendChild(a);
           a.click();
           document.body.removeChild(a);
           URL.revokeObjectURL(url);
-          btnDlKeepers.disabled = false;
-          btnDlKeepers.textContent = origText;
+          showInlineNotice("✓ Download complete: Clean dataset saved!", "success");
         } catch (err) {
           showInlineNotice(err.message || "Download failed", "error");
+        } finally {
+          if (pollTimer) clearInterval(pollTimer);
           btnDlKeepers.disabled = false;
           btnDlKeepers.textContent = origText;
         }

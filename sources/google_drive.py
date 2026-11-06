@@ -1044,29 +1044,30 @@ class GoogleDriveSource(ImageSource):
 
         return thumb
 
-    def get_bytes(self, file_id: str) -> bytes:
+    def get_bytes(self, file_id: str, allow_unclustered: bool = False) -> bytes:
         """
-        Download full file bytes ONLY for members of candidate clusters.
+        Download full file bytes ONLY for members of candidate clusters,
+        or for clean dataset exports when allow_unclustered is True.
         Streams to temporary storage, checks size cap, and immediately cleans up.
-        Guarantees that unclustered files are NEVER downloaded.
         """
         drive_id, _ = self.parse_file_id(file_id)
 
-        # Security check: must be a member of a cluster
-        if self.conn is not None:
-            with self._db_lock:
-                row = self.conn.execute(
-                    "SELECT cluster_id FROM images WHERE (drive_id = ? OR file_path = ?) LIMIT 1",
-                    (drive_id, file_id),
-                ).fetchone()
-            if not row or row[0] is None:
+        # Security check: must be a member of a cluster unless allow_unclustered is True
+        if not allow_unclustered:
+            if self.conn is not None:
+                with self._db_lock:
+                    row = self.conn.execute(
+                        "SELECT cluster_id FROM images WHERE (drive_id = ? OR file_path = ?) LIMIT 1",
+                        (drive_id, file_id),
+                    ).fetchone()
+                if not row or row[0] is None:
+                    raise PermissionError(
+                        f"Security Invariant: Cannot download full file for unclustered image: {file_id}"
+                    )
+            else:
                 raise PermissionError(
-                    f"Security Invariant: Cannot download full file for unclustered image: {file_id}"
+                    f"Security Invariant: Database connection required to verify cluster membership for {file_id}"
                 )
-        else:
-            raise PermissionError(
-                f"Security Invariant: Database connection required to verify cluster membership for {file_id}"
-            )
 
         # Check metadata size cap before downloading
         with self._cache_lock:
@@ -1089,6 +1090,41 @@ class GoogleDriveSource(ImageSource):
             except Exception as exc:
                 logger.error("Failed to read bytes for %s from remote zip: %s", file_id, exc)
 
+        # 1. Fast direct media download using OAuth Bearer token
+        token = None
+        try:
+            creds = self.credentials
+            if creds and getattr(creds, "valid", False):
+                token = getattr(creds, "token", None)
+        except Exception:
+            pass
+
+        if token:
+            try:
+                import urllib.request
+                url = f"https://www.googleapis.com/drive/v3/files/{drive_id}?alt=media&supportsAllDrives=true"
+                req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+                with urllib.request.urlopen(req, timeout=25) as resp:
+                    data = resp.read()
+                    if data:
+                        record_bandwidth(self.conn, self.stage, drive_id, len(data), "full_file")
+                        return data
+            except Exception as exc:
+                logger.debug("Fast direct media download failed for %s: %s; trying CDN fallback", drive_id, exc)
+
+        # 2. Fast CDN fallback
+        try:
+            import urllib.request
+            cdn_url = f"https://lh3.googleusercontent.com/d/{drive_id}=s0"
+            with urllib.request.urlopen(cdn_url, timeout=15) as resp:
+                data = resp.read()
+                if data:
+                    record_bandwidth(self.conn, self.stage, drive_id, len(data), "full_file")
+                    return data
+        except Exception:
+            pass
+
+        # 3. Standard Google Drive API client library fallback
         from googleapiclient.http import MediaIoBaseDownload
 
         tmp_fd, tmp_path_str = tempfile.mkstemp(
