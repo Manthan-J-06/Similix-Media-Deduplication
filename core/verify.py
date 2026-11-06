@@ -232,7 +232,42 @@ def load_proxy_grayscale(
         im = image_or_path.copy()
     else:
         file_path = str(image_or_path)
-        if source is not None:
+        # Drive-aware loading: resolve drive:// URIs through the local thumbnail cache
+        # regardless of what source type was passed in (fixes the case where
+        # LocalFolderSource is used but the DB contains gdrive images).
+        if file_path.startswith("drive://"):
+            drive_id = file_path[8:].split("/")[0]
+            cache_dirs: list[Path] = []
+            if source is not None and hasattr(source, "cache_dir") and getattr(source, "cache_dir", None):
+                cache_dirs.append(Path(source.cache_dir))
+            try:
+                from core.config import resolve_data_dir
+                cache_dirs.append(resolve_data_dir() / "drive_cache")
+            except Exception:
+                pass
+            cache_dirs.extend([
+                Path.cwd() / ".similix" / "drive_cache",
+                Path.home() / ".similix" / "drive_cache",
+                Path.home() / ".argus" / "drive_cache",
+            ])
+            cached_file: Path | None = None
+            for cd in cache_dirs:
+                if cd and cd.is_dir():
+                    matches = sorted(cd.glob(f"{drive_id}_*.jpg"))
+                    if not matches:
+                        matches = sorted(cd.glob(f"{drive_id}.jpg"))
+                    if matches:
+                        cached_file = matches[0]
+                        break
+            if cached_file and cached_file.is_file():
+                with Image.open(cached_file) as raw_im:
+                    im = raw_im.copy()
+            elif source is not None and hasattr(source, "get_thumbnail"):
+                im = source.get_thumbnail(file_path, size=(proxy_size, proxy_size))
+            else:
+                # Cannot resolve drive URI — raise so the caller can handle gracefully
+                raise FileNotFoundError(f"drive:// URI not resolvable from cache: {file_path}")
+        elif source is not None:
             im = source.get_thumbnail(file_path, size=(proxy_size, proxy_size))
         else:
             p = Path(file_path)

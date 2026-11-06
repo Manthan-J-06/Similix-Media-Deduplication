@@ -664,7 +664,7 @@ def run_pipeline(
         worker_state.last_progress_time = time.time()
         try:
             from core.keeper import run_keeper_pipeline
-            run_keeper_pipeline(conn, cfg, mode="balanced")
+            run_keeper_pipeline(conn, mode="balanced", config=cfg)
         except Exception as exc:
             logger.warning("Stage 4.5 keeper pipeline failed: %s", exc)
         stage_timings["keeper"] = round(time.time() - t_stage, 3)

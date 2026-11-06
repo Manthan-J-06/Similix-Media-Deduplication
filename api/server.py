@@ -4092,21 +4092,29 @@ def create_app(
         """Re-run the deduplication pipeline on existing user sources."""
         target_folder, local_count = _sync_user_library_from_shared(request, user)
         drive_folder_id = None
-        if local_count > 0:
+        has_gdrive = conn.execute("SELECT 1 FROM images WHERE source = 'gdrive' LIMIT 1").fetchone() is not None
+        if has_gdrive:
+            source_type = "drive"
+            saved_fid_file = user.root / "drive_folder_id.txt"
+            if saved_fid_file.exists():
+                drive_folder_id = saved_fid_file.read_text(encoding="utf-8").strip() or None
+            if not drive_folder_id and user.jobs_dir.is_dir():
+                for jf in sorted(user.jobs_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+                    st = read_job_state(jf) or {}
+                    if st.get("drive_folder_id"):
+                        drive_folder_id = st["drive_folder_id"]
+                        break
+            if not drive_folder_id:
+                try:
+                    row_fid = conn.execute("SELECT drive_id FROM images WHERE source = 'gdrive' AND drive_id IS NOT NULL LIMIT 1").fetchone()
+                    if row_fid and row_fid[0]:
+                        drive_folder_id = row_fid[0].split(":", 1)[0]
+                except Exception:
+                    pass
+        elif local_count > 0:
             source_type = "local"
         else:
-            has_gdrive = conn.execute("SELECT 1 FROM images WHERE source = 'gdrive' LIMIT 1").fetchone() is not None
-            source_type = "drive" if has_gdrive else "local"
-            if has_gdrive:
-                saved_fid_file = user.root / "drive_folder_id.txt"
-                if saved_fid_file.exists():
-                    drive_folder_id = saved_fid_file.read_text(encoding="utf-8").strip() or None
-                if not drive_folder_id and user.jobs_dir.is_dir():
-                    for jf in sorted(user.jobs_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
-                        st = read_job_state(jf) or {}
-                        if st.get("drive_folder_id"):
-                            drive_folder_id = st["drive_folder_id"]
-                            break
+            source_type = "local"
 
         job_id = launch_pipeline_job(
             request.app,

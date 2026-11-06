@@ -93,7 +93,7 @@ def run_stage2_clustering(
     config = config or {}
     stage2_cfg = config.get("stage2", {})
     cosine_threshold = float(stage2_cfg.get("cosine_threshold", 0.92))
-    k = int(stage2_cfg.get("faiss_k", 20))
+    k = int(stage2_cfg.get("faiss_k", 50))
     hamming_threshold = int(config.get("stage1", {}).get("hamming_threshold", 10))
 
     if index_path is None:
@@ -395,6 +395,17 @@ def run_stage2_clustering(
         valid_members: list[tuple[int, float, str]] = []
         still_unclustered: list[int] = []
 
+        # Running centroid of accepted members (rep + accepted so far) for anti-drift check.
+        # We use the centroid instead of full pairwise clique to allow large burst-shot
+        # sequences (A~B~C~D all similar to rep) while still blocking true drift chains
+        # (A~B, B~C but A!~C → centroid(B+A) shifts, so C~centroid < threshold).
+        # Running centroid of accepted members (rep + accepted so far) for anti-drift check.
+        # We use the centroid instead of full pairwise clique to allow large burst-shot
+        # sequences (A~B~C~D all similar to rep) while still blocking true drift chains
+        # (A~B, B~C but A!~C → centroid(B+A) shifts, so C~centroid < threshold).
+        rep_vecs_for_centroid = vec_map.get(representative_id, [])
+        centroid: np.ndarray | None = rep_vecs_for_centroid[0].copy() if rep_vecs_for_centroid else None
+
         for candidate_id in candidate_pool:
             if candidate_id == representative_id:
                 continue
@@ -406,17 +417,21 @@ def run_stage2_clustering(
                 still_unclustered.append(candidate_id)
                 continue
 
-            # Anti-chaining check 2: mutual compatibility with already accepted members
-            conflict = False
-            for accepted_id, _, _ in valid_members:
-                if get_sim(candidate_id, accepted_id) < cosine_threshold:
-                    conflict = True
-                    break
-
-            if conflict:
-                # Fails mutual compatibility: split out
-                still_unclustered.append(candidate_id)
-                continue
+            # Anti-chaining check 2: centroid compatibility
+            # Check candidate against the running centroid of (representative + accepted members).
+            # This prevents drift chaining: if A and C both pass rep-sim individually but
+            # A~C < threshold, the centroid shifts toward A after A is accepted, so C will
+            # fail the centroid check. Pure rep-only check would let both join.
+            if centroid is not None and len(valid_members) > 0:
+                cand_vecs = vec_map.get(candidate_id, [])
+                if cand_vecs:
+                    cand_v = cand_vecs[0]
+                    centroid_norm = centroid / (np.linalg.norm(centroid) + 1e-8)
+                    cand_norm = cand_v / (np.linalg.norm(cand_v) + 1e-8)
+                    centroid_sim = float(np.dot(centroid_norm, cand_norm))
+                    if centroid_sim < cosine_threshold:
+                        still_unclustered.append(candidate_id)
+                        continue
 
             # Determine link signal (phash if matching hamming distance, else clip)
             c_phash = img_map[candidate_id].get("phash")
@@ -427,6 +442,12 @@ def run_stage2_clustering(
                 signal = "clip"
 
             valid_members.append((candidate_id, direct_sim, signal))
+            # Update running centroid with this accepted candidate's vector
+            cand_vecs_for_centroid = vec_map.get(candidate_id, [])
+            if centroid is not None and cand_vecs_for_centroid:
+                centroid = centroid + cand_vecs_for_centroid[0]
+            elif cand_vecs_for_centroid and centroid is None:
+                centroid = cand_vecs_for_centroid[0].copy()
 
         if valid_members:
             # We have a valid cluster!
