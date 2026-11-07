@@ -1763,9 +1763,9 @@
       activeClusterId = clusterId;
 
       // Update active highlight in left list (O(1) DOM update)
-      const prevActive = container.querySelector(".cluster-item.active");
+      const prevActive = document.querySelector(".cluster-item.active");
       if (prevActive) prevActive.classList.remove("active");
-      const nextActive = container.querySelector(`.cluster-item[data-cluster-id="${clusterId}"]`);
+      const nextActive = document.querySelector(`.cluster-item[data-cluster-id="${clusterId}"]`);
       if (nextActive) nextActive.classList.add("active");
 
       try {
