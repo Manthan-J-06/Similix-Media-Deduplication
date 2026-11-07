@@ -735,8 +735,15 @@ def run_stage3_verification(
                         if (pdist is not None and pdist <= 8) or (csim is not None and csim >= 0.92):
                             is_confirmed_match = True
                     elif match_res.status == "failed":
-                        # For geometrically aligned pairs with >= 15 inliers, if CLIP similarity is high (>= 0.90) and not an obvious mismatch:
-                        if csim is not None and csim >= 0.90 and (pdist is None or pdist <= 16):
+                        # Only recover if there is genuine geometric alignment (>= 15 inliers with valid transformation)
+                        # that was rejected merely due to strict inlier ratio on high-texture backgrounds:
+                        if (
+                            match_res.inlier_count >= 15
+                            and match_res.transform_matrix is not None
+                            and csim is not None
+                            and csim >= 0.90
+                            and (pdist is None or pdist <= 16)
+                        ):
                             is_confirmed_match = True
 
                 if is_obvious_mismatch:

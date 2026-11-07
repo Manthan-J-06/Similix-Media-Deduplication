@@ -1575,9 +1575,12 @@ def _evaluate_cluster_worker(
         )
 
         # Quality metrics recorded for keeper selection.
-        # Members with lower match_pct or unalignable status are safely retained in the cluster
-        # and marked for manual review (review_ids) by core/keeper.py, rather than being
-        # destructively unclustered or falsely marked as unique.
+        # Members that fail alignment or fall below min_cluster_match_pct are not duplicates;
+        # in Conservative mode (prune_non_duplicates=True), they are pruned and marked Unique.
+        prune_non_duplicates = q_cfg.get("prune_non_duplicates", True)
+        if prune_non_duplicates:
+            if metrics.quality_status == "unalignable" or (match_pct is not None and match_pct < min_cluster_match_pct):
+                pruned_mids.append(mid)
 
     return _EvaluatedCluster(
         cid=cid,
@@ -1714,9 +1717,42 @@ def run_quality_pipeline(
                 ev.member_quality_updates,
             )
 
-        # Ensure cluster member_count reflects current members
+        # Prune non-duplicate members (unalignable or below threshold) so they are marked as Unique
+        if ev.pruned_mids:
+            placeholders = ",".join(["?"] * len(ev.pruned_mids))
+            conn.execute(
+                f"""
+                UPDATE images
+                SET cluster_id = NULL,
+                    is_keeper = 0,
+                    status = 'embedded',
+                    link_signal = NULL,
+                    is_low_confidence = 0,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                WHERE id IN ({placeholders})
+                """,
+                ev.pruned_mids,
+            )
+
+        # Ensure cluster member_count reflects current members; disband if under 2
         surviving = conn.execute("SELECT id FROM images WHERE cluster_id = ?", (ev.cid,)).fetchall()
-        conn.execute("UPDATE clusters SET member_count = ? WHERE id = ?", (len(surviving), ev.cid))
+        if len(surviving) < 2:
+            conn.execute(
+                """
+                UPDATE images
+                SET cluster_id = NULL,
+                    is_keeper = 0,
+                    status = 'embedded',
+                    link_signal = NULL,
+                    is_low_confidence = 0,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                WHERE cluster_id = ?
+                """,
+                (ev.cid,),
+            )
+            conn.execute("DELETE FROM clusters WHERE id = ?", (ev.cid,))
+        else:
+            conn.execute("UPDATE clusters SET member_count = ? WHERE id = ?", (len(surviving), ev.cid))
 
         res.clusters_evaluated += 1
         res.members_evaluated += len(ev.member_records)
