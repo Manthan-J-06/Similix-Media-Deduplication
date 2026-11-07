@@ -1575,9 +1575,10 @@ def _evaluate_cluster_worker(
         )
 
         # Quality metrics recorded for keeper selection.
-        # Members that fail alignment or fall below min_cluster_match_pct are not duplicates;
-        # in Conservative mode (prune_non_duplicates=True), they are pruned and marked Unique.
-        prune_non_duplicates = q_cfg.get("prune_non_duplicates", True)
+        # Members with lower match_pct or unalignable status are safely retained in the cluster
+        # and marked for manual review (review_ids) by core/keeper.py, rather than being
+        # destructively unclustered or falsely marked as unique.
+        prune_non_duplicates = q_cfg.get("prune_non_duplicates", False)
         if prune_non_duplicates:
             if metrics.quality_status == "unalignable" or (match_pct is not None and match_pct < min_cluster_match_pct):
                 pruned_mids.append(mid)

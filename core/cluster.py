@@ -220,7 +220,12 @@ def run_stage2_clustering(
             unclustered_id = id1
 
         if rep_id is not None and unclustered_id is not None:
+            rep_phash = img_map[rep_id].get("phash")
+            u_phash = img_map[unclustered_id].get("phash")
+            pdist = _hamming_distance(rep_phash, u_phash) if (rep_phash and u_phash) else None
             direct_sim = get_sim(unclustered_id, rep_id)
+            if pdist is not None and pdist > 16 and direct_sim < 0.99:
+                continue
             if direct_sim >= cosine_threshold:
                 matches.append((direct_sim, unclustered_id, rep_id, rep_to_cluster[rep_id]))
 
@@ -305,7 +310,12 @@ def run_stage2_clustering(
                 continue
 
             # Check if representatives are candidate duplicates
+            r1_phash = img_map[r1_id].get("phash")
+            r2_phash = img_map[r2_id].get("phash")
+            rep_pdist = _hamming_distance(r1_phash, r2_phash) if (r1_phash and r2_phash) else None
             rep_sim = get_sim(r1_id, r2_id)
+            if rep_pdist is not None and rep_pdist > 16 and rep_sim < 0.99:
+                continue
             if rep_sim < cosine_threshold:
                 continue
 
@@ -410,8 +420,31 @@ def run_stage2_clustering(
             if candidate_id == representative_id:
                 continue
 
-            # Anti-chaining check 1: direct similarity to representative
+            # Anti-chaining check 0: pHash distance layout guard
+            c_phash = img_map[candidate_id].get("phash")
+            min_pdist = None
+            if c_phash:
+                d_list = []
+                if rep_phash:
+                    d_list.append(_hamming_distance(rep_phash, c_phash))
+                for vm_id, _, _ in valid_members:
+                    vm_ph = img_map[vm_id].get("phash")
+                    if vm_ph:
+                        d_list.append(_hamming_distance(vm_ph, c_phash))
+                for other_id in candidate_pool:
+                    if other_id != candidate_id and other_id != representative_id:
+                        o_ph = img_map[other_id].get("phash")
+                        if o_ph and get_sim(candidate_id, other_id) >= cosine_threshold:
+                            d_list.append(_hamming_distance(o_ph, c_phash))
+                if d_list:
+                    min_pdist = min(d_list)
+
             direct_sim = get_sim(candidate_id, representative_id)
+            if min_pdist is not None and min_pdist > 16 and direct_sim < 0.99:
+                still_unclustered.append(candidate_id)
+                continue
+
+            # Anti-chaining check 1: direct similarity to representative
             if direct_sim < cosine_threshold:
                 # Fails representative similarity: split out
                 still_unclustered.append(candidate_id)

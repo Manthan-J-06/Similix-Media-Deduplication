@@ -661,6 +661,7 @@ def run_stage3_verification(
 
         members_to_split: list[tuple[int, str]] = []
         cluster_has_inconclusive = False
+        verified_members: list[tuple[int, str]] = [(rep_id, rep_path)]
 
         for m_row in members:
             m_id = m_row["id"]
@@ -740,6 +741,25 @@ def run_stage3_verification(
                     match_res.verified = True
                     match_res.message = "Verified: low-texture match confirmed by pHash"
 
+            # Connected verification fallback for burst sequences:
+            # If star comparison to cluster representative failed, check against other already-verified cluster members
+            if match_res.status == "failed" and len(verified_members) > 1:
+                for v_id, v_path in list(verified_members):
+                    if v_id == rep_id:
+                        continue
+                    v_kp, v_des = get_features(v_id, v_path)
+                    v_res = verifier.match_features(v_kp, v_des, m_kp, m_des)
+                    if v_res.status == "verified":
+                        match_res = v_res
+                        if match_res.transform_matrix is not None:
+                            p1_s = get_proxy_shape(v_id)
+                            o1_s = orig_dims.get(v_id, (1024, 1024))
+                            p2_s = get_proxy_shape(m_id)
+                            o2_s = orig_dims.get(m_id, (1024, 1024))
+                            M_full = proxy_matrix_to_full(match_res.transform_matrix, p1_s, o1_s, p2_s, o2_s)
+                            cache_pair_transform(conn, v_id, m_id, M_full, verifier.model, match_res.inlier_count, match_res.inlier_ratio)
+                        break
+
             if match_res.status == "inconclusive":
                 res.pairs_inconclusive += 1
                 cluster_has_inconclusive = True
@@ -753,6 +773,7 @@ def run_stage3_verification(
                     cache_pair_transform(conn, rep_id, m_id, M_full, verifier.model, match_res.inlier_count, match_res.inlier_ratio)
             elif match_res.status == "verified":
                 res.pairs_verified += 1
+                verified_members.append((m_id, m_path))
                 conn.execute("UPDATE images SET is_low_confidence = 0 WHERE id = ?", (m_id,))
                 if match_res.transform_matrix is not None:
                     p1_s = get_proxy_shape(rep_id)

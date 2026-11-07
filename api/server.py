@@ -1633,31 +1633,23 @@ def create_app(
         total_images = len(all_active_images)
         delete_safe_count = sum(1 for img in all_active_images if img["delete_safe"] == 1)
 
-        # In conservative mode: drop strictly files marked delete_safe = 1
-        # In balanced/aggressive mode (default): export clean dataset = uniques + 1 keeper per cluster
-        if mode == "conservative":
-            candidates = [img for img in all_active_images if img["delete_safe"] == 0]
-            assert len(candidates) == total_images - delete_safe_count, (
-                f"Clean dataset export invariant violated: expected {total_images - delete_safe_count} images, "
-                f"got {len(candidates)} (total={total_images}, delete_safe={delete_safe_count})"
-            )
-        else:
-            # Collect chosen keeper IDs per cluster
-            cluster_keepers = set()
-            for img in all_active_images:
-                if img["cluster_id"] and (img["is_recommended_keeper"] == 1 or img["is_keeper"] == 1):
-                    cluster_keepers.add(img["id"])
-            clusters_present = {img["cluster_id"] for img in all_active_images if img["cluster_id"]}
-            for cid in clusters_present:
-                c_members = [img for img in all_active_images if img["cluster_id"] == cid]
-                if not any(m["id"] in cluster_keepers for m in c_members):
-                    cluster_keepers.add(c_members[0]["id"])
+        # Clean dataset export: strictly uniques + 1 chosen keeper per cluster.
+        # Duplicate non-keepers (including burst shots and review items) are never downloaded in the clean zip.
+        cluster_keepers = set()
+        for img in all_active_images:
+            if img["cluster_id"] and (img["is_recommended_keeper"] == 1 or img["is_keeper"] == 1):
+                cluster_keepers.add(img["id"])
+        clusters_present = {img["cluster_id"] for img in all_active_images if img["cluster_id"]}
+        for cid in clusters_present:
+            c_members = [img for img in all_active_images if img["cluster_id"] == cid]
+            if not any(m["id"] in cluster_keepers for m in c_members):
+                cluster_keepers.add(c_members[0]["id"])
 
-            candidates = [
-                img for img in all_active_images
-                if (img["cluster_id"] is None or img["cluster_id"] == 0)
-                or (img["id"] in cluster_keepers)
-            ]
+        candidates = [
+            img for img in all_active_images
+            if (img["cluster_id"] is None or img["cluster_id"] == 0)
+            or (img["id"] in cluster_keepers)
+        ]
 
         file_records: list[tuple[str, str]] = [
             (str(img["file_path"]), Path(str(img["file_path"])).name)
