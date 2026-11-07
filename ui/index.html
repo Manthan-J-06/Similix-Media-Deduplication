@@ -494,24 +494,9 @@
       transform: translateY(-2px);
     }
 
-    /* Glowing outline for Recommended Keeper */
-    @keyframes keeper-glow {
-      0% {
-        box-shadow: 0 0 6px rgba(16, 185, 129, 0.5), inset 0 0 2px rgba(16, 185, 129, 0.3);
-        border-color: #10b981;
-      }
-      50% {
-        box-shadow: 0 0 18px rgba(16, 185, 129, 0.85), inset 0 0 6px rgba(16, 185, 129, 0.5);
-        border-color: #34d399;
-      }
-      100% {
-        box-shadow: 0 0 6px rgba(16, 185, 129, 0.5), inset 0 0 2px rgba(16, 185, 129, 0.3);
-        border-color: #10b981;
-      }
-    }
     .member-card.is-keeper {
-      animation: keeper-glow 2.5s infinite ease-in-out;
       border: 2px solid #10b981;
+      box-shadow: 0 0 12px rgba(16, 185, 129, 0.45);
     }
 
     .member-thumb-wrap {
@@ -1755,12 +1740,16 @@
       // Initial batch render (fast initial paint)
       appendNextBatch();
 
-      // Progressive infinite scroll for subsequent clusters
+      // Progressive infinite scroll for subsequent clusters (throttled with rAF)
+      let isBatchPending = false;
       container.onscroll = () => {
-        if (renderedCount < clusters.length) {
-          if (container.scrollTop + container.clientHeight >= container.scrollHeight - 250) {
+        if (isBatchPending || renderedCount >= clusters.length) return;
+        if (container.scrollTop + container.clientHeight >= container.scrollHeight - 300) {
+          isBatchPending = true;
+          requestAnimationFrame(() => {
             appendNextBatch();
-          }
+            isBatchPending = false;
+          });
         }
       };
     }
@@ -1773,10 +1762,11 @@
       const selSeq = ++currentClusterSelectSeq;
       activeClusterId = clusterId;
 
-      // Update active highlight in left list
-      document.querySelectorAll(".cluster-item").forEach(el => {
-        el.classList.toggle("active", parseInt(el.dataset.clusterId, 10) === clusterId);
-      });
+      // Update active highlight in left list (O(1) DOM update)
+      const prevActive = container.querySelector(".cluster-item.active");
+      if (prevActive) prevActive.classList.remove("active");
+      const nextActive = container.querySelector(`.cluster-item[data-cluster-id="${clusterId}"]`);
+      if (nextActive) nextActive.classList.add("active");
 
       try {
         const res = await fetch(`/clusters/${clusterId}?mode=${encodeURIComponent(currentMode)}`);

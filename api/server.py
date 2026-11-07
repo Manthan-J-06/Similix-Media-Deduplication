@@ -1856,24 +1856,30 @@ def create_app(
             "SELECT id, representative_id, reference_uncertain, category, manual_category FROM clusters ORDER BY id"
         ).fetchall()
 
+        all_members = conn.execute(
+            """
+            SELECT id, cluster_id, file_path, width, height, file_size, format, md5,
+                   is_keeper, is_low_confidence, ssim, ssim_color, sharpness_ratio,
+                   pixel_ratio, bytes_ratio, quality_status, review_flag, delete_safe,
+                   reason, source_likelihood, jpeg_quality_est, category_top1,
+                   category_top1_prob, category_top2, category_top2_prob, match_pct,
+                   resolution_pct, confidence, status
+            FROM images
+            WHERE cluster_id IS NOT NULL AND (status IS NULL OR status NOT IN ('trashed', 'deleted', 'dismissed'))
+            ORDER BY id
+            """
+        ).fetchall()
+
+        from collections import defaultdict
+        members_by_cluster = defaultdict(list)
+        for m in all_members:
+            members_by_cluster[m["cluster_id"]].append(m)
+
         results: list[dict[str, Any]] = []
         for c_row in c_rows:
             cid = c_row["id"]
             ref_unc = c_row["reference_uncertain"] if "reference_uncertain" in c_row.keys() else 0
-            members = conn.execute(
-                """
-                SELECT id, cluster_id, file_path, width, height, file_size, format, md5,
-                       is_keeper, is_low_confidence, ssim, ssim_color, sharpness_ratio,
-                       pixel_ratio, bytes_ratio, quality_status, review_flag, delete_safe,
-                       reason, source_likelihood, jpeg_quality_est, category_top1,
-                       category_top1_prob, category_top2, category_top2_prob, match_pct,
-                       resolution_pct, confidence, status
-                FROM images
-                WHERE cluster_id = ? AND (status IS NULL OR status NOT IN ('trashed', 'deleted', 'dismissed'))
-                ORDER BY id
-                """,
-                (cid,),
-            ).fetchall()
+            members = members_by_cluster.get(cid, [])
 
             live_members = [
                 m for m in members
@@ -2377,6 +2383,31 @@ def create_app(
             if not row:
                 raise HTTPException(status_code=404, detail=f"Image {image_id} not found")
 
+            cache_dir = user.thumb_cache_dir
+            validate_confined_user_path(cache_dir, user.root)
+            cache_key = _thumb_cache_key(image_id, row["md5"], row["modified_time"], size)
+            cache_path = cache_dir / cache_key
+            legacy_path = cache_dir / f"{image_id}_{size}.jpg"
+
+            etag = f'"{row["md5"] or image_id}"'
+            _thumb_headers = {
+                "Cache-Control": "private, max-age=3600",
+                "ETag": etag,
+            }
+
+            # 1. Fast-path: Immediate O(1) cache hit check without resolving source file
+            for hit_candidate in (cache_path, legacy_path):
+                if hit_candidate.is_file():
+                    try:
+                        st = hit_candidate.stat()
+                        if st.st_size > 0:
+                            if request and request.headers.get("if-none-match") == etag:
+                                return Response(status_code=304, headers=_thumb_headers)
+                            return FileResponse(str(hit_candidate), media_type="image/jpeg", headers=_thumb_headers)
+                    except OSError:
+                        pass
+
+            # 2. Cache miss: resolve source path
             file_path_str = str(row["file_path"])
             orig_path: Path | None = None
 
@@ -2404,9 +2435,12 @@ def create_app(
                         except Exception:
                             pass
                     if orig_path is None:
+                        candidate_plain = drive_cache_dir / f"{safe_drive_id}.jpg"
+                        if candidate_plain.is_file():
+                            orig_path = candidate_plain
+
+                    if orig_path is None:
                         matches = sorted(drive_cache_dir.glob(f"{safe_drive_id}_*.jpg"))
-                        if not matches:
-                            matches = sorted(drive_cache_dir.glob(f"{safe_drive_id}.jpg"))
                         if matches:
                             orig_path = matches[0]
 
@@ -2430,14 +2464,8 @@ def create_app(
                             if matches:
                                 orig_path = matches[0]
                             else:
-                                cache_dir = user.thumb_cache_dir
-                                cache_path = cache_dir / f"{image_id}_{size}.jpg"
                                 cache_dir.mkdir(parents=True, exist_ok=True)
                                 thumb_im.save(str(cache_path), format="JPEG", quality=85)
-                                _thumb_headers = {
-                                    "Cache-Control": "private, max-age=3600",
-                                    "ETag": f'"{row["md5"] or image_id}"',
-                                }
                                 return FileResponse(str(cache_path), media_type="image/jpeg", headers=_thumb_headers)
                         except Exception as exc:
                             logger.warning(f"Could not refetch Drive thumbnail for image {image_id} ({drive_id}): {exc}")
@@ -2453,31 +2481,15 @@ def create_app(
                 logger.warning(f"Image {image_id} source file not found on disk: {file_path_str}")
                 return Response(content=PLACEHOLDER_JPEG_BYTES, media_type="image/jpeg", status_code=200)
 
-            cache_dir = user.thumb_cache_dir
-            validate_confined_user_path(cache_dir, user.root)
-            cache_key = _thumb_cache_key(image_id, row["md5"], row["modified_time"], size)
-            cache_path = cache_dir / cache_key
-            legacy_path = cache_dir / f"{image_id}_{size}.jpg"
+            # Fast-path for Google Drive cached proxies:
+            # If the source file is in drive_cache_dir (already a ~512px compressed JPEG proxy)
+            # and requested size is 320 or greater, serve the proxy directly without PIL decompress/re-encode
+            if is_drive and orig_path.is_file() and size >= 320:
+                if request and request.headers.get("if-none-match") == etag:
+                    return Response(status_code=304, headers=_thumb_headers)
+                return FileResponse(str(orig_path), media_type="image/jpeg", headers=_thumb_headers)
 
-            etag = f'"{row["md5"] or image_id}"'
-            _thumb_headers = {
-                "Cache-Control": "private, max-age=3600",
-                "ETag": etag,
-            }
-
-            # Fast-path: Direct O(1) cache hit check without directory globbing
-            for hit_candidate in (cache_path, legacy_path):
-                if hit_candidate.is_file():
-                    try:
-                        st = hit_candidate.stat()
-                        if st.st_size > 0 and st.st_mtime >= orig_path.stat().st_mtime:
-                            if request and request.headers.get("if-none-match") == etag:
-                                return Response(status_code=304, headers=_thumb_headers)
-                            return FileResponse(str(hit_candidate), media_type="image/jpeg", headers=_thumb_headers)
-                    except OSError:
-                        pass
-
-            # Cache miss: generate thumbnail under lock to avoid duplicated work
+            # Generate thumbnail under lock to avoid duplicated work
             lock = _get_thumb_lock(image_id, size)
             with lock:
                 # Double-check inside lock
@@ -2485,7 +2497,7 @@ def create_app(
                     if hit_candidate.is_file():
                         try:
                             st = hit_candidate.stat()
-                            if st.st_size > 0 and st.st_mtime >= orig_path.stat().st_mtime:
+                            if st.st_size > 0:
                                 return FileResponse(str(hit_candidate), media_type="image/jpeg", headers=_thumb_headers)
                         except OSError:
                             pass
@@ -2501,17 +2513,6 @@ def create_app(
                         img.thumbnail((size, size), Image.Resampling.BILINEAR)
                         img.save(str(tmp_path), format="JPEG", quality=85)
                     os.replace(str(tmp_path), str(cache_path))
-
-                    # Evict stale thumbnails only when generating a new thumbnail
-                    try:
-                        for stale in cache_dir.glob(f"{image_id}_*_{size}.jpg"):
-                            if stale != cache_path:
-                                try:
-                                    stale.unlink()
-                                except OSError:
-                                    pass
-                    except Exception:
-                        pass
                 except Exception as exc:
                     if tmp_path.exists():
                         try:
@@ -2557,22 +2558,27 @@ def create_app(
         """Return cluster counts per category (same visibility rules as /clusters).
         Only clusters with >=2 live members are counted. Zero-count categories are omitted.
         """
-        from collections import Counter
+        from collections import Counter, defaultdict
         c_rows = conn.execute(
             "SELECT id, representative_id, reference_uncertain, category, manual_category FROM clusters ORDER BY id"
         ).fetchall()
 
+        all_members = conn.execute(
+            """
+            SELECT id, cluster_id, file_path, category_top1
+            FROM images
+            WHERE cluster_id IS NOT NULL AND (status IS NULL OR status NOT IN ('trashed', 'deleted', 'dismissed'))
+            """
+        ).fetchall()
+
+        members_by_cluster = defaultdict(list)
+        for m in all_members:
+            members_by_cluster[m["cluster_id"]].append(m)
+
         cat_counts: Counter = Counter()
         for c_row in c_rows:
             cid = c_row["id"]
-            members = conn.execute(
-                """
-                SELECT id, file_path, category_top1
-                FROM images
-                WHERE cluster_id = ? AND (status IS NULL OR status NOT IN ('trashed', 'deleted', 'dismissed'))
-                """,
-                (cid,),
-            ).fetchall()
+            members = members_by_cluster.get(cid, [])
             live_members = [
                 m for m in members
                 if str(m["file_path"]).startswith("drive://") or os.path.exists(m["file_path"])
