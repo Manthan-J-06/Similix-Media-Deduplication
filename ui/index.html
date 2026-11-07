@@ -1329,28 +1329,18 @@
 
         <!-- Tab 2: Drive -->
         <div id="tab-drive" class="source-tab-pane" style="display:none;">
-          <!-- Primary Section: Public / Shared Link Scanner -->
-          <div id="drive-scan-panel" style="margin-bottom:16px;">
-            <label style="font-size:0.88rem; font-weight:600; display:block; margin-bottom:6px;">Google Drive Link (Folder, File, or ZIP Archive):</label>
-            <input type="text" id="drive-link-input" class="search-input" style="width:100%; box-sizing:border-box;" placeholder="https://drive.google.com/file/d/... or https://drive.google.com/drive/folders/...">
-            <div style="font-size:0.8rem; color:var(--success); margin-top:6px; display:flex; align-items:center; gap:6px;">
-              <span>✓</span> <span>Public &amp; shared links work directly — no Google sign-in required!</span>
-            </div>
-            <button type="button" class="btn btn-primary" id="btn-scan-drive" style="margin-top:10px; width:100%;">Scan Drive (Read-Only)</button>
-          </div>
-
-          <!-- Secondary Section: Private Drive Access & Settings -->
-          <div id="drive-auth-panel" style="padding:12px 14px; border-radius:6px; background:rgba(255,255,255,0.02); border:1px solid var(--border);">
+          <!-- Google Account Connection -->
+          <div id="drive-auth-panel" style="padding:12px 14px; border-radius:6px; background:rgba(255,255,255,0.02); border:1px solid var(--border); margin-bottom:16px;">
             <div id="drive-status-message" style="font-size:0.85rem; padding:8px 12px; border-radius:6px; margin-bottom:10px; display:none;"></div>
 
             <div id="drive-connect-view">
               <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
                 <div>
-                  <div style="font-size:0.82rem; font-weight:500;">Private Google Drive Files (Optional)</div>
-                  <div style="font-size:0.75rem; color:var(--text-muted);">Only needed if accessing private, non-shared files from your personal drive.</div>
+                  <div style="font-size:0.82rem; font-weight:500;">Google Account Authentication</div>
+                  <div style="font-size:0.75rem; color:var(--text-muted);">Sign in to authorize scanning your shared and private Google Drive folders.</div>
                 </div>
                 <div style="display:flex; gap:8px; align-items:center;">
-                  <button type="button" class="btn btn-secondary" id="btn-connect-drive" style="font-size:0.8rem; padding:4px 10px;">Sign in with Google</button>
+                  <button type="button" class="btn btn-secondary" id="btn-connect-drive" style="font-size:0.8rem; padding:6px 12px;">Sign in with Google</button>
                 </div>
               </div>
             </div>
@@ -1359,6 +1349,16 @@
               <span style="font-size:0.85rem; color:var(--success); font-weight:500;" id="drive-connected-user">Connected as ...</span>
               <button type="button" class="btn" id="btn-disconnect-drive" style="padding:4px 10px; font-size:0.8rem;">Disconnect</button>
             </div>
+          </div>
+
+          <!-- Section: Folder Link Scanner -->
+          <div id="drive-scan-panel" style="margin-bottom:16px;">
+            <label style="font-size:0.88rem; font-weight:600; display:block; margin-bottom:6px;">Google Drive Folder Link:</label>
+            <input type="text" id="drive-link-input" class="search-input" style="width:100%; box-sizing:border-box;" placeholder="https://drive.google.com/drive/folders/...">
+            <div style="font-size:0.78rem; color:var(--text-muted); margin-top:6px; display:flex; align-items:center; gap:6px;">
+              <span>🔒</span> <span><strong>Scoped Access:</strong> Argus strictly reads <em>only</em> the folder you provide above. Your private drive, root, and other files are never accessed.</span>
+            </div>
+            <button type="button" class="btn btn-primary" id="btn-scan-drive" style="margin-top:10px; width:100%;">Scan Folder (Read-Only)</button>
           </div>
         </div>
 
@@ -3624,7 +3624,7 @@
         const data = await res.json();
         sourcesModal.style.display = "none";
         btn.disabled = false;
-        btn.textContent = "Scan Drive (Read-Only)";
+        btn.textContent = "Scan Folder (Read-Only)";
         refreshAll({ preserveActiveCluster: true });
         if (data && typeof data.job_id === "string" && data.job_id.trim()) {
           pollJobProgress(data.job_id);
@@ -3633,7 +3633,7 @@
         }
       } catch (err) {
         btn.disabled = false;
-        btn.textContent = "Scan Drive (Read-Only)";
+        btn.textContent = "Scan Folder (Read-Only)";
         const msg = document.getElementById("source-status-msg");
         msg.style.display = "block";
         msg.style.background = "var(--danger-bg)";

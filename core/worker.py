@@ -347,6 +347,8 @@ def run_pipeline(
                             drive_folder_id = row_fid[0].split(":", 1)[0]
                     except Exception:
                         pass
+            if not drive_folder_id or drive_folder_id == "root":
+                raise ValueError("Security violation: A specific Google Drive folder ID is required. Scanning root or entire drive is prohibited.")
             user_tok = resolved_db.parent / "drive_token.json"
             tok_path = user_tok if user_tok.exists() else None
             cache_p = resolved_db.parent / "drive_cache"
@@ -385,10 +387,6 @@ def run_pipeline(
         else:
             from sources.local_folder import LocalFolderSource
             scan_dir = Path(folder or cfg.get("sources", {}).get("library_dir", resolve_data_dir() / "library")).expanduser().resolve()
-            if not (scan_dir.is_dir() and any(scan_dir.iterdir())):
-                shared_lib = resolve_data_dir() / "library"
-                if shared_lib.is_dir() and any(shared_lib.iterdir()):
-                    scan_dir = shared_lib.resolve()
             source_active = LocalFolderSource(scan_dir)
             files = list(source_active.list_files())
             total_files = len(files)

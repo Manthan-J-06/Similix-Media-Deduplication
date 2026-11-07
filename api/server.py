@@ -1166,6 +1166,7 @@ def create_app(
     config_path: str | Path | None = None,
     auth_db_path: str | Path | None = None,
     users_dir: str | Path | None = None,
+    data_dir: str | Path | None = None,
 ) -> FastAPI:
     """Create and configure the SIMILIX FastAPI application with per-user isolation."""
     if config is None:
@@ -1174,7 +1175,7 @@ def create_app(
         except Exception:
             config = {}
 
-    raw_data_dir = get_env("DATA_DIR") or config.get("general", {}).get("data_dir")
+    raw_data_dir = data_dir or get_env("DATA_DIR") or config.get("general", {}).get("data_dir")
     data_root = resolve_data_dir(raw_data_dir)
 
     explicit_db_path = db_path is not None
@@ -3993,6 +3994,11 @@ def create_app(
             raise HTTPException(status_code=403, detail="Google Drive integration is disabled in hosted mode.")
 
         folder_id = extract_drive_folder_id(req.link)
+        if not folder_id or folder_id == "root":
+            raise HTTPException(
+                status_code=400,
+                detail="Please specify a specific Google Drive folder link. Scanning your entire Google Drive root is prohibited for your security.",
+            )
 
         user_tok = user.root / "drive_token.json"
         is_public = False
@@ -4002,17 +4008,17 @@ def create_app(
             try:
                 creds = get_drive_credentials(token_path=user_tok, prompt_if_missing=False)
             except Exception as exc:
-                logger.warning("User drive token invalid/expired: %s; falling back to public link check", exc)
+                logger.warning("User drive token invalid/expired: %s", exc)
                 creds = None
 
         if creds and getattr(creds, "valid", False):
             is_public = False
         else:
             pub_res = check_drive_link_accessibility(req.link)
-            if not pub_res.get("is_public"):
+            if not pub_res.get("is_public") or not pub_res.get("is_file"):
                 raise HTTPException(
                     status_code=400,
-                    detail="This Google Drive folder is private or requires sign-in. Please connect your Google Drive account first.",
+                    detail="Google Drive authentication required. Please connect your Google Drive account first before scanning this folder.",
                 )
             is_public = True
 
@@ -4242,28 +4248,6 @@ def create_app(
         target_folder = user.library_dir
         target_folder.mkdir(parents=True, exist_ok=True)
         local_files = [f for f in target_folder.rglob("*") if f.is_file() and f.suffix.lower() in DEFAULT_EXTENSIONS and not f.name.startswith(".")]
-        if not local_files:
-            candidates = [
-                getattr(request.app.state, "data_root", resolve_data_dir()) / "library",
-                Path("/content/ARGUS-Media-Deduplication/.similix/library"),
-                Path.cwd() / ".similix" / "library",
-            ]
-            for shared_lib in candidates:
-                if shared_lib.is_dir():
-                    shared_images = [f for f in shared_lib.rglob("*") if f.is_file() and f.suffix.lower() in DEFAULT_EXTENSIONS and not f.name.startswith(".")]
-                    if shared_images:
-                        for f in shared_images:
-                            target_f = target_folder / f.name
-                            if not target_f.exists():
-                                try:
-                                    target_f.symlink_to(f)
-                                except Exception:
-                                    try:
-                                        shutil.copy2(f, target_f)
-                                    except Exception:
-                                        pass
-                        break
-            local_files = [f for f in target_folder.rglob("*") if f.is_file() and f.suffix.lower() in DEFAULT_EXTENSIONS and not f.name.startswith(".")]
         return target_folder, len(local_files)
 
     @app.get("/sources/library-info")
@@ -4333,10 +4317,18 @@ def create_app(
                         drive_folder_id = row_fid[0].split(":", 1)[0]
                 except Exception:
                     pass
+            if not drive_folder_id or drive_folder_id == "root":
+                raise HTTPException(
+                    status_code=400,
+                    detail="No previous Google Drive folder found to rescan. Please provide a folder link.",
+                )
         elif local_count > 0:
             source_type = "local"
         else:
-            source_type = "local"
+            raise HTTPException(
+                status_code=400,
+                detail="Your library is currently empty. Please upload photos or provide a Google Drive folder link to scan.",
+            )
 
         job_id = launch_pipeline_job(
             request.app,

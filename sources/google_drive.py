@@ -242,7 +242,7 @@ def get_drive_credentials(
         if not prompt_if_missing:
             raise FileNotFoundError(
                 f"Valid Google Drive credentials not found at {tok_path}. "
-                f"Run `similix drive-auth` to authorize."
+                f"Please click 'Sign in with Google' to authorize access."
             )
 
         if not sec_path.exists():
@@ -534,16 +534,13 @@ class GoogleDriveSource(ImageSource):
             except Exception as exc:
                 logger.warning("Remote public ZIP discovery failed for %s: %s", self.folder_id, exc)
 
-        if self.all_drive:
-            folder_queue.append(None)
-        elif self.folder_id:
-            folder_queue.append(self.folder_id)
-        else:
-            logger.warning(
-                "GoogleDriveSource: neither folder_id nor all_drive was set. "
-                "Refusing to crawl Google Drive root to protect user privacy."
+        if not self.folder_id or self.folder_id == "root" or getattr(self, "all_drive", False):
+            raise ValueError(
+                "Security violation: Specific folder_id is required. "
+                "Scanning root or your entire Google Drive is strictly prohibited to protect user privacy."
             )
-            return
+
+        folder_queue.append(self.folder_id)
 
         while folder_queue:
             curr_folder = folder_queue.pop(0)

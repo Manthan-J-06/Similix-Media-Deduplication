@@ -784,6 +784,12 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
     cfg = load_config(args.config) if getattr(args, "config", None) else load_config()
     db_path = getattr(args, "db", None)
+    cand_data_dir = None
+    if not getattr(args, "folder", None):
+        cand_local = Path(".similix").resolve()
+        if cand_local.is_dir() and ((cand_local / "auth.db").exists() or (cand_local / "similix.db").exists() or (cand_local / "client_secret.json").exists()):
+            cand_data_dir = cand_local
+
     if not db_path and getattr(args, "folder", None):
         target = Path(args.folder).expanduser().resolve()
         if target.is_file() and target.suffix == ".db":
@@ -807,6 +813,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
         trash_dir=getattr(args, "trash_dir", None),
         thumb_cache_dir=getattr(args, "thumb_cache_dir", None),
         config=cfg,
+        data_dir=cand_data_dir,
     )
     # Bind host and port, supporting HOST/PORT env vars for container deployments
     host = getattr(args, "host", None) or os.environ.get("HOST", "127.0.0.1")
