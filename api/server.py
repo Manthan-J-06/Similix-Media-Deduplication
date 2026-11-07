@@ -261,16 +261,15 @@ def check_drive_link_accessibility(folder_id_or_link: str, timeout: float = 8.0)
     urls_to_try = []
     if is_explicit_file:
         urls_to_try = [
+            f"https://drive.google.com/file/d/{folder_id}/view",
             f"https://drive.usercontent.google.com/download?id={folder_id}&export=download&confirm=t",
             f"https://drive.google.com/uc?id={folder_id}&export=download&confirm=t",
-            f"https://drive.google.com/file/d/{folder_id}/view",
-            f"https://drive.google.com/embeddedfolderview?id={folder_id}",
         ]
     else:
         urls_to_try = [
-            f"https://drive.google.com/embeddedfolderview?id={folder_id}",
-            f"https://drive.usercontent.google.com/download?id={folder_id}&export=download&confirm=t",
+            f"https://drive.google.com/drive/folders/{folder_id}",
             f"https://drive.google.com/file/d/{folder_id}/view",
+            f"https://drive.usercontent.google.com/download?id={folder_id}&export=download&confirm=t",
         ]
 
     class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -310,7 +309,7 @@ def check_drive_link_accessibility(folder_id_or_link: str, timeout: float = 8.0)
                     
                     content_peek = resp.read(8192).decode("utf-8", errors="ignore")
                     if not filename:
-                        m_title = re.search(r"<title>(.*?)(?: - Google Drive)?</title>", content_peek, re.IGNORECASE)
+                        m_title = re.search(r"<title>(.*?)(?:\s*[-–—]\s*Google Drive)?</title>", content_peek, re.IGNORECASE)
                         if m_title and "Virus scan warning" not in m_title.group(1):
                             filename = m_title.group(1).strip()
                         elif "Virus scan warning" in content_peek:
