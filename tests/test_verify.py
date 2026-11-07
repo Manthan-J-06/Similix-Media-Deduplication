@@ -250,10 +250,11 @@ class TestStage3ClusterPipelineSplitting:
         # Both images unclustered
         assert conn.execute("SELECT COUNT(*) FROM images WHERE cluster_id IS NOT NULL").fetchone()[0] == 0
 
-    def test_split_members_re_evaluated_into_two_clusters(self, tmp_path, benchmark_available):
+    def test_failed_members_become_singletons_no_subclusters(self, tmp_path, benchmark_available):
         """
-        A mixed cluster containing scene A (rep) and scene B members must end
-        as two clusters, with no member left ungrouped.
+        A cluster containing scene A (rep) and unrelated scene B members must verify
+        genuine scene A duplicates and split failing scene B members out as singletons,
+        preventing non-deterministic sub-cluster cascades.
         """
         if not benchmark_available:
             pytest.skip("Benchmark files not present in data/benchmark")
@@ -287,22 +288,20 @@ class TestStage3ClusterPipelineSplitting:
 
         res = run_stage3_verification(conn, cfg)
 
-        # Must end as two clusters!
+        # Exactly 1 surviving cluster (Scene A)
         all_clusters = conn.execute("SELECT id, representative_id, member_count FROM clusters ORDER BY id").fetchall()
-        assert len(all_clusters) == 2, f"Expected 2 clusters, got {len(all_clusters)}"
+        assert len(all_clusters) == 1, f"Expected 1 cluster, got {len(all_clusters)}"
 
-        # No member left ungrouped!
-        ungrouped = conn.execute("SELECT COUNT(*) FROM images WHERE cluster_id IS NULL").fetchone()[0]
-        assert ungrouped == 0, f"Expected 0 ungrouped images, got {ungrouped}"
-
-        # Cluster 1 has scene A members (ids 1, 2)
+        # Scene A members (ids 1, 2) remain in c1
         c1_members = {row["id"] for row in conn.execute("SELECT id FROM images WHERE cluster_id = ?", (c1,)).fetchall()}
         assert c1_members == {1, 2}
 
-        # Cluster 2 has scene B members (ids 3, 4)
-        c2_id = [c["id"] for c in all_clusters if c["id"] != c1][0]
-        c2_members = {row["id"] for row in conn.execute("SELECT id FROM images WHERE cluster_id = ?", (c2_id,)).fetchall()}
-        assert c2_members == {3, 4}
+        # Failing Scene B members (ids 3, 4) become singletons (cluster_id IS NULL)
+        p9_rows = conn.execute("SELECT id, cluster_id, is_keeper, status FROM images WHERE id IN (3, 4)").fetchall()
+        for r in p9_rows:
+            assert r["cluster_id"] is None
+            assert r["is_keeper"] == 0
+            assert r["status"] == "embedded"
 
     def test_inconclusive_verdict_low_keypoints_and_auto_delete_exclusion(self, tmp_path):
         """

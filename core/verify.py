@@ -318,6 +318,7 @@ class KeypointVerifier:
         self.min_inliers = int(stage3_cfg.get("min_inliers", 20))
         self.min_inlier_ratio = float(stage3_cfg.get("min_inlier_ratio", 0.65))
         self.model = str(stage3_cfg.get("transformation_model", "affine")).lower()
+        cv2.setRNGSeed(42)
 
         if self.algorithm == "orb":
             self.detector = cv2.ORB_create(nfeatures=self.max_features)
@@ -535,13 +536,12 @@ def run_stage3_verification(
     2. Compares each non-representative cluster member against the representative.
     3. If either image has < min_keypoints, verdict is 'inconclusive'; the member keeps
        its cluster, gets is_low_confidence = 1 in the database, and is excluded from auto-delete.
-    4. Members that fail geometric verification are split out of the cluster.
+    4. Members that fail geometric verification leave the cluster and become singletons (cluster_id = NULL).
     5. Disbands clusters reduced to fewer than 2 members.
-    6. Re-evaluates split members: matches them against other cluster representatives and
-       against each other to form separate clusters (never simply dropped).
-    7. Caches keypoints and descriptors in SQLite table keypoint_cache and in-memory.
+    6. Caches keypoints and descriptors in SQLite table keypoint_cache and in-memory.
     """
     t0 = time.perf_counter()
+    cv2.setRNGSeed(42)
     verifier = KeypointVerifier(config)
 
     # Ensure keypoint cache table, pair_transforms table, and is_low_confidence column exist
@@ -691,11 +691,8 @@ def run_stage3_verification(
                 except Exception:
                     pass
 
-            if match_res.status == "inconclusive" or (match_res.status == "failed" and match_res.inlier_count >= 15 and match_res.transform_matrix is not None):
-                # Guard against impostor false-positives masquerading as inconclusive due to low keypoints,
-                # AND recover genuine high-confidence duplicates where RANSAC found a valid geometric
-                # transformation with substantial inliers (>= 15), but natural background texture/clutter
-                # slightly diluted the inlier ratio below the strict threshold.
+            if match_res.status == "inconclusive":
+                # Guard against impostor false-positives masquerading as inconclusive due to low keypoints
                 rep_meta = conn.execute("SELECT phash, clip_vector FROM images WHERE id = ?", (rep_id,)).fetchone()
                 m_meta = conn.execute("SELECT phash, clip_vector FROM images WHERE id = ?", (m_id,)).fetchone()
                 is_obvious_mismatch = False
@@ -730,21 +727,9 @@ def run_stage3_verification(
                     elif (pdist is not None and pdist > 8) and (csim is not None and csim < 0.88):
                         is_obvious_mismatch = True
 
-                    # 2. Confirmed genuine duplicate on low-texture images OR geometric inliers with high CLIP similarity
-                    if match_res.status == "inconclusive":
-                        if (pdist is not None and pdist <= 8) or (csim is not None and csim >= 0.92):
-                            is_confirmed_match = True
-                    elif match_res.status == "failed":
-                        # Only recover if there is genuine geometric alignment (>= 15 inliers with valid transformation)
-                        # that was rejected merely due to strict inlier ratio on high-texture backgrounds:
-                        if (
-                            match_res.inlier_count >= 15
-                            and match_res.transform_matrix is not None
-                            and csim is not None
-                            and csim >= 0.90
-                            and (pdist is None or pdist <= 16)
-                        ):
-                            is_confirmed_match = True
+                    # 2. Confirmed genuine duplicate on low-texture flat surfaces (insufficient keypoints)
+                    if pdist is not None and pdist <= 8:
+                        is_confirmed_match = True
 
                 if is_obvious_mismatch:
                     match_res.status = "failed"
@@ -753,7 +738,7 @@ def run_stage3_verification(
                 elif is_confirmed_match:
                     match_res.status = "verified"
                     match_res.verified = True
-                    match_res.message = "Verified: confirmed by geometric alignment and CLIP similarity"
+                    match_res.message = "Verified: low-texture match confirmed by pHash"
 
             if match_res.status == "inconclusive":
                 res.pairs_inconclusive += 1
@@ -801,7 +786,6 @@ def run_stage3_verification(
             conn.execute("UPDATE images SET is_low_confidence = 0 WHERE id = ?", (rep_id,))
 
         # Split failing members out of the cluster
-        current_split_group: list[tuple[int, str]] = list(members_to_split)
         if members_to_split:
             conn.executemany(
                 """
@@ -825,10 +809,7 @@ def run_stage3_verification(
         ).fetchone()[0]
 
         if remaining_count < 2:
-            # Cluster reduced below 2 members: disband and add remaining rep to split group
-            rep_row = conn.execute("SELECT id, file_path FROM images WHERE id = ?", (rep_id,)).fetchone()
-            if rep_row is not None:
-                current_split_group.insert(0, (rep_row["id"], rep_row["file_path"]))
+            # Cluster reduced below 2 members: disband into singletons
             conn.execute(
                 """
                 UPDATE images
@@ -851,73 +832,6 @@ def run_stage3_verification(
                 (remaining_count, cluster_id),
             )
         conn.commit()
-
-        # Re-evaluate co-split members from this cluster among each other (e.g. mixed-scene clusters)
-        if len(current_split_group) >= 2:
-            sub_pool = list(current_split_group)
-            while len(sub_pool) >= 2:
-                seed_id, seed_path = sub_pool.pop(0)
-                seed_kp, seed_des = get_features(seed_id, seed_path)
-                cand_members: list[tuple[int, str]] = [(seed_id, seed_path)]
-                unmatched: list[tuple[int, str]] = []
-                for mid, mpath in sub_pool:
-                    mkp, mdes = get_features(mid, mpath)
-                    mres = verifier.match_features(seed_kp, seed_des, mkp, mdes)
-                    if mres.status == "verified":
-                        cand_members.append((mid, mpath))
-                        if mres.transform_matrix is not None:
-                            p1_s = get_proxy_shape(seed_id)
-                            o1_s = orig_dims.get(seed_id, (1024, 1024))
-                            p2_s = get_proxy_shape(mid)
-                            o2_s = orig_dims.get(mid, (1024, 1024))
-                            M_full = proxy_matrix_to_full(mres.transform_matrix, p1_s, o1_s, p2_s, o2_s)
-                            cache_pair_transform(conn, seed_id, mid, M_full, verifier.model, mres.inlier_count, mres.inlier_ratio)
-                    else:
-                        unmatched.append((mid, mpath))
-
-                sub_pool = unmatched
-                if len(cand_members) >= 2:
-                    conn.execute(
-                        """
-                        INSERT INTO clusters (representative_id, stage_detected, member_count)
-                        VALUES (?, 3, ?)
-                        """,
-                        (seed_id, len(cand_members)),
-                    )
-                    new_cid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-                    has_low = 1 if len(seed_kp) < verifier.min_keypoints else 0
-
-                    conn.execute(
-                        """
-                        UPDATE images
-                        SET cluster_id        = ?,
-                            is_keeper         = 1,
-                            confidence        = 100.0,
-                            link_signal       = 'sift',
-                            status            = 'clustered',
-                            is_low_confidence = ?,
-                            updated_at        = strftime('%Y-%m-%dT%H:%M:%SZ','now')
-                        WHERE id = ?
-                        """,
-                        (new_cid, has_low, seed_id),
-                    )
-                    for mid, _mpath in cand_members[1:]:
-                        conn.execute(
-                            """
-                            UPDATE images
-                            SET cluster_id        = ?,
-                                is_keeper         = 0,
-                                confidence        = 100.0,
-                                link_signal       = 'sift',
-                                status            = 'clustered',
-                                is_low_confidence = ?,
-                                updated_at        = strftime('%Y-%m-%dT%H:%M:%SZ','now')
-                            WHERE id = ?
-                            """,
-                            (new_cid, has_low, mid),
-                        )
-                    res.new_clusters_formed += 1
-                    conn.commit()
 
     # Populate images.confidence using the fused logistic regression model
     update_cluster_duplicate_confidences(conn)

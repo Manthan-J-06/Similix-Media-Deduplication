@@ -1594,82 +1594,50 @@ def create_app(
         user: UserContext = Depends(get_current_user),
         conn: sqlite3.Connection = Depends(get_db),
     ):
-        """Stream a zip archive of the complete deduplicated dataset: all unique images plus the recommended keeper from each cluster (local or Google Drive)."""
-        clusters = conn.execute("SELECT id, reference_uncertain FROM clusters").fetchall()
-        gdrive_source = _get_user_gdrive_source(request, user, conn)
+        """
+        Stream a zip archive of the complete clean dataset:
+        Removes ONLY files with delete_safe = 1 for the chosen mode.
+        Guarantees exported_count == total_images - delete_safe_count.
+        Every non-delete-safe file (keepers, uniques, review items) is strictly preserved.
+        """
+        from core.keeper import run_keeper_pipeline
+        cfg = getattr(request.app.state, "config", {}) or {}
+        run_keeper_pipeline(conn, mode=mode, config=cfg)
+        conn.execute("UPDATE images SET delete_safe = 0 WHERE cluster_id IS NULL OR cluster_id = 0")
+        conn.commit()
 
-        candidates: list[dict[str, Any]] = []
-        cluster_keeper_ids: set[int] = set()
-
-        for c in clusters:
-            cid = c["id"]
-            ref_unc = c["reference_uncertain"] if "reference_uncertain" in c.keys() else 0
-            members = conn.execute(
-                "SELECT * FROM images WHERE cluster_id = ? AND (status IS NULL OR status NOT IN ('trashed', 'deleted', 'dismissed'))",
-                (cid,),
-            ).fetchall()
-            live_members = [
-                m for m in members
-                if str(m["file_path"]).startswith("drive://") or (os.path.exists(m["file_path"]) and not os.path.islink(m["file_path"]))
-            ]
-            if len(live_members) == 1:
-                m = live_members[0]
-                cluster_keeper_ids.add(m["id"])
-                candidates.append(dict(m))
-                continue
-            if len(live_members) < 2:
-                continue
-
-            member_dicts = [dict(m) for m in live_members]
-            res = choose_keeper(
-                member_dicts,
-                mode=mode,
-                config=request.app.state.config,
-                reference_uncertain=ref_unc,
-            )
-            k_id = res.get("keeper_id")
-            if k_id:
-                cluster_keeper_ids.add(k_id)
-                k_row = next((m for m in live_members if m["id"] == k_id), None)
-                if k_row:
-                    candidates.append(dict(k_row))
-
-        # Collect unclustered (truly unique) images
-        unique_members = conn.execute(
+        # Fetch all active images
+        all_active_images = conn.execute(
             """
-            SELECT * FROM images
-            WHERE (cluster_id IS NULL OR cluster_id = 0)
-              AND (status IS NULL OR status NOT IN ('trashed', 'deleted', 'dismissed'))
+            SELECT id, file_path, file_size, md5, delete_safe, review_flag, is_recommended_keeper, cluster_id
+            FROM images
+            WHERE (status IS NULL OR status NOT IN ('trashed', 'deleted', 'dismissed'))
             ORDER BY id
             """
         ).fetchall()
-        for u in unique_members:
-            if str(u["file_path"]).startswith("drive://") or (os.path.exists(u["file_path"]) and not os.path.islink(u["file_path"])):
-                if u["id"] not in cluster_keeper_ids:
-                    candidates.append(dict(u))
 
-        # Sort candidates deterministically: keeper clusters first, then unclustered images
-        candidates.sort(
-            key=lambda m: (
-                0 if m.get("id") in cluster_keeper_ids else 1,
-                -((m.get("width") or 0) * (m.get("height") or 0)),
-                -(m.get("file_size") or 0),
-                str(m.get("file_path") or ""),
-            ),
+        total_images = len(all_active_images)
+        delete_safe_count = sum(1 for img in all_active_images if img["delete_safe"] == 1)
+
+        # Export ONLY images where delete_safe == 0
+        candidates = [img for img in all_active_images if img["delete_safe"] == 0]
+
+        # Invariant assertion: exactly total_images - delete_safe_count images exported
+        assert len(candidates) == total_images - delete_safe_count, (
+            f"Clean dataset export invariant violated: expected {total_images - delete_safe_count} images, "
+            f"got {len(candidates)} (total={total_images}, delete_safe={delete_safe_count})"
         )
 
-        file_records: list[tuple[str, str]] = []
-        selected_md5s: set[str] = set()
+        file_records: list[tuple[str, str]] = [
+            (str(img["file_path"]), Path(str(img["file_path"])).name)
+            for img in candidates
+        ]
 
-        for item in candidates:
-            fp_str = str(item["file_path"])
-            md5 = item.get("md5")
-            if md5 and md5 in selected_md5s:
-                continue
-            if md5:
-                selected_md5s.add(md5)
-            file_records.append((fp_str, Path(fp_str).name))
+        assert len(file_records) == total_images - delete_safe_count, (
+            f"File records count mismatch: {len(file_records)} != {total_images - delete_safe_count}"
+        )
 
+        gdrive_source = _get_user_gdrive_source(request, user, conn)
         return build_and_stream_zip(
             file_records=file_records,
             zip_filename="recommended_keepers.zip",

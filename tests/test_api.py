@@ -2017,6 +2017,50 @@ class TestPipelineResumable:
         res_empty = client.post("/download/selected", json={"image_ids": []})
         assert res_empty.status_code in (400, 422)
 
+    def test_clean_dataset_export_drops_only_delete_safe_and_preserves_all_others(self, api_test_env):
+        """
+        Export 'clean dataset' must drop ONLY files with delete_safe = 1.
+        Assert exported_count == total_images - delete_safe_count.
+        Fails if any non-delete-safe image is dropped.
+        """
+        import zipfile
+        client = api_test_env["client"]
+        db_file = api_test_env["db_file"]
+        conn = sqlite3.connect(db_file)
+
+        # Inspect database before export
+        active = conn.execute(
+            "SELECT id, file_path, delete_safe, review_flag, is_keeper FROM images WHERE (status IS NULL OR status NOT IN ('trashed', 'deleted', 'dismissed'))"
+        ).fetchall()
+        total_active = len(active)
+
+        # Run export
+        res = client.get("/download/keepers?mode=conservative")
+        assert res.status_code == 200
+
+        # Refresh delete_safe counts according to what run_keeper_pipeline evaluated
+        active_after = conn.execute(
+            "SELECT id, file_path, delete_safe, review_flag, is_keeper FROM images WHERE (status IS NULL OR status NOT IN ('trashed', 'deleted', 'dismissed'))"
+        ).fetchall()
+        del_safe_count = sum(1 for r in active_after if r[2] == 1)
+        expected_export_count = total_active - del_safe_count
+
+        with zipfile.ZipFile(io.BytesIO(res.content)) as zf:
+            exported_names = zf.namelist()
+            assert len(exported_names) == expected_export_count, (
+                f"Exported count {len(exported_names)} != expected {expected_export_count} "
+                f"(total={total_active}, delete_safe={del_safe_count})"
+            )
+
+            # Ensure every single non-delete-safe image is present in the zip
+            for r in active_after:
+                mid, fpath, is_del, is_rev, is_k = r[0], r[1], r[2], r[3], r[4]
+                bname = Path(fpath).name
+                if is_del == 0:
+                    assert any(bname in n for n in exported_names), (
+                        f"Non-delete-safe image {bname} (id={mid}, delete_safe={is_del}, review={is_rev}, keeper={is_k}) was incorrectly dropped!"
+                    )
+
     def test_download_google_drive_cluster_and_selected(self, api_test_env, monkeypatch):
         """Test streaming zip downloads for clusters and selected files originating from Google Drive."""
         import zipfile

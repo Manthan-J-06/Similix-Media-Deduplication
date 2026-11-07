@@ -1796,6 +1796,11 @@
         const res = await fetch(`/clusters/${clusterId}?mode=${encodeURIComponent(currentMode)}`);
         if (expectedRefreshSeq !== undefined && expectedRefreshSeq !== currentRefreshSeq) return;
         if (selSeq !== currentClusterSelectSeq) return;
+        if (res.status === 404) {
+          // Cluster was disbanded or has fewer than 2 members - refresh list cleanly
+          refreshAll({ preserveActiveCluster: false });
+          return;
+        }
         if (!res.ok) throw new Error("HTTP " + res.status);
         const data = await res.json();
         if (expectedRefreshSeq !== undefined && expectedRefreshSeq !== currentRefreshSeq) return;
