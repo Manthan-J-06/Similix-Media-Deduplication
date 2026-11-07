@@ -429,6 +429,30 @@ def read_job_state(job_file: Path) -> dict | None:
         return None
 
 
+def is_process_alive(pid: int | None) -> bool:
+    """Safely check if a worker process PID is alive across OS / sandbox permission domains.
+
+    Returns True if process exists or cannot be queried due to permission.
+    Returns False only if process definitely does not exist (ESRCH).
+    If pid is None, returns True so stall detection can evaluate heartbeat.
+    """
+    if pid is None:
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        # ESRCH: Process definitely does not exist
+        return False
+    except PermissionError:
+        # EPERM: Process exists, caller lacks permission to signal it
+        return True
+    except OSError as exc:
+        if getattr(exc, "errno", None) == 3:  # ESRCH
+            return False
+        return True
+
+
 def count_active_jobs_global(app: FastAPI) -> tuple[int, int]:
     """Count running and queued jobs across all users."""
     running = 0
@@ -456,13 +480,8 @@ def count_active_jobs_global(app: FastAPI) -> tuple[int, int]:
             status = st.get("status")
             if status == "running":
                 pid = st.get("pid")
-                alive = True
-                if pid:
-                    try:
-                        os.kill(pid, 0)
-                    except OSError:
-                        alive = False
                 last_hb = st.get("heartbeat_at") or st.get("updated_at", 0)
+                alive = is_process_alive(pid)
                 if alive and (now - last_hb) <= 60:
                     running += 1
             elif status == "queued":
@@ -646,13 +665,8 @@ def launch_pipeline_job(
             st = read_job_state(jf)
             if st and st.get("status") in ("running", "queued"):
                 pid = st.get("pid")
-                alive = True
-                if pid:
-                    try:
-                        os.kill(pid, 0)
-                    except OSError:
-                        alive = False
                 last_hb = st.get("heartbeat_at") or st.get("updated_at", 0)
+                alive = is_process_alive(pid)
                 if alive and (now - last_hb) <= 60:
                     raise HTTPException(
                         status_code=409,
@@ -1608,7 +1622,7 @@ def create_app(
         # Fetch all active images
         all_active_images = conn.execute(
             """
-            SELECT id, file_path, file_size, md5, delete_safe, review_flag, is_recommended_keeper, cluster_id
+            SELECT id, file_path, file_size, md5, delete_safe, review_flag, is_recommended_keeper, is_keeper, cluster_id
             FROM images
             WHERE (status IS NULL OR status NOT IN ('trashed', 'deleted', 'dismissed'))
             ORDER BY id
@@ -1618,23 +1632,36 @@ def create_app(
         total_images = len(all_active_images)
         delete_safe_count = sum(1 for img in all_active_images if img["delete_safe"] == 1)
 
-        # Export ONLY images where delete_safe == 0
-        candidates = [img for img in all_active_images if img["delete_safe"] == 0]
+        # In conservative mode: drop strictly files marked delete_safe = 1
+        # In balanced/aggressive mode (default): export clean dataset = uniques + 1 keeper per cluster
+        if mode == "conservative":
+            candidates = [img for img in all_active_images if img["delete_safe"] == 0]
+            assert len(candidates) == total_images - delete_safe_count, (
+                f"Clean dataset export invariant violated: expected {total_images - delete_safe_count} images, "
+                f"got {len(candidates)} (total={total_images}, delete_safe={delete_safe_count})"
+            )
+        else:
+            # Collect chosen keeper IDs per cluster
+            cluster_keepers = set()
+            for img in all_active_images:
+                if img["cluster_id"] and (img["is_recommended_keeper"] == 1 or img["is_keeper"] == 1):
+                    cluster_keepers.add(img["id"])
+            clusters_present = {img["cluster_id"] for img in all_active_images if img["cluster_id"]}
+            for cid in clusters_present:
+                c_members = [img for img in all_active_images if img["cluster_id"] == cid]
+                if not any(m["id"] in cluster_keepers for m in c_members):
+                    cluster_keepers.add(c_members[0]["id"])
 
-        # Invariant assertion: exactly total_images - delete_safe_count images exported
-        assert len(candidates) == total_images - delete_safe_count, (
-            f"Clean dataset export invariant violated: expected {total_images - delete_safe_count} images, "
-            f"got {len(candidates)} (total={total_images}, delete_safe={delete_safe_count})"
-        )
+            candidates = [
+                img for img in all_active_images
+                if (img["cluster_id"] is None or img["cluster_id"] == 0)
+                or (img["id"] in cluster_keepers)
+            ]
 
         file_records: list[tuple[str, str]] = [
             (str(img["file_path"]), Path(str(img["file_path"])).name)
             for img in candidates
         ]
-
-        assert len(file_records) == total_images - delete_safe_count, (
-            f"File records count mismatch: {len(file_records)} != {total_images - delete_safe_count}"
-        )
 
         gdrive_source = _get_user_gdrive_source(request, user, conn)
         return build_and_stream_zip(
@@ -3879,19 +3906,27 @@ def create_app(
             }
 
         from sources.google_drive import get_drive_credentials, get_drive_service
+        creds = None
         try:
             creds = get_drive_credentials(token_path=user_tok, prompt_if_missing=False)
-            if not creds or not creds.valid:
-                return {
-                    "valid": False,
-                    "error": "token_expired",
-                    "detail": "Google Drive authentication expired or invalid. Please reconnect your account.",
-                }
         except Exception as exc:
+            logger.warning("Google Drive credentials check failed: %s", exc)
+
+        if not creds or not creds.valid:
+            pub_res = check_drive_link_accessibility(folder_link)
+            if pub_res.get("is_public"):
+                return {
+                    "valid": True,
+                    "is_public": True,
+                    "folder_id": folder_id,
+                    "folder_name": pub_res.get("folder_name", "Public Google Drive Folder"),
+                    "mime_type": "application/vnd.google-apps.folder",
+                    "message": "Public Google Drive folder is accessible without sign-in.",
+                }
             return {
                 "valid": False,
-                "error": "auth_error",
-                "detail": f"Google Drive authentication error: {exc}",
+                "error": "token_expired",
+                "detail": "Google Drive authentication expired or invalid. Please reconnect your account.",
             }
 
         if folder_id == "root":
@@ -3966,18 +4001,12 @@ def create_app(
             from sources.google_drive import get_drive_credentials, get_drive_service
             try:
                 creds = get_drive_credentials(token_path=user_tok, prompt_if_missing=False)
-                if not creds or not creds.valid:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Google Drive authentication expired or invalid. Please reconnect your account.",
-                    )
-            except HTTPException:
-                raise
             except Exception as exc:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Google Drive authentication error: {exc}. Please reconnect your account.",
-                )
+                logger.warning("User drive token invalid/expired: %s; falling back to public link check", exc)
+                creds = None
+
+        if creds and getattr(creds, "valid", False):
+            is_public = False
         else:
             pub_res = check_drive_link_accessibility(req.link)
             if not pub_res.get("is_public"):
@@ -4358,14 +4387,10 @@ def create_app(
                     state = read_job_state(jf)
                     if state and state.get("status") in ("running", "queued"):
                         pid = state.get("pid")
-                        is_alive = True
-                        if pid is not None:
-                            try:
-                                os.kill(pid, 0)
-                            except OSError:
-                                is_alive = False
                         last_heartbeat = state.get("heartbeat_at") or state.get("updated_at", 0)
                         last_progress = state.get("last_progress_at") or state.get("updated_at", 0)
+                        is_alive = is_process_alive(pid)
+
                         cfg_stall = float(getattr(request.app.state, "config", {}).get("general", {}).get("stall_timeout_seconds", 900.0)) if hasattr(request.app, "state") else 900.0
                         stall_limit = cfg_stall if (pid is not None and is_alive) else 60.0
                         if pid is not None and is_alive:

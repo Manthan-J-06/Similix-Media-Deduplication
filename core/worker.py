@@ -151,6 +151,9 @@ def update_job_file(
 
     if status is not None:
         data["status"] = status
+    elif data.get("status") in ("failed", "stalled", None) and stage is not None and stage not in ("complete", "failed"):
+        data["status"] = "running"
+        data["error"] = None
     if stage is not None:
         data["stage"] = stage
     if stage_display is not None:
