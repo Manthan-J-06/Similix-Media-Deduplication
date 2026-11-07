@@ -3896,6 +3896,7 @@
         if (!pw || !deleteAccountCheckbox || !deleteAccountCheckbox.checked) return;
 
         btnConfirmDeleteAccount.disabled = true;
+        btnConfirmDeleteAccount.textContent = "Deleting account...";
         if (deleteAccountError) {
           deleteAccountError.style.display = "none";
           deleteAccountError.textContent = "";
@@ -3931,6 +3932,7 @@
             return;
           }
 
+          btnConfirmDeleteAccount.textContent = "Delete account";
           if (deleteAccountError) {
             if (res.status === 429) {
               deleteAccountError.textContent = data?.detail || "Too many attempts. Please try again later.";
@@ -3943,6 +3945,7 @@
           }
           checkDeleteButtonEnabled();
         } catch (err) {
+          btnConfirmDeleteAccount.textContent = "Delete account";
           if (deleteAccountError) {
             deleteAccountError.textContent = "Network error: " + (err.message || "Failed to connect to server");
             deleteAccountError.style.display = "block";

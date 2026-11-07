@@ -15,6 +15,7 @@ Features:
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 import re
 import secrets
@@ -23,6 +24,7 @@ import sqlite3
 import threading
 import time
 from typing import Any, Callable
+import uuid
 
 try:
     import bcrypt
@@ -505,15 +507,79 @@ def delete_user_account(
         if on_before_delete is not None:
             on_before_delete()
 
-        # 1. Remove user directory on disk
-        user_path = Path(users_dir).expanduser().resolve() / str(user_id)
-        if user_path.exists():
-            shutil.rmtree(user_path, ignore_errors=True)
-
-        # 2. Invalidate ALL sessions for this user and delete rows in auth.db
+        # Invalidate ALL sessions for this user and delete rows in auth.db immediately
         with conn:
             conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
             conn.execute("DELETE FROM login_attempts WHERE email = ?", (row["email"],))
             conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
 
-        return {"status": "deleted", "user_id": user_id, "email": row["email"]}
+    # Instant atomic move out of users_dir + asynchronous purge outside of _auth_lock
+    user_path = Path(users_dir).expanduser().resolve() / str(user_id)
+    if user_path.exists():
+        purge_dir = user_path.parent.parent / "purge"
+        target_to_remove = user_path
+        try:
+            purge_dir.mkdir(parents=True, exist_ok=True)
+            purge_target = purge_dir / f"user_{user_id}_{uuid.uuid4().hex}"
+            os.replace(str(user_path), str(purge_target))
+            target_to_remove = purge_target
+        except OSError:
+            pass
+
+        def _bg_purge(path_to_clean: Path):
+            try:
+                if path_to_clean.exists():
+                    shutil.rmtree(str(path_to_clean), ignore_errors=True)
+            except Exception:
+                pass
+
+        threading.Thread(target=_bg_purge, args=(target_to_remove,), daemon=True).start()
+
+    return {"status": "deleted", "user_id": user_id, "email": row["email"]}
+
+
+def admin_delete_user_account(
+    conn: sqlite3.Connection,
+    user_identifier: str | int,
+    users_dir: Path | str,
+) -> dict[str, Any]:
+    """Administrative deletion of a user account by email or user ID without requiring password."""
+    with _auth_lock:
+        if isinstance(user_identifier, int) or str(user_identifier).isdigit():
+            row = conn.execute("SELECT id, email FROM users WHERE id = ?", (int(user_identifier),)).fetchone()
+        else:
+            row = conn.execute("SELECT id, email FROM users WHERE email = ?", (str(user_identifier).strip().lower(),)).fetchone()
+
+        if not row:
+            raise ValueError(f"User '{user_identifier}' not found in auth.db")
+
+        user_id = row["id"]
+        email = row["email"]
+
+        with conn:
+            conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+            conn.execute("DELETE FROM login_attempts WHERE email = ?", (email,))
+            conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+
+    user_path = Path(users_dir).expanduser().resolve() / str(user_id)
+    if user_path.exists():
+        purge_dir = user_path.parent.parent / "purge"
+        target_to_remove = user_path
+        try:
+            purge_dir.mkdir(parents=True, exist_ok=True)
+            purge_target = purge_dir / f"user_{user_id}_{uuid.uuid4().hex}"
+            os.replace(str(user_path), str(purge_target))
+            target_to_remove = purge_target
+        except OSError:
+            pass
+
+        def _bg_purge(path_to_clean: Path):
+            try:
+                if path_to_clean.exists():
+                    shutil.rmtree(str(path_to_clean), ignore_errors=True)
+            except Exception:
+                pass
+
+        threading.Thread(target=_bg_purge, args=(target_to_remove,), daemon=True).start()
+
+    return {"status": "deleted", "user_id": user_id, "email": email}

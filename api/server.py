@@ -1485,11 +1485,6 @@ def create_app(
             stop_user_jobs(request.app, user.id, user.jobs_dir)
             if hasattr(request.app.state, "_initialized_user_dbs"):
                 request.app.state._initialized_user_dbs.discard(user.db_path)
-            # Clear per-user thumbnail cache
-            try:
-                shutil.rmtree(user.thumb_cache_dir, ignore_errors=True)
-            except Exception:
-                pass
 
         res = delete_user_account(
             conn=request.app.state.auth_conn,

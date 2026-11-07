@@ -961,6 +961,59 @@ def cmd_confirm_drive(args: argparse.Namespace) -> None:
     print()
 
 
+def cmd_user_list(args: argparse.Namespace) -> None:
+    from core.auth import init_auth_db
+    from core.config import resolve_data_dir
+    cfg = load_config(args.config)
+    data_dir = resolve_data_dir(cfg.get("general", {}).get("data_dir"))
+    auth_db_path = data_dir / "auth.db"
+    if not auth_db_path.exists():
+        print(f"No auth database found at {auth_db_path}")
+        return
+    conn = init_auth_db(auth_db_path)
+    rows = conn.execute("SELECT id, email, created_at FROM users ORDER BY id").fetchall()
+    users_dir = data_dir / "users"
+    print(f"{'ID':<6} {'Email':<32} {'Disk Size':<12}")
+    print("-" * 54)
+    for r in rows:
+        uid = r["id"]
+        email = r["email"]
+        u_path = users_dir / str(uid)
+        size_str = "0 B"
+        if u_path.exists():
+            try:
+                total_bytes = sum(f.stat().st_size for f in u_path.rglob("*") if f.is_file())
+                b = float(total_bytes)
+                for unit in ("B", "KB", "MB", "GB"):
+                    if b < 1024.0 or unit == "GB":
+                        size_str = f"{b:.1f} {unit}" if unit != "B" else f"{int(b)} B"
+                        break
+                    b /= 1024.0
+            except Exception:
+                size_str = "unknown"
+        print(f"{uid:<6} {email:<32} {size_str:<12}")
+    print()
+
+
+def cmd_user_delete(args: argparse.Namespace) -> None:
+    from core.auth import init_auth_db, admin_delete_user_account
+    from core.config import resolve_data_dir
+    cfg = load_config(args.config)
+    data_dir = resolve_data_dir(cfg.get("general", {}).get("data_dir"))
+    auth_db_path = data_dir / "auth.db"
+    if not auth_db_path.exists():
+        print(f"No auth database found at {auth_db_path}", file=sys.stderr)
+        sys.exit(1)
+    conn = init_auth_db(auth_db_path)
+    users_dir = data_dir / "users"
+    try:
+        res = admin_delete_user_account(conn, args.user, users_dir)
+        print(f"Successfully deleted user account: {res['email']} (ID: {res['user_id']})")
+    except Exception as exc:
+        print(f"Error deleting user '{args.user}': {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
 def main(argv: list[str] | None = None) -> None:
     prog_name = "similix"
     if sys.argv and Path(sys.argv[0]).stem == "argus":
@@ -1096,6 +1149,13 @@ def main(argv: list[str] | None = None) -> None:
     )
     confirm_drive_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
 
+    user_list_parser = subparsers.add_parser("user-list", help="List all registered user accounts and their storage sizes")
+    user_list_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
+
+    user_delete_parser = subparsers.add_parser("user-delete", help="Delete a user account by email or user ID (CLI admin)")
+    user_delete_parser.add_argument("user", help="User email or user ID to delete")
+    user_delete_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.toml")
+
     args = parser.parse_args(argv)
     if args.subcommand == "scan":
         cmd_scan(args)
@@ -1135,6 +1195,10 @@ def main(argv: list[str] | None = None) -> None:
         cmd_scan_drive(args)
     elif args.subcommand == "confirm-drive":
         cmd_confirm_drive(args)
+    elif args.subcommand == "user-list":
+        cmd_user_list(args)
+    elif args.subcommand == "user-delete":
+        cmd_user_delete(args)
 
 
 if __name__ == "__main__":
