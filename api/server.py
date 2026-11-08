@@ -4518,3 +4518,18 @@ def create_app(
 
 # Module-level app instance
 app = create_app()
+
+
+if __name__ == "__main__":
+    import argparse
+    from core.cli import cmd_serve
+
+    parser = argparse.ArgumentParser(description="Run Similix Web Server")
+    parser.add_argument("--host", default="127.0.0.1", help="Host to bind to")
+    parser.add_argument("--port", type=int, default=8000, help="Port to bind to")
+    parser.add_argument("--config", help="Path to config.toml")
+    parser.add_argument("--folder", help="Folder or db path")
+    parser.add_argument("--db", help="Path to database")
+    args = parser.parse_args()
+    cmd_serve(args)
+
