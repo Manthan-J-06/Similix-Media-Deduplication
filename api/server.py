@@ -2508,6 +2508,17 @@ def create_app(
                         img.thumbnail((size, size), Image.Resampling.BILINEAR)
                         img.save(str(tmp_path), format="JPEG", quality=85)
                     os.replace(str(tmp_path), str(cache_path))
+                    for old_thumb in cache_dir.glob(f"{image_id}_*_{size}.jpg"):
+                        if old_thumb != cache_path:
+                            try:
+                                old_thumb.unlink(missing_ok=True)
+                            except OSError:
+                                pass
+                    if legacy_path.is_file() and legacy_path != cache_path:
+                        try:
+                            legacy_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
                 except Exception as exc:
                     if tmp_path.exists():
                         try:
