@@ -3439,6 +3439,14 @@
           return;
         }
 
+        if (!data.configured) {
+          msgEl.style.display = "block";
+          msgEl.style.color = "var(--text)";
+          msgEl.style.background = "rgba(59, 130, 246, 0.08)";
+          msgEl.style.border = "1px solid var(--accent)";
+          msgEl.innerHTML = `<strong>Notice:</strong> ${escapeHtml(data.message || "Google Drive integration is not configured. An administrator must provide client_secret.json in the data directory.")}<br><span style="font-size:0.8rem; color:var(--text-muted); margin-top:4px; display:inline-block;">Public and shared Drive links don't require sign-in — simply paste the link into the box above and click Scan!</span>`;
+        }
+
         const cfgView = document.getElementById("drive-configure-view");
         if (cfgView && !cfgView.dataset.userOpened) {
           cfgView.style.display = "none";
