@@ -89,7 +89,16 @@ class JobHeartbeatThread(threading.Thread):
                             failed_file=stalled_file,
                             actionable_advice="Processing stalled. Check network connectivity, source availability, or file integrity.",
                         )
-                        break
+                    elif self.worker_state.is_stalled and elapsed_since_prog <= self.stall_timeout:
+                        # Resumed progress: auto-recover
+                        self.worker_state.is_stalled = False
+                        update_job_file(
+                            self.job_file,
+                            status="running",
+                            error=None,
+                            failed_stage=None,
+                            failed_file=None,
+                        )
 
                 if self.job_file.is_file():
                     update_job_file(self.job_file, heartbeat_at=now)
@@ -151,9 +160,16 @@ def update_job_file(
 
     if status is not None:
         data["status"] = status
+        if status == "running":
+            if error is None:
+                data["error"] = None
+            data.pop("failed_stage", None)
+            data.pop("failed_file", None)
     elif data.get("status") in ("failed", "stalled", None) and stage is not None and stage not in ("complete", "failed"):
         data["status"] = "running"
         data["error"] = None
+        data.pop("failed_stage", None)
+        data.pop("failed_file", None)
     if stage is not None:
         data["stage"] = stage
     if stage_display is not None:

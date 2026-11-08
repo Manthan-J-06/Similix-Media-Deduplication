@@ -102,15 +102,15 @@ allow_resolution_loss = false
 ssim_gray = 0.92
 ssim_color = 0.90
 pixel_ratio_floor = 0.50
-min_saving_ratio = 0.15
+min_saving_ratio = 0.05
 allow_blur_flag = false
 allow_resolution_loss = true
 
 [keeper.modes.aggressive]
-ssim_gray = 0.82
-ssim_color = 0.80
-pixel_ratio_floor = 0.15
-min_saving_ratio = 0.05
+ssim_gray = 0.0
+ssim_color = 0.0
+pixel_ratio_floor = 0.0
+min_saving_ratio = 0.0
 allow_blur_flag = true
 allow_resolution_loss = true
 

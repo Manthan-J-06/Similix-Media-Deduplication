@@ -70,20 +70,20 @@ DEFAULT_KEEPER_MODES: dict[str, dict[str, Any]] = {
         "allow_resolution_loss": False,
     },
     "balanced": {
-        "ssim_gray": 0.98,
-        "ssim_color": 0.97,
-        "pixel_ratio_floor": 0.60,
-        "min_saving_ratio": 0.30,
+        "ssim_gray": 0.92,
+        "ssim_color": 0.90,
+        "pixel_ratio_floor": 0.50,
+        "min_saving_ratio": 0.05,
         "allow_blur_flag": False,
-        "allow_resolution_loss": False,
+        "allow_resolution_loss": True,
     },
     "aggressive": {
-        "ssim_gray": 0.95,
-        "ssim_color": 0.94,
-        "pixel_ratio_floor": 0.25,
-        "min_saving_ratio": 0.30,
+        "ssim_gray": 0.0,
+        "ssim_color": 0.0,
+        "pixel_ratio_floor": 0.0,
+        "min_saving_ratio": 0.0,
         "allow_blur_flag": True,
-        "allow_resolution_loss": False,
+        "allow_resolution_loss": True,
     },
 }
 
@@ -292,8 +292,8 @@ def choose_keeper(
     if mode == "conservative":
         keeper = ref_member
     elif mode == "balanced":
-        # Balanced: prefers candidates with high quality tier (SSIM >= 0.95 or match_pct >= 95%)
-        # that save meaningful space, balancing fidelity and file size.
+        # Balanced: smart quality-saving tradeoff.
+        # Candidates meet balanced limits (SSIM >= 0.90, pixel_ratio >= 0.50) and save space.
         candidates = []
         for m in members:
             is_ref = (m.get("id") == ref_id)
@@ -314,13 +314,16 @@ def choose_keeper(
             def _balanced_sort_key(m):
                 m_ssim = float(m.get("ssim") or 1.0)
                 m_sz = m.get("file_size") or 0
-                tier = 0 if m_ssim >= 0.98 else (1 if m_ssim >= 0.95 else 2)
-                return (tier, m_sz, -m_ssim, len(str(m.get("file_path") or "")), m.get("id", 0))
+                sz_val = m_sz if m_sz > 0 else float("inf")
+                # Sort primarily by smaller file size, then higher SSIM
+                return (sz_val, -m_ssim, len(str(m.get("file_path") or "")), m.get("id", 0))
             keeper = min(candidates, key=_balanced_sort_key)
         else:
             keeper = ref_member
     else:  # aggressive
-        # Aggressive: picks the smallest file size among all candidates meeting the threshold
+        # Aggressive: strictly pick the lowest file size verified member in the cluster.
+        # "No matter how it's the resolution, what is the clarity, I don't want to care.
+        # I want each and every cluster to have the lowest possible size selected."
         candidates = []
         for m in members:
             is_ref = (m.get("id") == ref_id)
@@ -330,15 +333,19 @@ def choose_keeper(
                 m_px = m_w * m_h
                 if (not res_loss_allowed) and (m_px < ref_px):
                     continue
-                if is_ref:
-                    candidates.append(m)
-                else:
-                    m_sz = m.get("file_size") or 0
-                    if m_sz <= max_non_ref_sz:
-                        candidates.append(m)
+                candidates.append(m)
 
         if candidates:
-            keeper = min(candidates, key=_keeper_candidate_sort_key)
+            def _aggressive_sort_key(m):
+                sz = m.get("file_size")
+                sz_val = sz if (sz is not None and sz > 0) else float("inf")
+                is_not_ref = 0 if m.get("id") == ref_id else 1
+                w = m.get("width") or 0
+                h = m.get("height") or 0
+                px = w * h
+                path = str(m.get("file_path") or "")
+                return (sz_val, is_not_ref, -px, len(path), path, m.get("id") or 0)
+            keeper = min(candidates, key=_aggressive_sort_key)
         else:
             keeper = ref_member
 
@@ -364,6 +371,10 @@ def choose_keeper(
     if keeper_id == ref_id:
         reasons[keeper_id] = "Recommended keeper (reference copy, highest fidelity)"
         quality_retained[keeper_id] = 100.0
+    elif mode == "aggressive":
+        k_pct = round(float(k_quality) * 100.0, 1) if k_quality is not None else 100.0
+        reasons[keeper_id] = f"Recommended keeper (lowest file size in cluster, {keeper_sz:,} B)"
+        quality_retained[keeper_id] = k_pct
     else:
         k_ssim = keeper.get("ssim")
         k_pct = round(float(k_ssim) * 100.0, 1) if k_ssim is not None else 100.0
@@ -662,12 +673,23 @@ def choose_keeper(
         else:
             res_pct = 100.0
 
-        better_ids = [
-            m.get("id")
-            for m in members
-            if m.get("id") in review_ids
-            and ("better than" in reasons.get(m.get("id"), "").lower() or m.get("id") == ref_id)
-        ]
+        if mode == "aggressive":
+            better_ids = []
+            swap_reason = reasons.get(
+                keeper_id,
+                f"Swap reference with lowest size candidate ({saving_pct}% size reduction)",
+            )
+        else:
+            better_ids = [
+                m.get("id")
+                for m in members
+                if m.get("id") in review_ids
+                and ("better than" in reasons.get(m.get("id"), "").lower() or m.get("id") == ref_id)
+            ]
+            swap_reason = reasons.get(
+                keeper_id,
+                f"Swap reference with smaller {mode} candidate ({saving_pct}% size reduction, {match_pct}% quality retained)",
+            )
 
         swap_proposal = {
             "from_id": ref_id,
@@ -676,10 +698,7 @@ def choose_keeper(
             "saving_pct": saving_pct,
             "match_pct": match_pct,
             "res_pct": res_pct,
-            "reason": reasons.get(
-                keeper_id,
-                f"Swap reference with smaller {mode} candidate ({saving_pct}% size reduction, {match_pct}% quality retained)",
-            ),
+            "reason": swap_reason,
             "better_than_keeper_ids": better_ids,
         }
     else:

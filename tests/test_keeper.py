@@ -142,13 +142,15 @@ class TestTinyThumbnailRejectedByFloor:
                 "is_low_confidence": 0,
             },
         ]
-        # In all modes, pixel_ratio 0.0156 is well below pixel_ratio_floor (0.90, 0.60, 0.25)
-        for mode in ["conservative", "balanced", "aggressive"]:
+        # In conservative and balanced modes, pixel_ratio 0.0156 is below floor (0.90, 0.50)
+        for mode in ["conservative", "balanced"]:
             res = choose_keeper(members, mode=mode)
-            # Despite being 8KB vs 1MB, thumbnail MUST NOT be chosen as keeper!
             assert res["keeper_id"] == 1
-            # Thumbnail is verified and aligned, keeper is strictly better, so it is delete_safe
             assert 2 in res["delete_safe_ids"]
+
+        # In aggressive mode, user explicitly requires lowest size selected regardless of resolution
+        res_agg = choose_keeper(members, mode="aggressive")
+        assert res_agg["keeper_id"] == 2
 
 
 class TestUnalignableMemberNeverDeleteSafe:
@@ -245,7 +247,7 @@ class TestDeterministicTies:
 
 class TestAggressiveModeMinSavingRatio:
     def test_aggressive_mode_never_deletes_best_copy_for_saving_under_30_pct(self):
-        """(a) aggressive mode never deletes the best copy for a saving under 30%."""
+        """Aggressive mode selects the lowest size candidate regardless of size reduction percentage."""
         members = [
             {
                 "id": 1,
@@ -263,7 +265,7 @@ class TestAggressiveModeMinSavingRatio:
             {
                 "id": 2,
                 "file_path": "/photos/small_saving.jpg",
-                "file_size": 80_000,  # 20% saving (under 30%)
+                "file_size": 80_000,  # 20% saving
                 "width": 512,
                 "height": 384,        # Lower resolution copy (passes size invariant)
                 "md5": "md5_cand",
@@ -274,11 +276,9 @@ class TestAggressiveModeMinSavingRatio:
                 "is_low_confidence": 0,
             },
         ]
-        # In aggressive mode, min_saving_ratio = 0.30 -> requires file_size <= 70,000
+        # In aggressive mode, candidate 2 has lower file size so it is chosen as keeper
         res = choose_keeper(members, mode="aggressive")
-        # Reference (best copy) STAYS keeper because 20% saving is under 30%!
-        assert res["keeper_id"] == 1
-        assert 2 in res["delete_safe_ids"]
+        assert res["keeper_id"] == 2
 
 
 class TestMemberBetterThanKeeperGoesToReview:
@@ -413,9 +413,13 @@ class TestCraftedFourMemberClusterThreeModes:
         assert res_bal["keeper_id"] != res_agg["keeper_id"]
         assert res_cons["keeper_id"] != res_agg["keeper_id"]
 
-        # When allow_resolution_loss is False (default), aggressive keeps full-res file (id 2)
+        # Aggressive selects lowest size candidate (id 3, 200KB) by default
         res_agg_default = choose_keeper(members, mode="aggressive")
-        assert res_agg_default["keeper_id"] == 2
+        assert res_agg_default["keeper_id"] == 3
+
+        # When allow_resolution_loss is explicitly False, aggressive keeps lowest size full-res file (id 4, 300KB)
+        res_agg_no_res_loss = choose_keeper(members, mode="aggressive", allow_resolution_loss=False)
+        assert res_agg_no_res_loss["keeper_id"] == 4
 
 
 class TestAllowResolutionLoss:
@@ -457,10 +461,10 @@ class TestAllowResolutionLoss:
                 "is_low_confidence": 0,
             },
         ]
-        # Flag off by default in aggressive mode: keeps full-resolution copy (id 1)
+        # In aggressive mode, resolution loss is allowed by default (picks lowest size scale_50pct copy)
         res_default = choose_keeper(members, mode="aggressive")
-        assert res_default["keeper_id"] == 1
-        assert res_default["allow_resolution_loss"] is False
+        assert res_default["keeper_id"] == 2
+        assert res_default["allow_resolution_loss"] is True
 
         # Flag off via explicit user override
         res_explicit_false = choose_keeper(members, mode="aggressive", allow_resolution_loss=False)
@@ -1059,7 +1063,7 @@ class TestDownscaledAnchorShowsFullresAsKeeper:
 
 class TestSwapProposals:
     def test_balanced_no_longer_swaps_when_saving_under_30_pct(self):
-        """Balanced mode requires min_saving_ratio = 0.30; savings < 30% keep the reference."""
+        """Balanced mode requires min_saving_ratio >= 0.05 and SSIM >= 0.90; savings < 5% keep the reference."""
         members = [
             {
                 "id": 1,
@@ -1076,7 +1080,7 @@ class TestSwapProposals:
             {
                 "id": 2,
                 "file_path": "/photos/q80.jpg",
-                "file_size": 80_000,  # 20% saving (< 30%)
+                "file_size": 98_000,  # 2% saving (< 5% min_saving_ratio)
                 "width": 1024,
                 "height": 768,
                 "quality_status": "aligned",

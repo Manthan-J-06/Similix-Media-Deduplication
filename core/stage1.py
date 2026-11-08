@@ -157,15 +157,12 @@ def compute_stage1_hashes(
                     pass
             thumb = thumbs_map.get(fpath)
             if thumb is None:
-                # Try single get_thumbnail fallback if not in map
-                try:
-                    thumb = source.get_thumbnail(fpath, size=(thumb_size, thumb_size))
-                except Exception as exc:
-                    if result is not None:
-                        result.files_skipped += 1
-                        result.skipped_reasons.append((fpath, f"Thumbnail generation failed: {exc}"))
-                    failed_ids.append(fid)
-                    continue
+                # Concurrent fetch with retries already attempted this file; record skip without redundant blocking
+                if result is not None:
+                    result.files_skipped += 1
+                    result.skipped_reasons.append((fpath, "Thumbnail download or decode failed"))
+                failed_ids.append(fid)
+                continue
 
             # Pre-cache thumbnail on ingestion to eliminate CPU starvation during UI browsing
             if thumb_cache_dir is not None and thumb is not None:

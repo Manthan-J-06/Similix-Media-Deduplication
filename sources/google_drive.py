@@ -768,10 +768,10 @@ class GoogleDriveSource(ImageSource):
     def _download_thumbnail_bytes(
         self,
         link: str,
-        timeout: float = 20.0,
-        max_retries: int = 3,
+        timeout: float = 12.0,
+        max_retries: int = 2,
     ) -> bytes | None:
-        """Download thumbnail bytes from URL with per-request 20s timeout and 3 retries with backoff."""
+        """Download thumbnail bytes from URL with per-request 12s timeout and 2 retries with backoff."""
         headers = {"User-Agent": "SIMILIX/1.0"}
         try:
             creds = self.credentials

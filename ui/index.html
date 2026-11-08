@@ -2856,6 +2856,10 @@
           if (dismissBtn && data.status !== "failed" && data.status !== "error" && data.status !== "stalled" && data.status !== "canceled") {
             dismissBtn.style.display = "none";
           }
+          if (data.status === "running" || data.status === "queued") {
+            fill.style.background = "#2563eb";
+            if (stageFill) stageFill.style.background = "#2dd4bf";
+          }
 
           let stgPct = 0;
           if (typeof data.stage_progress === "number") {
