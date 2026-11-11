@@ -324,7 +324,7 @@ def run_pipeline(
         from core.quality import run_quality_pipeline
         from core.stage0 import run_stage0
         from core.stage1 import run_stage1
-        from core.verify import run_stage3_verification
+        from core.verify import prune_keypoint_cache, run_stage3_verification
 
         update_job_file(
             job_file,
@@ -736,6 +736,12 @@ def run_pipeline(
 
         # ── Finalize ──
         conn.commit()
+        try:
+            pruned_kp = prune_keypoint_cache(conn, keep_representatives=True, max_rep_rows=500, vacuum_threshold_mb=10.0)
+            if pruned_kp > 0:
+                logger.info("Pruned %d stale keypoint_cache rows after pipeline completion.", pruned_kp)
+        except Exception as exc:
+            logger.warning("Non-fatal error pruning keypoint_cache: %s", exc)
 
         # Timing Summary Report
         total_pipeline_time = round(time.time() - job_start_time, 3)

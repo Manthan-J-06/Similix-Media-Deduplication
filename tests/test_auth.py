@@ -843,3 +843,77 @@ class TestConfinementAndQuotas:
         assert "this cannot be undone and the trash is deleted too" in html
         assert "original files on the user's own devices are never touched" in html
         assert "I understand this is permanent" in html
+
+
+class TestProductionDeploymentSafeguards:
+    def test_host_disk_space_guard_rejects_with_507(self, auth_test_app, monkeypatch):
+        from collections import namedtuple
+        from unittest.mock import patch
+        from fastapi.testclient import TestClient
+
+        app = auth_test_app["app"]
+        client = TestClient(app)
+        auth_info = register_and_login(client, "disk_guard@argus.local")
+
+        DiskUsage = namedtuple("DiskUsage", ["total", "used", "free"])
+        monkeypatch.setenv("MIN_FREE_DISK_MB", "512")
+        with patch("shutil.disk_usage", return_value=DiskUsage(10_000_000_000, 9_900_000_000, 100 * 1024 * 1024)):
+            resp = client.post(
+                "/sources/upload",
+                files=[("files", ("photo.jpg", b"\xff\xd8\xff\xe0" + b"\x00" * 32, "image/jpeg"))],
+                headers={"X-CSRF-Token": auth_info["csrf_token"]},
+            )
+            assert resp.status_code == 507
+            assert "storage low" in resp.json()["detail"].lower()
+
+    def test_max_concurrent_jobs_env_override_and_wal_quota_exclusion(self, auth_test_app, tmp_path, monkeypatch):
+        from api.server import get_max_concurrent_jobs, get_user_storage_usage
+
+        app = auth_test_app["app"]
+        assert get_max_concurrent_jobs(app) == 1
+        monkeypatch.setenv("MAX_CONCURRENT_JOBS", "3")
+        assert get_max_concurrent_jobs(app) == 3
+
+        user_dir = tmp_path / "u_quota"
+        user_dir.mkdir()
+        (user_dir / "photo.jpg").write_bytes(b"a" * 100)
+        (user_dir / "similix.db-wal").write_bytes(b"b" * 5000)
+        (user_dir / "similix.db-shm").write_bytes(b"c" * 4096)
+        assert get_user_storage_usage(user_dir) == 100
+
+    def test_online_backup_script_snapshots_live_wal_db(self, tmp_path):
+        import sqlite3
+        import tarfile
+        from scripts.backup_data import create_backup
+
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        db_path = data_dir / "users" / "1" / "similix.db"
+        db_path.parent.mkdir(parents=True)
+        (data_dir / "users" / "1" / "library").mkdir()
+        (data_dir / "users" / "1" / "library" / "pic.jpg").write_bytes(b"jpegdata")
+
+        # Keep an active uncommitted WAL writer open while backing up
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, val TEXT);")
+        conn.execute("INSERT INTO items (val) VALUES ('persisted');")
+        conn.commit()
+        conn.execute("INSERT INTO items (val) VALUES ('uncommitted_in_wal');")
+
+        bkp_dir = tmp_path / "backups"
+        try:
+            archive = create_backup(data_dir, bkp_dir, retain_days=30)
+            assert archive.is_file()
+        finally:
+            conn.close()
+
+        extract_dir = tmp_path / "restored"
+        with tarfile.open(archive, "r:gz") as tar:
+            tar.extractall(extract_dir, filter="data")
+
+        assert (extract_dir / "users" / "1" / "library" / "pic.jpg").read_bytes() == b"jpegdata"
+        restored_conn = sqlite3.connect(str(extract_dir / "users" / "1" / "similix.db"))
+        rows = [r[0] for r in restored_conn.execute("SELECT val FROM items").fetchall()]
+        restored_conn.close()
+        assert rows == ["persisted"]

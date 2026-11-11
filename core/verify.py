@@ -27,8 +27,10 @@ from pathlib import Path
 import logging
 import pickle
 import sqlite3
+import struct
 import time
 from typing import Any, Callable
+import zlib
 
 import cv2
 import numpy as np
@@ -169,22 +171,27 @@ class Stage3Result:
     pair_details: list[PairVerificationRecord] = field(default_factory=list)
 
 
+_KP_MAGIC = b"SMXKPZ01"
+_DS_MAGIC = b"SMXDSZ01"
+
+
 def serialize_keypoints(keypoints: list[cv2.KeyPoint]) -> bytes:
-    """Serialize OpenCV KeyPoints into compact float32 binary format."""
+    """Serialize OpenCV KeyPoints into a zlib-compressed float32 binary format."""
     if not keypoints:
         return b""
     arr = np.array(
         [(kp.pt[0], kp.pt[1], kp.size, kp.angle, kp.response, kp.octave, kp.class_id) for kp in keypoints],
         dtype=np.float32,
     )
-    return arr.tobytes()
+    return _KP_MAGIC + zlib.compress(arr.tobytes(), level=1)
 
 
 def deserialize_keypoints(data: bytes) -> list[cv2.KeyPoint]:
-    """Deserialize binary format back into a list of OpenCV KeyPoints."""
+    """Deserialize binary format (compressed or legacy) back into OpenCV KeyPoints."""
     if not data:
         return []
-    arr = np.frombuffer(data, dtype=np.float32).reshape(-1, 7)
+    raw = zlib.decompress(data[len(_KP_MAGIC):]) if data.startswith(_KP_MAGIC) else data
+    arr = np.frombuffer(raw, dtype=np.float32).reshape(-1, 7)
     return [
         cv2.KeyPoint(
             x=float(r[0]),
@@ -200,17 +207,93 @@ def deserialize_keypoints(data: bytes) -> list[cv2.KeyPoint]:
 
 
 def serialize_descriptors(descriptors: np.ndarray | None) -> bytes:
-    """Serialize numpy feature descriptors into bytes."""
+    """Serialize numpy feature descriptors into a compact zlib-compressed binary payload."""
     if descriptors is None or len(descriptors) == 0:
         return b""
-    return pickle.dumps(descriptors)
+    arr = np.ascontiguousarray(descriptors)
+    if arr.ndim != 2:
+        return _DS_MAGIC + b"PK" + struct.pack("<II", 0, 0) + zlib.compress(pickle.dumps(arr), level=1)
+
+    rows, cols = arr.shape
+    if arr.dtype == np.uint8:
+        tag = b"U8"
+        payload = arr.tobytes()
+    elif arr.dtype == np.float32 and np.all((arr >= 0) & (arr <= 255) & (arr == np.floor(arr))):
+        # OpenCV SIFT descriptors are integer values in [0, 255] stored as float32; store losslessly as uint8.
+        tag = b"U3"
+        payload = arr.astype(np.uint8).tobytes()
+    elif arr.dtype == np.float32:
+        tag = b"F3"
+        payload = arr.tobytes()
+    else:
+        return _DS_MAGIC + b"PK" + struct.pack("<II", rows, cols) + zlib.compress(pickle.dumps(arr), level=1)
+
+    return _DS_MAGIC + tag + struct.pack("<II", rows, cols) + zlib.compress(payload, level=1)
 
 
 def deserialize_descriptors(data: bytes) -> np.ndarray | None:
-    """Deserialize bytes back into numpy feature descriptors."""
+    """Deserialize bytes (compressed or legacy pickle) back into numpy feature descriptors."""
     if not data:
         return None
-    return pickle.loads(data)
+    if not data.startswith(_DS_MAGIC):
+        return pickle.loads(data)
+
+    header_len = len(_DS_MAGIC) + 2 + 8
+    tag = data[len(_DS_MAGIC):len(_DS_MAGIC) + 2]
+    rows, cols = struct.unpack("<II", data[len(_DS_MAGIC) + 2:header_len])
+    raw = zlib.decompress(data[header_len:])
+
+    if tag == b"U3":
+        return np.frombuffer(raw, dtype=np.uint8).reshape(rows, cols).astype(np.float32)
+    if tag == b"U8":
+        return np.frombuffer(raw, dtype=np.uint8).reshape(rows, cols).copy()
+    if tag == b"F3":
+        return np.frombuffer(raw, dtype=np.float32).reshape(rows, cols).copy()
+    return pickle.loads(raw)
+
+
+def prune_keypoint_cache(
+    conn: sqlite3.Connection,
+    keep_representatives: bool = True,
+    max_rep_rows: int = 500,
+    vacuum_threshold_mb: float = 10.0,
+) -> int:
+    """Prune bloated keypoint_cache rows after verification to reclaim SQLite disk space."""
+    tbl = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='keypoint_cache'"
+    ).fetchone()
+    if not tbl:
+        return 0
+
+    if keep_representatives:
+        # Remove entries for non-representatives (singletons and duplicate members)
+        cur = conn.execute(
+            """
+            DELETE FROM keypoint_cache
+            WHERE image_id NOT IN (
+                SELECT representative_id FROM clusters
+                WHERE representative_id IS NOT NULL
+                ORDER BY id DESC
+                LIMIT ?
+            )
+            """,
+            (max(0, int(max_rep_rows)),),
+        )
+    else:
+        cur = conn.execute("DELETE FROM keypoint_cache")
+
+    deleted = cur.rowcount or 0
+    conn.commit()
+
+    if deleted > 0:
+        freelist_pages = conn.execute("PRAGMA freelist_count;").fetchone()[0]
+        page_size = conn.execute("PRAGMA page_size;").fetchone()[0]
+        freed_mb = (freelist_pages * page_size) / (1024 * 1024)
+        if freed_mb >= vacuum_threshold_mb:
+            conn.execute("VACUUM;")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+
+    return deleted
 
 
 def load_proxy_grayscale(

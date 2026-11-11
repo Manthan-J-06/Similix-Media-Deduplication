@@ -14,6 +14,8 @@ db_path = "similix.db"
 thumbnail_cache_dir = "thumbnails/"
 # Maximum time (seconds) of zero pipeline progress before flagging as stalled (default 15 minutes).
 stall_timeout_seconds = 900.0
+# Global cap on concurrent ML worker subprocesses (override via MAX_CONCURRENT_JOBS env var).
+max_concurrent_jobs = 1
 
 # ── Stage 0: Exact duplicate detection ───────────────────────────────────────
 [stage0]
@@ -532,4 +534,10 @@ max_files = 10000
 allowed_hosts = ["huggingface.co", "hf.co", "github.com", "raw.githubusercontent.com"]
 size_cap_mb = 500
 file_count_cap = 1000
+
+# ── Storage quotas & host disk protection ────────────────────────────────────
+[quotas]
+user_storage_cap_mb = 2048
+# Minimum free host disk space (MB) required before accepting uploads/scans (override via MIN_FREE_DISK_MB).
+min_free_disk_mb = 512
 

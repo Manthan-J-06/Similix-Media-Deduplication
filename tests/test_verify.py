@@ -445,3 +445,80 @@ class TestFusedDuplicateConfidenceIntegration:
         assert conf_high >= 0.99
         assert conf_low <= 0.15
 
+
+class TestKeypointCacheCompressionAndPruning:
+    def test_compressed_serialization_roundtrip_and_legacy_compat(self):
+        import pickle
+        import cv2
+        import numpy as np
+        from core.verify import (
+            deserialize_descriptors,
+            deserialize_keypoints,
+            serialize_descriptors,
+            serialize_keypoints,
+        )
+
+        # Integer SIFT float32 descriptors -> lossless compressed uint8 storage
+        sift_des = np.random.randint(0, 256, size=(500, 128)).astype(np.float32)
+        blob = serialize_descriptors(sift_des)
+        assert len(blob) < len(pickle.dumps(sift_des))
+        restored = deserialize_descriptors(blob)
+        assert restored.dtype == np.float32
+        assert np.array_equal(restored, sift_des)
+
+        # Fractional float32 fallback -> lossless compressed float32
+        frac_des = np.linspace(0.1, 1.5, 64, dtype=np.float32).reshape(4, 16)
+        assert np.allclose(deserialize_descriptors(serialize_descriptors(frac_des)), frac_des)
+
+        # ORB uint8 descriptors
+        orb_des = np.random.randint(0, 256, size=(100, 32), dtype=np.uint8)
+        restored_orb = deserialize_descriptors(serialize_descriptors(orb_des))
+        assert restored_orb.dtype == np.uint8
+        assert np.array_equal(restored_orb, orb_des)
+
+        # Legacy pickle descriptors remain readable
+        assert np.array_equal(deserialize_descriptors(pickle.dumps(sift_des)), sift_des)
+
+        # Compressed keypoints round-trip + legacy uncompressed compatibility
+        kps = [cv2.KeyPoint(x=float(i), y=float(i * 2), size=4.5, angle=90.0, response=0.5, octave=1, class_id=0) for i in range(50)]
+        kp_blob = serialize_keypoints(kps)
+        restored_kps = deserialize_keypoints(kp_blob)
+        assert len(restored_kps) == 50
+        assert restored_kps[10].pt == (10.0, 20.0)
+
+        legacy_raw = np.array(
+            [(kp.pt[0], kp.pt[1], kp.size, kp.angle, kp.response, kp.octave, kp.class_id) for kp in kps],
+            dtype=np.float32,
+        ).tobytes()
+        assert len(deserialize_keypoints(legacy_raw)) == 50
+
+    def test_prune_keypoint_cache_keeps_representatives_only(self, tmp_path: Path):
+        from core.verify import prune_keypoint_cache
+
+        db_path = tmp_path / "prune.db"
+        conn = init_db(db_path)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS keypoint_cache (
+                image_id INTEGER PRIMARY KEY,
+                keypoints BLOB,
+                descriptors BLOB,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+            );
+            """
+        )
+        conn.execute("INSERT INTO clusters (id, representative_id, stage_detected, member_count) VALUES (1, NULL, 2, 2)")
+        conn.execute("INSERT INTO images (id, file_path, cluster_id, is_keeper) VALUES (1, 'rep.jpg', 1, 1)")
+        conn.execute("INSERT INTO images (id, file_path, cluster_id, is_keeper) VALUES (2, 'dup.jpg', 1, 0)")
+        conn.execute("INSERT INTO images (id, file_path, cluster_id, is_keeper) VALUES (3, 'uniq.jpg', NULL, 0)")
+        conn.execute("UPDATE clusters SET representative_id = 1 WHERE id = 1")
+        for img_id in (1, 2, 3):
+            conn.execute("INSERT INTO keypoint_cache (image_id, keypoints, descriptors) VALUES (?, x'01', x'02')", (img_id,))
+        conn.commit()
+
+        deleted = prune_keypoint_cache(conn, keep_representatives=True, max_rep_rows=500, vacuum_threshold_mb=100.0)
+        assert deleted == 2
+        remaining = [r[0] for r in conn.execute("SELECT image_id FROM keypoint_cache").fetchall()]
+        assert remaining == [1]
+        conn.close()
+

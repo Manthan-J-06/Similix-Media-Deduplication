@@ -186,6 +186,8 @@ def get_user_storage_usage(user_root: Path) -> int:
         return 0
     for dirpath, _, filenames in os.walk(user_root):
         for f in filenames:
+            if f.endswith(("-wal", "-shm", "-journal")):
+                continue
             fp = os.path.join(dirpath, f)
             if not os.path.islink(fp):
                 try:
@@ -193,6 +195,72 @@ def get_user_storage_usage(user_root: Path) -> int:
                 except OSError:
                     pass
     return total
+
+
+def ensure_host_disk_space(
+    target_path: Path,
+    config: dict[str, Any] | None = None,
+    required_bytes: int = 0,
+) -> None:
+    """Reject ingestion when host disk free space falls below the configured minimum floor."""
+    env_min = get_env("MIN_FREE_DISK_MB")
+    cfg_min = (config or {}).get("quotas", {}).get("min_free_disk_mb", 512)
+    try:
+        min_free_mb = max(0, int(env_min if env_min is not None else cfg_min))
+    except (TypeError, ValueError):
+        min_free_mb = 512
+
+    if min_free_mb <= 0:
+        return
+
+    check_path = Path(target_path)
+    while not check_path.exists() and check_path.parent != check_path:
+        check_path = check_path.parent
+    try:
+        usage = shutil.disk_usage(check_path)
+    except OSError:
+        return
+
+    min_free_bytes = min_free_mb * 1024 * 1024
+    if usage.free - max(0, required_bytes) < min_free_bytes:
+        free_mb = usage.free // (1024 * 1024)
+        raise HTTPException(
+            status_code=507,
+            detail=f"Server storage low ({free_mb} MB free; minimum {min_free_mb} MB required). Please try again later.",
+        )
+
+
+def check_user_ingestion_quota(
+    user_root: Path,
+    config: dict[str, Any] | None = None,
+    required_bytes: int = 0,
+) -> tuple[int, int]:
+    """Verify host free disk floor and per-user storage quota before ingestion."""
+    ensure_host_disk_space(user_root, config, required_bytes=required_bytes)
+    quotas_cfg = (config or {}).get("quotas", {})
+    user_storage_cap = int(float(quotas_cfg.get("user_storage_cap_mb", 2048)) * 1024 * 1024)
+    current_user_storage = get_user_storage_usage(user_root)
+    if current_user_storage >= user_storage_cap:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Upload exceeds user storage quota ({user_storage_cap // (1024 * 1024)} MB)",
+        )
+    return current_user_storage, user_storage_cap
+
+
+def get_max_concurrent_jobs(app: FastAPI) -> int:
+    """Resolve global concurrent ML worker limit from MAX_CONCURRENT_JOBS env or config.toml."""
+    env_val = get_env("MAX_CONCURRENT_JOBS")
+    if env_val is not None:
+        try:
+            return max(1, int(env_val))
+        except ValueError:
+            pass
+    cfg_val = app.state.config.get("general", {}).get("max_concurrent_jobs", 1)
+    try:
+        return max(1, int(cfg_val))
+    except (TypeError, ValueError):
+        return 1
 
 
 def extract_drive_folder_id(link: str) -> str:
@@ -552,7 +620,7 @@ def _start_job_process(
 def maybe_start_next_queued_job(app: FastAPI) -> None:
     """Check if any global worker slot is free and promote the oldest queued job."""
     with app.state.job_queue_lock:
-        max_concurrent = app.state.config.get("general", {}).get("max_concurrent_jobs", 1)
+        max_concurrent = get_max_concurrent_jobs(app)
         running_count, _ = count_active_jobs_global(app)
         if running_count >= max_concurrent:
             return
@@ -677,7 +745,7 @@ def launch_pipeline_job(
     jobs_dir.mkdir(parents=True, exist_ok=True)
     job_file = jobs_dir / f"{job_id}.json"
 
-    max_concurrent = app.state.config.get("general", {}).get("max_concurrent_jobs", 1)
+    max_concurrent = get_max_concurrent_jobs(app)
     with app.state.job_queue_lock:
         running_count, queued_count = count_active_jobs_global(app)
         if running_count < max_concurrent:
@@ -2843,7 +2911,6 @@ def create_app(
         clean_project = re.sub(r"[^a-zA-Z0-9_\-]", "_", project.strip()) or "default"
         sources_cfg = request.app.state.config.get("sources", {})
         upload_cfg = sources_cfg.get("upload", {})
-        quotas_cfg = request.app.state.config.get("quotas", {})
 
         dest_dir = user.library_dir / clean_project
         validate_confined_user_path(dest_dir, user.root)
@@ -2858,14 +2925,7 @@ def create_app(
 
         allowed_exts = {e.lower().lstrip(".") for e in upload_cfg.get("allowed_extensions", ["jpg", "jpeg", "png", "webp", "heic"])}
         per_file_cap = upload_cfg.get("per_file_cap_mb", 50) * 1024 * 1024
-        user_storage_cap = quotas_cfg.get("user_storage_cap_mb", 2048) * 1024 * 1024
-
-        current_user_storage = get_user_storage_usage(user.root)
-        if current_user_storage >= user_storage_cap:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Upload exceeds user storage quota ({user_storage_cap // (1024*1024)} MB)",
-            )
+        current_user_storage, user_storage_cap = check_user_ingestion_quota(user.root, request.app.state.config)
 
         saved_files = []
         for upload in files:
@@ -3124,7 +3184,6 @@ def create_app(
         """
         sources_cfg = request.app.state.config.get("sources", {})
         upload_cfg = sources_cfg.get("upload", {})
-        quotas_cfg = request.app.state.config.get("quotas", {})
 
         max_folder_files = upload_cfg.get("max_folder_files", 10000)
         if total_files > max_folder_files:
@@ -3163,8 +3222,7 @@ def create_app(
 
         allowed_exts = {e.lower().lstrip(".") for e in upload_cfg.get("allowed_extensions", ["jpg", "jpeg", "png", "webp", "heic", "tiff", "bmp"])}
         per_file_cap = upload_cfg.get("per_file_cap_mb", 50) * 1024 * 1024
-        user_storage_cap = quotas_cfg.get("user_storage_cap_mb", 2048) * 1024 * 1024
-        current_user_storage = get_user_storage_usage(user.root)
+        current_user_storage, user_storage_cap = check_user_ingestion_quota(user.root, request.app.state.config)
 
         saved_this_chunk = []
         for idx, upload in enumerate(files):
@@ -3308,11 +3366,11 @@ def create_app(
         """Upload a binary chunk of a ZIP archive."""
         clean_upload_id = re.sub(r"[^a-zA-Z0-9_\-]", "", upload_id.strip()) or f"zip_{int(time.time())}"
         clean_project = re.sub(r"[^a-zA-Z0-9_\-]", "_", project.strip()) or "default"
-        quotas_cfg = request.app.state.config.get("quotas", {})
-        user_storage_cap = quotas_cfg.get("user_storage_cap_mb", 2048) * 1024 * 1024
-        current_user_storage = get_user_storage_usage(user.root)
-        if current_user_storage >= user_storage_cap:
-            raise HTTPException(status_code=400, detail="Upload exceeds user storage quota")
+        current_user_storage, user_storage_cap = check_user_ingestion_quota(
+            user.root,
+            request.app.state.config,
+            required_bytes=max(0, total_bytes),
+        )
 
         tmp_dir = user.root / "tmp"
         tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -3438,9 +3496,7 @@ def create_app(
         temp_zip = tmp_dir / f"direct_{uuid.uuid4().hex}.zip"
         validate_confined_user_path(temp_zip, user.root)
 
-        quotas_cfg = request.app.state.config.get("quotas", {})
-        user_storage_cap = quotas_cfg.get("user_storage_cap_mb", 2048) * 1024 * 1024
-        current_user_storage = get_user_storage_usage(user.root)
+        current_user_storage, user_storage_cap = check_user_ingestion_quota(user.root, request.app.state.config)
 
         try:
             with open(temp_zip, "wb") as f_out:
@@ -4062,6 +4118,7 @@ def create_app(
             except Exception:
                 pass
 
+        ensure_host_disk_space(user.root, cfg)
         job_id = launch_pipeline_job(request.app, user=user, source_type="drive", drive_folder_id=folder_id)
         return {
             "job_id": job_id,
@@ -4082,6 +4139,7 @@ def create_app(
             hosted_mode = os.environ.get("HOSTED_MODE", "").lower() in ("true", "1", "yes")
         if hosted_mode:
             raise HTTPException(status_code=403, detail="Dataset download is disabled in hosted mode")
+        ensure_host_disk_space(user.root, cfg)
 
         url = req.url.strip()
         parsed = urllib.parse.urlparse(url)

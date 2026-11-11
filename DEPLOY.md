@@ -324,26 +324,25 @@ sudo systemctl enable similix
 sudo systemctl start similix
 ```
 
-### Step 7: Automated Backup of Data Volume
+### Step 7: Automated Online Backup of Data Volume
+
+SIMILIX includes [`scripts/backup_data.py`](scripts/backup_data.py), which uses SQLite's online `.backup()` API so `auth.db` and per-user `similix.db` databases are snapshotted safely even while pipeline workers are writing in WAL mode.
 
 Add a daily cron job to back up the `similix_data` Docker volume:
 
 ```bash
+sudo mkdir -p /opt/backups/similix
 sudo crontab -e
 ```
 
 Add the following line:
 
 ```cron
-0 3 * * * docker run --rm -v similix_similix_data:/data:ro -v /opt/backups/similix:/backup alpine tar czf /backup/similix_data_$(date +\%Y\%m\%d).tar.gz -C /data . && find /opt/backups/similix -name "*.tar.gz" -mtime +30 -delete
-```
-
-```bash
-sudo mkdir -p /opt/backups/similix
+0 3 * * * docker run --rm -v similix_similix_data:/data -v /opt/backups/similix:/backup -v /opt/similix/scripts:/scripts:ro python:3.11-slim python3 /scripts/backup_data.py --data-dir /data --backup-dir /backup --retain-days 30
 ```
 
 > [!NOTE]
-> The cron runs at 03:00 daily, creates a compressed `.tar.gz` snapshot of `/data`, and prunes backups older than 30 days.
+> The cron runs at 03:00 daily, creates a transactionally consistent `.tar.gz` snapshot of `/data`, and prunes backups older than 30 days. Never snapshot live SQLite WAL databases with raw `tar` while workers are writing.
 
 ### Step 8: Google Drive Integration (Optional)
 

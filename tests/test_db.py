@@ -125,7 +125,7 @@ class TestDatabaseMigrations:
         conn.close()
 
         # Verify viewer API can list clusters from the migrated DB
-        app = create_app(db_path=test_db)
+        app = create_app(db_path=test_db, auth_db_path=tmp_path / "auth.db", users_dir=tmp_path / "users")
         client = make_authenticated_client(app)
         resp = client.get("/clusters")
         assert resp.status_code == 200
